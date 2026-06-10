@@ -31,6 +31,14 @@ type section struct {
 	total   int
 }
 
+// appMode selects which screen is active.
+type appMode int
+
+const (
+	modeDashboard appMode = iota
+	modeDetail
+)
+
 // Model is the root Bubble Tea model.
 type Model struct {
 	cfg config.Config
@@ -38,6 +46,9 @@ type Model struct {
 
 	width  int
 	height int
+
+	mode   appMode
+	detail detailModel
 
 	sections []section
 	active   int
@@ -133,12 +144,36 @@ func (m Model) Init() tea.Cmd {
 
 // Update handles messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Global messages handled regardless of mode.
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeLists()
+		if m.mode == modeDetail {
+			var cmd tea.Cmd
+			m.detail, cmd = m.detail.Update(msg) // keep the detail screen sized
+			return m, cmd
+		}
 		return m, nil
 
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case detailExitMsg:
+		m.mode = modeDashboard
+		return m, nil
+	}
+
+	// In detail mode, everything else routes to the detail screen.
+	if m.mode == modeDetail {
+		var cmd tea.Cmd
+		m.detail, cmd = m.detail.Update(msg)
+		return m, cmd
+	}
+
+	switch msg := msg.(type) {
 	case viewerMsg:
 		m.headerLoading = false
 		if msg.err != nil {
@@ -169,15 +204,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
-
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "enter":
+			return m.openSelected()
 		case "tab", "l", "right":
 			m.active = (m.active + 1) % len(m.sections)
 			return m, nil
@@ -203,6 +235,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// openSelected opens the highlighted dashboard row in the detail screen, if it
+// is a pull request. Non-PR rows (issues, number-less notifications) are
+// ignored for now — the review pane is PR-only.
+func (m Model) openSelected() (tea.Model, tea.Cmd) {
+	if len(m.sections) == 0 {
+		return m, nil
+	}
+	sel := m.sections[m.active].list.SelectedItem()
+	it, ok := sel.(prItem)
+	if !ok || !it.IsPR || it.Number == 0 {
+		return m, nil
+	}
+	m.detail = newDetail(m.th, it.Item)
+	m.detail, _ = m.detail.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+	m.mode = modeDetail
+	return m, m.detail.Init()
+}
+
 // chrome heights, used for both layout and list sizing.
 const (
 	headerH = 1
@@ -226,6 +276,9 @@ func (m *Model) resizeLists() {
 func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
+	}
+	if m.mode == modeDetail {
+		return m.detail.View()
 	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.viewHeader(),
@@ -306,7 +359,7 @@ func (m Model) viewBody() string {
 }
 
 func (m Model) viewFooter() string {
-	help := "↑/↓ or j/k move · ←/→ or tab section · r refresh · q quit"
+	help := "↑/↓ or j/k move · ←/→ or tab section · enter open · r refresh · q quit"
 	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).
 		Padding(0, 1).Render(help)
 }

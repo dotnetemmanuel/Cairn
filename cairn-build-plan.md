@@ -199,7 +199,7 @@ Three panes, vim-style navigation, rebindable keys, `?` help overlay.
 - Notifications section via the notifications API.
 **Acceptance:** with a real config, `cairn` shows live "My PRs", "Needs Review", and an org section, refreshable, no browser needed to *see* state.
 
-### Phase 2 — PR detail + review pane `[ ]`
+### Phase 2 — PR detail + review pane `[x]`
 **Goal:** review without leaving the terminal.
 - Selecting a PR opens center pane: syntax-highlighted diff (chroma), file tree, hunk navigation.
 - Right pane: conversation + checks list.
