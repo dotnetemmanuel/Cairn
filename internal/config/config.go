@@ -13,10 +13,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Section is a board section backed by a GitHub search filter. Only the shape
-// is defined in Phase 0; it is consumed starting in Phase 1.
+// SectionType selects how a section is loaded.
+const (
+	SectionSearch        = "search"        // default: a GitHub search filter
+	SectionNotifications = "notifications" // the notifications REST feed
+)
+
+// Section is a board section. A search section is backed by a GitHub search
+// filter; a notifications section pulls the REST notifications feed and ignores
+// Filter.
 type Section struct {
 	Title  string `yaml:"title"`
+	Type   string `yaml:"type"` // "" defaults to search
 	Filter string `yaml:"filter"`
 }
 
@@ -39,6 +47,8 @@ func Default() Config {
 		Sections: []Section{
 			{Title: "My PRs", Filter: "is:open is:pr author:@me"},
 			{Title: "Needs Review", Filter: "is:open is:pr review-requested:@me"},
+			{Title: "Involved", Filter: "is:open is:pr involves:@me"},
+			{Title: "Notifications", Type: SectionNotifications},
 		},
 	}
 }

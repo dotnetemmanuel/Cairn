@@ -191,7 +191,7 @@ Three panes, vim-style navigation, rebindable keys, `?` help overlay.
 - Minimal Bubble Tea app: a header showing the authenticated GitHub login + rate-limit remaining; `q` quits.
 **Acceptance:** `cairn` launches, shows `Logged in as <login> · <n> API calls remaining`, quits cleanly. `cairn doctor` reports tool/auth status.
 
-### Phase 1 — Read-only dashboard `[ ]`
+### Phase 1 — Read-only dashboard `[x]`
 **Goal:** the gh-dash core. Sections of PRs/issues from GraphQL.
 - Config-driven sections (filters in GitHub search syntax).
 - GraphQL query per section → list view (Bubbles `list`), columns: repo, number, title, author, review state, CI rollup, updated.

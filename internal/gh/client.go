@@ -5,6 +5,12 @@ package gh
 
 import "github.com/cli/go-gh/v2/pkg/api"
 
+// graphQLClient returns a GraphQL client whose token go-gh resolves from the
+// user's existing gh login (Hard Rule 2 — Cairn never handles tokens itself).
+func graphQLClient() (*api.GraphQLClient, error) {
+	return api.DefaultGraphQLClient()
+}
+
 // Viewer is the authenticated user plus current rate-limit state — exactly what
 // the Phase 0 header needs.
 type Viewer struct {
@@ -16,7 +22,7 @@ type Viewer struct {
 // FetchViewer issues a single GraphQL query for the logged-in user and the
 // current rate-limit quota.
 func FetchViewer() (Viewer, error) {
-	client, err := api.DefaultGraphQLClient()
+	client, err := graphQLClient()
 	if err != nil {
 		return Viewer{}, err
 	}
