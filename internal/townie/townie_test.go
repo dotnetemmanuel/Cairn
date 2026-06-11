@@ -98,3 +98,20 @@ func TestCatalogDrivesHelpAndDispatch(t *testing.T) {
 		t.Error("Find on unknown key should be nil")
 	}
 }
+
+func TestCheckoutArgvNotInCatalog(t *testing.T) {
+	// checkout runs via Run but must NOT appear as a stack command in Catalog().
+	for _, c := range Catalog() {
+		if c.Verb == "checkout" {
+			t.Fatal("checkout must stay out of Catalog() (it is not a stack mutation)")
+		}
+	}
+	rr := &recordRunner{out: "Switched to branch 'feat-mid'"}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	if _, err := ops.Run("checkout", "feat-mid"); err != nil {
+		t.Fatalf("checkout run errored: %v", err)
+	}
+	if len(rr.calls) != 1 || strings.Join(rr.calls[0], " ") != "git checkout feat-mid" {
+		t.Errorf("checkout ran %v, want git checkout feat-mid", rr.calls)
+	}
+}

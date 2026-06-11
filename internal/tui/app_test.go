@@ -141,3 +141,29 @@ func TestDashboardEscDoesNotQuitButQDoes(t *testing.T) {
 		t.Fatal("q should quit the dashboard")
 	}
 }
+
+func TestEnterStackModeFromDashboard(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "is:open is:pr"}}}
+	m := New(cfg)
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")},
+	)
+	if m.mode != modeStack {
+		t.Fatalf("S should switch to stack mode, got mode %d", m.mode)
+	}
+	view := m.View()
+	if !strings.Contains(view, "Stack actions") {
+		t.Errorf("stack mode view should show the action list:\n%s", view)
+	}
+	// Esc emits a stackExitMsg command; run it and feed the result back.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("esc in stack mode should return an exit command")
+	}
+	m = drive(m, cmd())
+	if m.mode != modeDashboard {
+		t.Errorf("esc should return to the dashboard, got mode %d", m.mode)
+	}
+}

@@ -48,6 +48,11 @@ func argv(verb, name string) []string {
 		return []string{"git-town", "prepend", name}
 	case "hack":
 		return []string{"git-town", "hack", name}
+	case "checkout":
+		// Not a stack mutation — just moves HEAD. Kept out of Catalog() so it
+		// isn't listed as a git-town stack command, but routed through Run so the
+		// stack mode reuses one execution path.
+		return []string{"git", "checkout", name}
 	case "sync":
 		return []string{"git-town", "sync", "--stack"}
 	case "restack":
@@ -131,15 +136,17 @@ func Catalog() []Command {
 			Key: "S", Verb: "sync", Title: "sync", Mutates: true,
 			Short: "pull trunk + rebase the whole stack, then push",
 			Long: "Fetches the latest trunk (main) and rebases every branch in the stack " +
-				"on top of it, prunes branches whose PRs merged, and pushes the results. " +
-				"This is how you keep a stack current with main and with each other.",
+				"on top of it, removes branches whose PRs have merged, and pushes the " +
+				"results. This is how you keep a stack current with main and with each " +
+				"other. (Cairn assumes git-town's rebase sync strategy.)",
 		},
 		{
 			Key: "R", Verb: "restack", Title: "restack", Mutates: true,
-			Short: "re-rebase the stack locally (no push)",
-			Long: "Like sync but local-only: re-rebases descendant branches onto their " +
-				"parents WITHOUT pushing. Use it to clear a drift (amber ⚠) after you've " +
-				"amended or rewritten a lower branch, before you're ready to push.",
+			Short: "re-rebase the stack without pushing",
+			Long: "Like sync but WITHOUT pushing: re-rebases descendant branches onto " +
+				"their parents (it still fetches the latest trunk). Use it to clear a " +
+				"drift (amber ⚠) after you've amended or rewritten a lower branch, before " +
+				"you're ready to push.",
 		},
 		{
 			Key: "A", Verb: "amend", Title: "amend", Mutates: true,

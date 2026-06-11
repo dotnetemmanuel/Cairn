@@ -59,6 +59,7 @@ func (m Model) renderHelp() string {
 		{"←/→ tab", "switch section"},
 		{"enter", "open the selected PR"},
 		{"s", "toggle the stack sidebar"},
+		{"S", "open stack mode (author/maintain the cwd repo's stack)"},
 		{"r", "refresh"},
 		{"?", "toggle this help"},
 		{"q", "quit"},

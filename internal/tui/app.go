@@ -40,6 +40,7 @@ type appMode int
 const (
 	modeDashboard appMode = iota
 	modeDetail
+	modeStack
 )
 
 // Model is the root Bubble Tea model.
@@ -50,8 +51,9 @@ type Model struct {
 	width  int
 	height int
 
-	mode   appMode
-	detail detailModel
+	mode      appMode
+	detail    detailModel
+	stackMode stackModel
 
 	sections []section
 	active   int
@@ -178,6 +180,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail, cmd = m.detail.Update(msg) // keep the detail screen sized
 			return m, cmd
 		}
+		if m.mode == modeStack {
+			var cmd tea.Cmd
+			m.stackMode, cmd = m.stackMode.Update(msg)
+			return m, cmd
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -186,6 +193,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case detailExitMsg:
+		m.mode = modeDashboard
+		return m, nil
+
+	case stackExitMsg:
 		m.mode = modeDashboard
 		return m, nil
 
@@ -198,9 +209,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Open help on ? — unless the detail composer is capturing text, where
-		// ? is a literal character.
-		if msg.String() == "?" && !(m.mode == modeDetail && m.detail.composing()) {
+		// Open help on ? — unless a text field is capturing input, where ? is a
+		// literal character.
+		capturing := (m.mode == modeDetail && m.detail.composing()) ||
+			(m.mode == modeStack && m.stackMode.capturing())
+		if msg.String() == "?" && !capturing {
 			m.showHelp = true
 			return m, nil
 		}
@@ -210,6 +223,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == modeDetail {
 		var cmd tea.Cmd
 		m.detail, cmd = m.detail.Update(msg)
+		return m, cmd
+	}
+
+	// In stack mode, everything else routes to the stack screen.
+	if m.mode == modeStack {
+		var cmd tea.Cmd
+		m.stackMode, cmd = m.stackMode.Update(msg)
 		return m, cmd
 	}
 
@@ -261,6 +281,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			m.showStack = !m.showStack
 			m.resizeLists()
+			return m, nil
+		case "S":
+			// Enter the dedicated, local-context stack authoring mode.
+			m.stackMode = newStackModel(m.th, m.localRepo)
+			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+			m.mode = modeStack
 			return m, nil
 		case "r":
 			cmds := []tea.Cmd{fetchViewer}
@@ -316,12 +342,17 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 }
 
 // chrome heights, used for both layout and list sizing. The tab strip is three
-// rows: the active tab's top border, the labels, and the body's top line.
+// rows: the active tab's top border, the labels, and the body's top line. The
+// header is two rows: the brand line and the session/status line.
 const (
-	headerH = 1
+	headerH = 2
 	tabsH   = 3
 	footerH = 1
 )
+
+// logoGlyph is Cairn's mark in the header brand line. Pulled out so it's a
+// one-line swap; ⟁ (a small triangle within a triangle) reads as a cairn/peak.
+const logoGlyph = "⟁"
 
 func (m *Model) resizeLists() {
 	bodyH := m.height - headerH - tabsH - footerH
@@ -402,6 +433,9 @@ func (m Model) View() string {
 	if m.mode == modeDetail {
 		return m.detail.View()
 	}
+	if m.mode == modeStack {
+		return m.stackMode.View(m.spinner.View())
+	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.viewHeader(),
 		m.viewTabs(),
@@ -411,8 +445,16 @@ func (m Model) View() string {
 }
 
 func (m Model) viewHeader() string {
-	title := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("⟁ Cairn")
+	row := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).
+		Foreground(m.th.Text).Padding(0, 1)
 
+	// Row 1 — brand. The mark + name get their own line so they read as a
+	// masthead rather than competing with the status text.
+	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
+	brandRow := row.Render(brand + tagline)
+
+	// Row 2 — session/status.
 	var status string
 	switch {
 	case m.headerLoading:
@@ -426,14 +468,9 @@ func (m Model) viewHeader() string {
 		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
 			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
 	}
+	statusRow := row.Render(status)
 
-	inner := lipgloss.JoinHorizontal(lipgloss.Center, title, "   ", status)
-	return lipgloss.NewStyle().
-		Width(m.width).
-		Background(m.th.Surface).
-		Foreground(m.th.Text).
-		Padding(0, 1).
-		Render(inner)
+	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
 
 func (m Model) viewTabs() string {
@@ -631,7 +668,23 @@ func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w
 }
 
 func (m Model) viewFooter() string {
-	help := "↑/↓ move · ←/→ section · enter open · s stack · r refresh · ? help · q quit"
-	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).
-		Padding(0, 1).Render(help)
+	dim := lipgloss.NewStyle().Foreground(m.th.Muted)
+	sep := dim.Render(" · ")
+
+	// Stack mode is Cairn's headline feature — render its hint in the Primary
+	// accent (bold) so it pops out of the otherwise-muted utility keys.
+	stackHint := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("S stack mode")
+
+	parts := []string{
+		dim.Render("↑/↓ move"),
+		dim.Render("←/→ section"),
+		dim.Render("enter open"),
+		dim.Render("s sidebar"),
+		stackHint,
+		dim.Render("r refresh"),
+		dim.Render("? help"),
+		dim.Render("q quit"),
+	}
+	return lipgloss.NewStyle().Width(m.width).Padding(0, 1).
+		Render(strings.Join(parts, sep))
 }
