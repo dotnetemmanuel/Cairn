@@ -50,7 +50,15 @@ type ReviewComment struct {
 	Body      string
 	Path      string
 	Line      int
+	Side      string // RIGHT (new) or LEFT (old); GitHub's diffSide
 	CreatedAt time.Time
+}
+
+// ReviewRequest is a pending (not-yet-submitted) review request on a PR.
+type ReviewRequest struct {
+	Name   string // user login or team slug
+	IsTeam bool
+	IsYou  bool
 }
 
 // PRDetail is everything the review pane needs about a single PR.
@@ -64,12 +72,14 @@ type PRDetail struct {
 	URL            string
 	BaseRef        string
 	HeadRef        string
+	HeadSHA        string
 	Additions      int
 	Deletions      int
 	ChangedFiles   int
 	Comments       []Comment
 	Reviews        []Review
 	ReviewComments []ReviewComment
+	ReviewRequests []ReviewRequest
 	Checks         []Check
 }
 
@@ -124,15 +134,17 @@ func (d PRDetail) Timeline() []TimelineEntry {
 
 const prDetailQuery = `
 query($owner:String!,$repo:String!,$number:Int!){
+  viewer{login}
   repository(owner:$owner,name:$repo){
     pullRequest(number:$number){
       number title body state url createdAt
       additions deletions changedFiles
-      baseRefName headRefName
+      baseRefName headRefName headRefOid
       author{login}
+      reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
       comments(first:50){nodes{author{login} body createdAt}}
       reviews(first:50){nodes{author{login} state body createdAt}}
-      reviewThreads(first:50){nodes{path line comments(first:20){nodes{author{login} body createdAt}}}}
+      reviewThreads(first:50){nodes{path line diffSide comments(first:20){nodes{author{login} body createdAt}}}}
       commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
@@ -150,6 +162,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 	}
 
 	var resp struct {
+		Viewer     struct{ Login string }
 		Repository struct {
 			PullRequest struct {
 				Number       int
@@ -163,7 +176,17 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				ChangedFiles int
 				BaseRefName  string
 				HeadRefName  string
+				HeadRefOid   string
 				Author       struct{ Login string }
+				ReviewRequests struct {
+					Nodes []struct {
+						RequestedReviewer struct {
+							Typename string `json:"__typename"`
+							Login    string
+							Slug     string
+						}
+					}
+				}
 				Comments     struct {
 					Nodes []struct {
 						Author    struct{ Login string }
@@ -183,6 +206,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 					Nodes []struct {
 						Path     string
 						Line     int
+						DiffSide string
 						Comments struct {
 							Nodes []struct {
 								Author    struct{ Login string }
@@ -234,17 +258,33 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		URL:          pr.URL,
 		BaseRef:      pr.BaseRefName,
 		HeadRef:      pr.HeadRefName,
+		HeadSHA:      pr.HeadRefOid,
 		Additions:    pr.Additions,
 		Deletions:    pr.Deletions,
 		ChangedFiles: pr.ChangedFiles,
+	}
+	for _, rr := range pr.ReviewRequests.Nodes {
+		r := rr.RequestedReviewer
+		switch r.Typename {
+		case "User":
+			d.ReviewRequests = append(d.ReviewRequests, ReviewRequest{
+				Name: r.Login, IsYou: strings.EqualFold(r.Login, resp.Viewer.Login),
+			})
+		case "Team":
+			d.ReviewRequests = append(d.ReviewRequests, ReviewRequest{Name: r.Slug, IsTeam: true})
+		}
 	}
 	for _, c := range pr.Comments.Nodes {
 		d.Comments = append(d.Comments, Comment{Author: c.Author.Login, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
 	for _, th := range pr.ReviewThreads.Nodes {
+		side := th.DiffSide
+		if side == "" {
+			side = "RIGHT"
+		}
 		for _, c := range th.Comments.Nodes {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
-				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, CreatedAt: c.CreatedAt,
+				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, Side: side, CreatedAt: c.CreatedAt,
 			})
 		}
 	}
@@ -325,6 +365,26 @@ func SubmitReview(owner, repo string, number int, event, body string) error {
 	payload, _ := json.Marshal(map[string]string{"event": event, "body": body})
 	path := fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", owner, repo, number)
 	return client.Post(path, bytes.NewReader(payload), nil)
+}
+
+// AddReviewComment posts a single inline comment anchored to a file line — the
+// equivalent of GitHub's "Add single comment" button (a COMMENT-event review
+// comment). commitID is the PR head SHA; side is RIGHT (new) or LEFT (old).
+// Unlike approve/request-changes, this is allowed on your own PR.
+func AddReviewComment(owner, repo string, number int, commitID, path string, line int, side, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"body":      body,
+		"commit_id": commitID,
+		"path":      path,
+		"line":      line,
+		"side":      side,
+	})
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments", owner, repo, number)
+	return client.Post(endpoint, bytes.NewReader(payload), nil)
 }
 
 // SplitRepo splits an "owner/name" string into its parts.

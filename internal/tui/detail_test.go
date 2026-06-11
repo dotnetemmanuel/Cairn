@@ -124,11 +124,225 @@ func TestRenderDiffMarksAddsAndDels(t *testing.T) {
 	out := renderDiff(th, gh.FileDiff{
 		Filename: "x.go",
 		Patch:    "@@ -1,2 +1,2 @@\n-removed\n+added\n unchanged",
-	}, 80)
+	}, 80, 0, -1, nil)
 	for _, want := range []string{"removed", "added", "unchanged"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered diff missing %q", want)
 		}
+	}
+}
+
+func multiHunkDetail(t *testing.T) detailModel {
+	t.Helper()
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 1})
+	files := []gh.FileDiff{{
+		Filename: "big.py", Status: "modified", Additions: 3, Deletions: 3,
+		Patch: "@@ -1,1 +1,1 @@\n-a\n+a2\n@@ -10,1 +10,1 @@\n-b\n+b2\n@@ -20,1 +20,1 @@\n-c\n+c2",
+	}}
+	return driveDetail(m,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: gh.PRDetail{Number: 1, State: "OPEN"}, files: files},
+	)
+}
+
+func TestHunkNavigationAdvancesAndCycles(t *testing.T) {
+	m := multiHunkDetail(t)
+	if len(m.hunks) != 3 {
+		t.Fatalf("expected 3 hunks, got %d", len(m.hunks))
+	}
+	if m.curHunk != 0 {
+		t.Fatalf("expected to start on hunk 0, got %d", m.curHunk)
+	}
+	n := func() { m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}) }
+	N := func() { m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("N")}) }
+
+	// 'n' advances; the title surfaces the position.
+	n()
+	if m.curHunk != 1 {
+		t.Fatalf("expected hunk 1 after n, got %d", m.curHunk)
+	}
+	if !strings.Contains(m.View(), "hunk 2/3") {
+		t.Errorf("expected 'hunk 2/3' in view")
+	}
+
+	// 'n' past the last hunk wraps to the first.
+	n() // → 2
+	n() // → 0 (wrap)
+	if m.curHunk != 0 {
+		t.Fatalf("expected n past last to wrap to 0, got %d", m.curHunk)
+	}
+
+	// 'N' before the first wraps to the last.
+	N()
+	if m.curHunk != 2 {
+		t.Fatalf("expected N on first to wrap to last (2), got %d", m.curHunk)
+	}
+}
+
+func TestStatusLineClearsOnNextKey(t *testing.T) {
+	m := multiHunkDetail(t)
+	// Simulate a lingering error from a failed action.
+	m.status = "✗ approve failed: boom"
+	if !strings.Contains(m.View(), "approve failed") {
+		t.Fatalf("expected error to show before dismissal")
+	}
+	// Any browsing keystroke dismisses it.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if m.status != "" {
+		t.Errorf("expected status cleared after keystroke, got %q", m.status)
+	}
+}
+
+func TestPatchLineMetaTracksSidesAndLines(t *testing.T) {
+	meta := patchLineMeta("@@ -1,2 +1,3 @@\n ctx\n-removed\n+added1\n+added2")
+	// idx0 = header (not commentable), then ctx, -removed, +added1, +added2.
+	if meta[0].side != "" {
+		t.Errorf("hunk header should not be commentable, got side %q", meta[0].side)
+	}
+	cases := []struct {
+		idx  int
+		side string
+		line int
+		code string
+	}{
+		{1, "RIGHT", 1, "ctx"},
+		{2, "LEFT", 2, "removed"},
+		{3, "RIGHT", 2, "added1"},
+		{4, "RIGHT", 3, "added2"},
+	}
+	for _, c := range cases {
+		got := meta[c.idx]
+		if got.side != c.side || got.line != c.line || got.code != c.code {
+			t.Errorf("meta[%d] = %+v, want side=%s line=%d code=%q", c.idx, got, c.side, c.line, c.code)
+		}
+	}
+}
+
+// inlineDetail builds a loaded detail at the given width with one multi-line
+// file and an optional inline comment on big.py RIGHT:2.
+func inlineDetail(t *testing.T, width int, withComment bool) detailModel {
+	t.Helper()
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 7})
+	detail := gh.PRDetail{Number: 7, State: "OPEN", HeadSHA: "deadbeef"}
+	if withComment {
+		detail.ReviewComments = []gh.ReviewComment{
+			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", CreatedAt: time.Now()},
+		}
+	}
+	files := []gh.FileDiff{{
+		Filename: "big.py", Status: "modified", Additions: 2, Deletions: 1,
+		Patch: "@@ -1,2 +1,3 @@\n ctx\n-removed\n+added1\n+added2",
+	}}
+	return driveDetail(m,
+		tea.WindowSizeMsg{Width: width, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+	)
+}
+
+func TestLineCommentAnchorsToCursor(t *testing.T) {
+	m := inlineDetail(t, 140, false)
+	m.focus = focusDiff
+	// cursor starts on the context line (idx 1); step down twice → idx 3.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if m.state != stateLineComment {
+		t.Fatalf("expected stateLineComment, got %d", m.state)
+	}
+	if m.anchorPath != "big.py" || m.anchorSide != "RIGHT" || m.anchorLine != 2 {
+		t.Fatalf("anchor = %s %s:%d, want big.py RIGHT:2", m.anchorPath, m.anchorSide, m.anchorLine)
+	}
+}
+
+func TestSuggestPrefillsBlock(t *testing.T) {
+	m := inlineDetail(t, 140, false)
+	m.focus = focusDiff
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")},
+	)
+	if m.state != stateLineComment {
+		t.Fatalf("expected stateLineComment after s, got %d", m.state)
+	}
+	val := m.composer.Value()
+	if !strings.Contains(val, "```suggestion") || !strings.Contains(val, "added1") {
+		t.Errorf("suggestion composer = %q, want a suggestion block seeded with the line", val)
+	}
+}
+
+func TestContextualPaneShowsLineThread(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m.focus = focusDiff
+	// Move onto RIGHT:2 (the commented line).
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	if lc := m.lineComments(); len(lc) != 1 {
+		t.Fatalf("expected 1 line comment at cursor, got %d", len(lc))
+	}
+	if cc := m.commentCounts(); cc[3] != 1 {
+		t.Errorf("expected a comment badge on rendered line 3, got %v", cc)
+	}
+	view := m.View()
+	for _, w := range []string{"Line thread", "tweak this", "@octocat"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("contextual pane missing %q", w)
+		}
+	}
+}
+
+func TestTabSkipsHiddenInfoPane(t *testing.T) {
+	m := inlineDetail(t, 90, false) // < 100 cols → info pane hidden
+	if m.infoVisible() {
+		t.Fatal("info pane should be hidden under 100 cols")
+	}
+	// Cycle focus a few times; it must never land on the hidden info pane.
+	for i := 0; i < 4; i++ {
+		m.focus = m.nextFocus(1)
+		if m.focus == focusInfo {
+			t.Fatalf("tab landed on hidden info pane after %d steps", i+1)
+		}
+	}
+}
+
+func TestReloadKeepsViewAfterAction(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 9})
+	files := []gh.FileDiff{
+		{Filename: "README.md", Status: "modified", Patch: "@@ -1,1 +1,1 @@\n-old\n+new"},
+		{Filename: "big.py", Status: "modified", Patch: "@@ -1,2 +1,3 @@\n ctx\n-removed\n+added1\n+added2"},
+	}
+	detail := gh.PRDetail{Number: 9, State: "OPEN"}
+	m = driveDetail(m,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+	)
+	// Navigate onto the second file and move the cursor down.
+	m.selected = 1
+	m.refreshDiff()
+	m.focus = focusDiff
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	gotSel, gotCursor := m.selected, m.diffCursor
+
+	// A post-action reload (keep:true) must NOT snap back to file 0.
+	m, _ = m.Update(prLoadedMsg{detail: detail, files: files, keep: true})
+	if m.selected != gotSel {
+		t.Errorf("reload changed file from %d to %d", gotSel, m.selected)
+	}
+	if m.diffCursor != gotCursor {
+		t.Errorf("reload changed cursor from %d to %d", gotCursor, m.diffCursor)
+	}
+
+	// An initial load (keep:false) resets to the first file.
+	m, _ = m.Update(prLoadedMsg{detail: detail, files: files, keep: false})
+	if m.selected != 0 {
+		t.Errorf("initial load should reset to file 0, got %d", m.selected)
 	}
 }
 

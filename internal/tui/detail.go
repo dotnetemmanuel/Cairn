@@ -36,7 +36,8 @@ type detailState int
 const (
 	stateBrowsing detailState = iota
 	stateComment
-	stateReject // request-changes reason
+	stateReject      // request-changes reason
+	stateLineComment // inline comment anchored to a diff line
 	stateConfirmApprove
 	stateSubmitting
 )
@@ -65,11 +66,20 @@ type detailModel struct {
 	diffVP viewport.Model
 	infoVP viewport.Model
 	convVP viewport.Model
-	hunks  []int // hunk start line offsets for the selected file
+	hunks     []int          // hunk start line offsets for the selected file
+	curHunk   int            // index into hunks of the currently-marked hunk
+	diffCursor int           // rendered-line index of the diff line cursor
+	diffNLines int           // number of rendered diff lines (for clamping)
+	lineMeta  []diffLineMeta // per rendered diff line: side + file line + code
 
 	state    detailState
 	composer textarea.Model
 	status   string // transient feedback line
+
+	// Anchor for an in-progress inline comment (stateLineComment).
+	anchorPath string
+	anchorLine int
+	anchorSide string
 }
 
 func newDetail(th theme.Theme, it gh.Item) detailModel {
@@ -107,6 +117,7 @@ type prLoadedMsg struct {
 	detail gh.PRDetail
 	files  []gh.FileDiff
 	err    error
+	keep   bool // preserve the current file/cursor/scroll (a post-action reload)
 }
 
 type actionDoneMsg struct {
@@ -116,7 +127,7 @@ type actionDoneMsg struct {
 
 type detailExitMsg struct{}
 
-func loadPR(owner, repo string, number int) tea.Cmd {
+func loadPR(owner, repo string, number int, keep bool) tea.Cmd {
 	return func() tea.Msg {
 		detail, derr := gh.FetchPRDetail(owner, repo, number)
 		files, ferr := gh.FetchPRFiles(owner, repo, number)
@@ -124,7 +135,7 @@ func loadPR(owner, repo string, number int) tea.Cmd {
 		if err == nil {
 			err = ferr
 		}
-		return prLoadedMsg{detail: detail, files: files, err: err}
+		return prLoadedMsg{detail: detail, files: files, err: err, keep: keep}
 	}
 }
 
@@ -141,8 +152,15 @@ func doReview(owner, repo string, number int, event, body string) tea.Cmd {
 	}
 }
 
+func doLineComment(owner, repo string, number int, sha, path string, line int, side, body string) tea.Cmd {
+	return func() tea.Msg {
+		err := gh.AddReviewComment(owner, repo, number, sha, path, line, side, body)
+		return actionDoneMsg{verb: "line comment", err: err}
+	}
+}
+
 func (m detailModel) Init() tea.Cmd {
-	return loadPR(m.owner, m.repo, m.number)
+	return loadPR(m.owner, m.repo, m.number, false)
 }
 
 // ---- update ----
@@ -152,19 +170,45 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.relayout()
+		// A narrower window can hide the info pane out from under the focus.
+		if !m.infoVisible() && m.focus == focusInfo {
+			m.focus = focusDiff
+		}
+		if !m.loading && m.err == nil {
+			m.renderDiffContent()
+			m.refreshInfo()
+		}
 		return m, nil
 
 	case prLoadedMsg:
 		m.loading = false
 		m.err = msg.err
 		m.detail = msg.detail
+		// A post-action reload keeps you where you were; the initial load
+		// starts at the top of the first file.
+		prevSel, prevCursor, prevHunk := m.selected, m.diffCursor, m.curHunk
+		prevDiffY, prevConvY := m.diffVP.YOffset, m.convVP.YOffset
 		m.files = msg.files
 		if msg.err == nil {
 			m.selected = 0
+			if msg.keep && prevSel < len(m.files) {
+				m.selected = prevSel
+			}
 			m.relayout()
-			m.refreshDiff()
+			m.refreshDiff() // resets cursor/hunk to the file's defaults
+			if msg.keep {
+				if len(m.hunks) > 0 {
+					m.curHunk = clamp(prevHunk, 0, len(m.hunks)-1)
+				}
+				m.diffCursor = clamp(prevCursor, 0, max(0, m.diffNLines-1))
+				m.renderDiffContent()
+				m.diffVP.SetYOffset(prevDiffY)
+			}
 			m.refreshInfo()
 			m.refreshConv()
+			if msg.keep {
+				m.convVP.SetYOffset(prevConvY)
+			}
 		}
 		return m, nil
 
@@ -175,8 +219,9 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 			return m, nil
 		}
 		m.status = okStyle(m.th).Render("✓ " + msg.verb + " submitted")
-		// Reload conversation/checks so the new review/comment shows.
-		return m, loadPR(m.owner, m.repo, m.number)
+		// Reload conversation/checks so the new review/comment shows — but stay
+		// on the current file, line, and scroll position.
+		return m, loadPR(m.owner, m.repo, m.number, true)
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -186,7 +231,7 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 
 func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 	// Composer states capture most keys.
-	if m.state == stateComment || m.state == stateReject {
+	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
 		switch msg.String() {
 		case "esc":
 			m.state = stateBrowsing
@@ -200,10 +245,15 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.composer.Blur()
 			m.state = stateSubmitting
 			m.status = mutedStyle(m.th).Render("submitting…")
-			if st == stateComment {
+			switch st {
+			case stateComment:
 				return m, doComment(m.owner, m.repo, m.number, body)
+			case stateLineComment:
+				return m, doLineComment(m.owner, m.repo, m.number, m.detail.HeadSHA,
+					m.anchorPath, m.anchorLine, m.anchorSide, body)
+			default:
+				return m, doReview(m.owner, m.repo, m.number, "REQUEST_CHANGES", body)
 			}
-			return m, doReview(m.owner, m.repo, m.number, "REQUEST_CHANGES", body)
 		default:
 			var cmd tea.Cmd
 			m.composer, cmd = m.composer.Update(msg)
@@ -224,7 +274,10 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		}
 	}
 
-	// Browsing.
+	// Browsing. Any keystroke dismisses a lingering transient status line
+	// (e.g. a prior "approve failed" error); keys that set their own status
+	// below re-set it after this clear.
+	m.status = ""
 	switch msg.String() {
 	case "esc":
 		// From the conversation page, esc returns to the diff; from the diff
@@ -235,30 +288,51 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		}
 		return m, func() tea.Msg { return detailExitMsg{} }
 	case "v":
-		m.page = pageConversation
+		// Toggle the full conversation: v opens it, v again closes it back to
+		// the diff (esc also closes it).
+		if m.page == pageConversation {
+			m.page = pageDiff
+		} else {
+			m.page = pageConversation
+		}
 		return m, nil
 	case "d":
 		m.page = pageDiff
 		return m, nil
-	case "tab":
+	case "tab", "right":
 		m.focus = m.nextFocus(1)
 		return m, nil
-	case "shift+tab":
+	case "shift+tab", "left":
 		m.focus = m.nextFocus(-1)
 		return m, nil
 	case "i":
 		m.showInfo = !m.showInfo
 		m.relayout()
+		if !m.infoVisible() && m.focus == focusInfo {
+			m.focus = focusDiff
+		}
 		m.refreshDiff()
 		return m, nil
 	case "o":
 		return m, openBrowser(m.url)
 	case "c":
+		// On the diff with the diff pane focused, c comments on the cursor
+		// line (GitHub's "Add single comment"); otherwise it's a PR-level
+		// conversation comment.
+		if m.page == pageDiff && m.focus == focusDiff {
+			return m.startLineComment("")
+		}
 		m.state = stateComment
 		m.composer.Reset()
 		m.composer.Placeholder = "Write a comment (GitHub-flavored Markdown)…"
 		m.composer.Focus()
 		return m, textarea.Blink
+	case "s":
+		// Suggest a change on the cursor line: a comment pre-filled with a
+		// GitHub ```suggestion block seeded from the line's current content.
+		if m.page == pageDiff && m.focus == focusDiff {
+			return m.startLineComment("suggest")
+		}
 	case "x":
 		m.state = stateReject
 		m.composer.Reset()
@@ -302,9 +376,18 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.selectFile(m.selected - 1)
 		}
 	case focusDiff:
-		var cmd tea.Cmd
-		m.diffVP, cmd = m.diffVP.Update(msg)
-		return m, cmd
+		switch msg.String() {
+		case "down", "j":
+			m.moveCursor(1)
+			return m, nil
+		case "up", "k":
+			m.moveCursor(-1)
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.diffVP, cmd = m.diffVP.Update(msg)
+			return m, cmd
+		}
 	case focusInfo:
 		var cmd tea.Cmd
 		m.infoVP, cmd = m.infoVP.Update(msg)
@@ -313,9 +396,17 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 	return m, nil
 }
 
+// infoVisible reports whether the right pane is actually on screen — both
+// toggled on and wide enough to render. Tab focus and rendering both key off
+// this so you can never tab into an invisible pane.
+func (m *detailModel) infoVisible() bool {
+	_, _, infoW := m.paneWidths()
+	return m.showInfo && infoW > 0
+}
+
 func (m *detailModel) nextFocus(dir int) focusPane {
 	order := []focusPane{focusFiles, focusDiff}
-	if m.showInfo {
+	if m.infoVisible() {
 		order = append(order, focusInfo)
 	}
 	cur := 0
@@ -347,32 +438,144 @@ func (m *detailModel) gotoHunk(dir int) {
 	if len(m.hunks) == 0 {
 		return
 	}
-	cur := m.diffVP.YOffset
-	target := cur
-	if dir > 0 {
-		for _, h := range m.hunks {
-			if h > cur {
-				target = h
-				break
-			}
+	// Cycle: n past the last hunk wraps to the first, N past the first to the last.
+	n := len(m.hunks)
+	m.curHunk = (m.curHunk + dir + n) % n
+	// Park the line cursor on the hunk header, re-render (marks the active
+	// hunk + cursor), then scroll so it sits near the top. The scroll is a
+	// no-op when the whole diff fits, but the markers still move — so
+	// navigation stays visible. Move the cursor first so the contextual right
+	// pane updates too.
+	m.diffCursor = m.hunks[m.curHunk]
+	m.renderDiffContent()
+	m.refreshInfo()
+	m.diffVP.SetYOffset(m.hunks[m.curHunk])
+}
+
+// commentCounts maps each rendered diff-line index to the number of inline
+// comments anchored there, for the 💬N badges.
+func (m *detailModel) commentCounts() map[int]int {
+	if len(m.lineMeta) == 0 || len(m.detail.ReviewComments) == 0 {
+		return nil
+	}
+	path := m.files[m.selected].Filename
+	counts := map[int]int{}
+	for _, c := range m.detail.ReviewComments {
+		if c.Path != path {
+			continue
 		}
-	} else {
-		for i := len(m.hunks) - 1; i >= 0; i-- {
-			if m.hunks[i] < cur {
-				target = m.hunks[i]
-				break
+		for i, meta := range m.lineMeta {
+			if meta.side == c.Side && meta.line == c.Line {
+				counts[i]++
 			}
 		}
 	}
-	m.diffVP.SetYOffset(target)
+	return counts
+}
+
+// lineComments returns the inline comments anchored to the cursor's line.
+func (m *detailModel) lineComments() []gh.ReviewComment {
+	if m.diffCursor >= len(m.lineMeta) {
+		return nil
+	}
+	meta := m.lineMeta[m.diffCursor]
+	if meta.side == "" {
+		return nil
+	}
+	path := m.files[m.selected].Filename
+	var out []gh.ReviewComment
+	for _, c := range m.detail.ReviewComments {
+		if c.Path == path && c.Side == meta.side && c.Line == meta.line {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// renderDiffContent rebuilds the diff viewport content for the current file,
+// active hunk, cursor, and comment badges.
+func (m *detailModel) renderDiffContent() {
+	if len(m.files) == 0 {
+		return
+	}
+	m.diffVP.SetContent(renderDiff(m.th, m.files[m.selected], m.diffVP.Width,
+		m.curHunk, m.diffCursor, m.commentCounts()))
+}
+
+// moveCursor steps the diff line cursor, keeps it on screen, and refreshes the
+// contextual right pane.
+func (m *detailModel) moveCursor(dir int) {
+	if m.diffNLines == 0 {
+		return
+	}
+	m.diffCursor += dir
+	if m.diffCursor < 0 {
+		m.diffCursor = 0
+	}
+	if m.diffCursor >= m.diffNLines {
+		m.diffCursor = m.diffNLines - 1
+	}
+	m.renderDiffContent()
+	m.ensureCursorVisible()
+	m.refreshInfo()
+}
+
+// ensureCursorVisible scrolls the diff viewport just enough to keep the cursor
+// line within view.
+func (m *detailModel) ensureCursorVisible() {
+	top := m.diffVP.YOffset
+	bottom := top + m.diffVP.Height - 1
+	switch {
+	case m.diffCursor < top:
+		m.diffVP.SetYOffset(m.diffCursor)
+	case m.diffCursor > bottom:
+		m.diffVP.SetYOffset(m.diffCursor - m.diffVP.Height + 1)
+	}
+}
+
+// startLineComment opens the composer anchored to the cursor's diff line. mode
+// "suggest" pre-fills a GitHub ```suggestion block seeded with the line's text.
+func (m detailModel) startLineComment(mode string) (detailModel, tea.Cmd) {
+	if m.diffCursor >= len(m.lineMeta) {
+		return m, nil
+	}
+	meta := m.lineMeta[m.diffCursor]
+	if meta.side == "" {
+		m.status = mutedStyle(m.th).Render("can't comment here — pick a code line")
+		return m, nil
+	}
+	m.anchorPath = m.files[m.selected].Filename
+	m.anchorLine = meta.line
+	m.anchorSide = meta.side
+	m.state = stateLineComment
+	m.composer.Reset()
+	if mode == "suggest" {
+		m.composer.SetValue("```suggestion\n" + meta.code + "\n```\n")
+		m.composer.Placeholder = "Edit the suggested change…"
+	} else {
+		m.composer.Placeholder = "Comment on this line (GitHub-flavored Markdown)…"
+	}
+	m.composer.Focus()
+	return m, textarea.Blink
 }
 
 // ---- layout ----
 
 const (
-	detailHeaderH = 2
+	detailHeaderH = 3 // two info lines + a focus-colored rule
 	detailFooterH = 1
+	composerH     = 8 // textarea rows when the comment composer is open
 )
+
+// bottomReserve is how many lines the bottom strip needs: a one-line footer
+// while browsing, or the taller composer (textarea + its title) while writing.
+func (m detailModel) bottomReserve() int {
+	switch m.state {
+	case stateComment, stateReject, stateLineComment:
+		return composerH + 1
+	}
+	return detailFooterH
+}
 
 func (m *detailModel) paneWidths() (files, diff, info int) {
 	w := m.width
@@ -385,9 +588,9 @@ func (m *detailModel) paneWidths() (files, diff, info int) {
 	}
 	info = 0
 	if m.showInfo && w >= 100 {
-		info = 42
-		if info > w/3 {
-			info = w / 3
+		info = 52
+		if info > w*2/5 {
+			info = w * 2 / 5
 		}
 	}
 	gaps := 1
@@ -410,7 +613,7 @@ func (m *detailModel) relayout() {
 		bodyH = 3
 	}
 	_, diffW, infoW := m.paneWidths()
-	vpH := bodyH - 1 // one line for the pane title
+	vpH := bodyH - 2 // pane title + its underline rule
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -422,20 +625,30 @@ func (m *detailModel) relayout() {
 	}
 	// The conversation page is full width.
 	m.convVP.Width = m.width
-	m.convVP.Height = bodyH - 1
+	m.convVP.Height = vpH
 	m.composer.SetWidth(m.width - 4)
-	m.composer.SetHeight(5)
+	m.composer.SetHeight(composerH)
 }
 
 func (m *detailModel) refreshDiff() {
 	if len(m.files) == 0 {
 		m.diffVP.SetContent(mutedStyle(m.th).Render("  (no files changed)"))
 		m.hunks = nil
+		m.lineMeta = nil
+		m.diffNLines = 0
 		return
 	}
 	f := m.files[m.selected]
-	m.diffVP.SetContent(renderDiff(m.th, f, m.diffVP.Width))
 	m.hunks = hunkLineIndexes(f.Patch)
+	m.lineMeta = patchLineMeta(f.Patch)
+	m.diffNLines = len(m.lineMeta)
+	m.curHunk = 0
+	// Start the cursor on the first real change rather than the hunk header.
+	m.diffCursor = 0
+	if len(m.hunks) > 0 && m.hunks[0]+1 < m.diffNLines {
+		m.diffCursor = m.hunks[0] + 1
+	}
+	m.renderDiffContent()
 	m.diffVP.GotoTop()
 }
 
@@ -469,14 +682,14 @@ func (m detailModel) View() string {
 		body = m.viewBody()
 	}
 
-	if m.state == stateComment || m.state == stateReject {
+	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
 		return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewComposer())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewFooter())
 }
 
 func (m detailModel) viewConversation() string {
-	bodyH := m.height - detailHeaderH - detailFooterH
+	bodyH := m.height - detailHeaderH - m.bottomReserve()
 	if bodyH < 3 {
 		bodyH = 3
 	}
@@ -543,40 +756,73 @@ func (m detailModel) viewHeader() string {
 	line2 := lipgloss.NewStyle().Width(m.width).Padding(0, 1).
 		Render(infoStyle(m.th).Render(refs) + "  " + stats)
 
-	return lipgloss.JoinVertical(lipgloss.Left, line1, line2)
+	// A focus-colored rule under the header mirrors the dashboard's tab line.
+	rule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", max(1, m.width)))
+
+	return lipgloss.JoinVertical(lipgloss.Left, line1, line2, rule)
 }
 
 func (m detailModel) viewBody() string {
-	bodyH := m.height - detailHeaderH - detailFooterH
+	bodyH := m.height - detailHeaderH - m.bottomReserve()
 	if bodyH < 3 {
 		bodyH = 3
 	}
 	filesW, _, infoW := m.paneWidths()
 
-	filePane := m.paneBox("Files", m.renderFileList(filesW, bodyH-1), filesW, bodyH, m.focus == focusFiles)
+	filePane := m.paneBox("Files", m.renderFileList(filesW, bodyH-2), filesW, bodyH, m.focus == focusFiles)
 	diffTitle := "Diff"
 	if len(m.files) > 0 {
 		diffTitle = "Diff · " + shortPath(m.files[m.selected].Filename, m.diffVP.Width-8)
+		if len(m.hunks) > 1 {
+			diffTitle += fmt.Sprintf("  hunk %d/%d", m.curHunk+1, len(m.hunks))
+		}
 	}
 	diffPane := m.paneBox(diffTitle, m.diffVP.View(), m.diffVP.Width, bodyH, m.focus == focusDiff)
 
 	panes := []string{filePane, diffPane}
 	if infoW > 0 {
-		infoPane := m.paneBox("Conversation · Checks", m.infoVP.View(), infoW, bodyH, m.focus == focusInfo)
+		infoTitle := "Conversation · Checks"
+		if len(m.lineComments()) > 0 {
+			infoTitle = "💬 Line thread"
+		}
+		infoPane := m.paneBox(infoTitle, m.infoVP.View(), infoW, bodyH, m.focus == focusInfo)
 		panes = append(panes, infoPane)
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, joinWithGap(panes)...)
+	// Vertical rules between the panes make the columns read clearly.
+	sep := m.vSep(bodyH)
+	cols := make([]string, 0, len(panes)*2-1)
+	for i, p := range panes {
+		if i > 0 {
+			cols = append(cols, sep)
+		}
+		cols = append(cols, p)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, cols...)
 }
 
-// paneBox renders a titled, fixed-size pane; the title bar is focus-colored
-// when active.
+// paneBox renders a titled, fixed-size pane. The title sits over a rule that
+// reads like a tab underline — focus-colored when active, a subtle overlay
+// divider otherwise.
 func (m detailModel) paneBox(title, content string, w, h int, focused bool) string {
 	titleStyle := lipgloss.NewStyle().Width(w).Foreground(m.th.Muted)
+	ruleColor := m.th.Overlay
 	if focused {
-		titleStyle = titleStyle.Foreground(m.th.Focus).Bold(true).Underline(true)
+		titleStyle = titleStyle.Foreground(m.th.Focus).Bold(true)
+		ruleColor = m.th.Focus
 	}
-	body := lipgloss.NewStyle().Width(w).Height(h - 1).MaxHeight(h - 1).Render(content)
-	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render(title), body)
+	rule := lipgloss.NewStyle().Foreground(ruleColor).Render(strings.Repeat("─", max(1, w)))
+	body := lipgloss.NewStyle().Width(w).Height(h - 2).MaxHeight(h - 2).Render(content)
+	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render(title), rule, body)
+}
+
+// vSep is a full-height vertical divider drawn between panes.
+func (m detailModel) vSep(h int) string {
+	bar := lipgloss.NewStyle().Foreground(m.th.Overlay).Render("│")
+	lines := make([]string, h)
+	for i := range lines {
+		lines[i] = bar
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m detailModel) renderFileList(w, h int) string {
@@ -596,15 +842,17 @@ func (m detailModel) renderFileList(w, h int) string {
 	var lines []string
 	for i := start; i < end; i++ {
 		f := m.files[i]
-		letter := statusLetter(m.th, f.Status)
-		name := truncate(shortRepo(f.Filename), w-10)
-		counts := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", f.Additions))
-		line := fmt.Sprintf("%s %s %s", letter, pad(name, w-10), counts)
 		if i == m.selected {
-			line = lipgloss.NewStyle().Width(w).Foreground(m.th.Primary).Background(m.th.Surface).
-				Render(fmt.Sprintf("%s %s", statusLetterPlain(f.Status), truncate(shortRepo(f.Filename), w-4)))
+			// A filled bar + ▸ arrow makes the current file unmistakable.
+			sel := lipgloss.NewStyle().Width(w).Foreground(m.th.Base).Background(m.th.Primary).Bold(true)
+			name := truncate(shortRepo(f.Filename), w-6)
+			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s", statusLetterPlain(f.Status), name)))
+			continue
 		}
-		lines = append(lines, line)
+		letter := statusLetter(m.th, f.Status)
+		name := mutedStyle(m.th).Render(pad(truncate(shortRepo(f.Filename), w-10), w-10))
+		counts := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", f.Additions))
+		lines = append(lines, fmt.Sprintf("  %s %s %s", letter, name, counts))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -612,6 +860,20 @@ func (m detailModel) renderFileList(w, h int) string {
 func (m detailModel) renderInfo() string {
 	var b strings.Builder
 	h := func(s string) string { return infoStyle(m.th).Bold(true).Render(s) }
+
+	// When the diff cursor sits on a commented line, lead with that line's
+	// thread — the contextual half of GitHub's "Files changed" view.
+	if lc := m.lineComments(); len(lc) > 0 {
+		meta := m.lineMeta[m.diffCursor]
+		b.WriteString(h(fmt.Sprintf("💬 Comments on %s:%d", shortRepo(m.files[m.selected].Filename), meta.line)) + "\n")
+		for _, c := range lc {
+			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
+			b.WriteString(wrap(c.Body, m.infoVP.Width) + "\n\n")
+		}
+		b.WriteString(mutedStyle(m.th).Render("c reply · v full conversation") + "\n")
+		// A rule divides the contextual line thread from the PR-level info below.
+		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
+	}
 
 	if strings.TrimSpace(m.detail.Body) != "" {
 		b.WriteString(h("Description") + "\n")
@@ -626,6 +888,24 @@ func (m detailModel) renderInfo() string {
 		b.WriteString(checkGlyph(m.th, c.Conclusion) + " " + c.Name + "\n")
 	}
 	b.WriteString("\n")
+
+	if len(m.detail.ReviewRequests) > 0 {
+		b.WriteString(h(fmt.Sprintf("Review requested (%d)", len(m.detail.ReviewRequests))) + "\n")
+		for _, rr := range m.detail.ReviewRequests {
+			// Same ◆ you / ◇ others vocabulary as the dashboard.
+			glyph := mutedStyle(m.th).Render("◇")
+			name := "@" + rr.Name
+			if rr.IsTeam {
+				name = "team " + rr.Name
+			}
+			if rr.IsYou {
+				glyph = lipgloss.NewStyle().Foreground(m.th.Focus).Bold(true).Render("◆")
+				name += mutedStyle(m.th).Render(" (you)")
+			}
+			b.WriteString(glyph + " " + name + "\n")
+		}
+		b.WriteString("\n")
+	}
 
 	b.WriteString(h(fmt.Sprintf("Reviews (%d)", len(m.detail.Reviews))) + "\n")
 	for _, r := range m.detail.Reviews {
@@ -646,8 +926,11 @@ func (m detailModel) renderInfo() string {
 
 func (m detailModel) viewComposer() string {
 	title := "Comment"
-	if m.state == stateReject {
+	switch m.state {
+	case stateReject:
 		title = "Request changes — reason"
+	case stateLineComment:
+		title = fmt.Sprintf("Comment on %s:%d", shortRepo(m.anchorPath), m.anchorLine)
 	}
 	head := warnStyle(m.th).Render(title) + mutedStyle(m.th).Render("   ctrl+s submit · esc cancel")
 	return lipgloss.JoinVertical(lipgloss.Left, head, m.composer.View())
@@ -658,10 +941,14 @@ func (m detailModel) viewFooter() string {
 		return lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(m.status)
 	}
 	var help string
-	if m.page == pageConversation {
-		help = "↑/↓ scroll · c reply · a approve · x request-changes · o open · d diff · esc back"
-	} else {
-		help = "tab focus · ↑/↓ move · [ ] file · n/N hunk · v conversation · c comment · a approve · x changes · o open · esc back"
+	switch {
+	case m.page == pageConversation:
+		help = "↑/↓ scroll · c reply · a approve · x request-changes · o open · v/d/esc close"
+	case m.focus == focusDiff:
+		// On the diff, c/s act on the cursor line.
+		help = "↑/↓ line · n/N change · c comment line · s suggest · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
+	default:
+		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · esc back"
 	}
 	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
 		Render(truncate(help, max(10, m.width-2)))
@@ -744,21 +1031,6 @@ func statusColor(t theme.Theme, status string) lipgloss.Color {
 	}
 }
 
-// joinWithGap interleaves single-space gap columns between panes.
-func joinWithGap(panes []string) []string {
-	if len(panes) <= 1 {
-		return panes
-	}
-	out := make([]string, 0, len(panes)*2-1)
-	for i, p := range panes {
-		if i > 0 {
-			out = append(out, " ")
-		}
-		out = append(out, p)
-	}
-	return out
-}
-
 func shortPath(p string, max int) string {
 	if max < 4 {
 		max = 4
@@ -781,4 +1053,14 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }

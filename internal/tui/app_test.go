@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -90,5 +91,53 @@ func TestTabCyclingWraps(t *testing.T) {
 	m = drive(m, tea.KeyMsg{Type: tea.KeyShiftTab}) // wrap backwards
 	if m.active != 2 {
 		t.Fatalf("expected back-wrap to 2, got %d", m.active)
+	}
+}
+
+func dashboardWithItems(t *testing.T, n int) Model {
+	t.Helper()
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "x"}}}
+	m := New(cfg)
+	items := make([]gh.Item, n)
+	for i := range items {
+		items[i] = gh.Item{IsPR: true, Repo: "o/r", Number: i + 1, Title: fmt.Sprintf("PR %d", i+1)}
+	}
+	return drive(m,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		sectionLoadedMsg{idx: 0, items: items, total: n},
+	)
+}
+
+func TestDashboardListWrapsAround(t *testing.T) {
+	m := dashboardWithItems(t, 3)
+	idx := func() int { return m.sections[m.active].list.Index() }
+	if idx() != 0 {
+		t.Fatalf("expected to start at 0, got %d", idx())
+	}
+	// up on the first row wraps to the last.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if idx() != 2 {
+		t.Fatalf("up on first should wrap to last (2), got %d", idx())
+	}
+	// down on the last row wraps back to the first.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if idx() != 0 {
+		t.Fatalf("down on last should wrap to first (0), got %d", idx())
+	}
+}
+
+func TestDashboardEscDoesNotQuitButQDoes(t *testing.T) {
+	m := dashboardWithItems(t, 3)
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc}); cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatal("esc must not quit the dashboard")
+		}
+	}
+	_, qcmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if qcmd == nil {
+		t.Fatal("q should return a command")
+	}
+	if _, ok := qcmd().(tea.QuitMsg); !ok {
+		t.Fatal("q should quit the dashboard")
 	}
 }

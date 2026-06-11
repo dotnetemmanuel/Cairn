@@ -1,6 +1,9 @@
 package gh
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ReviewState mirrors GitHub's PR reviewDecision (may be empty when no review
 // is required or the item is an issue).
@@ -40,12 +43,19 @@ type Item struct {
 	Review    ReviewState
 	Checks    CheckState
 	UpdatedAt time.Time
+
+	// Review-request routing: whether a review is pending from the current
+	// user vs only from other reviewers. (Team requests count as "others" —
+	// membership isn't resolved.)
+	ReviewReqFromMe     bool
+	ReviewReqFromOthers bool
 }
 
 // searchQuery fills an entire board section in one round-trip: items plus
 // review decision plus CI rollup. Reads go through GraphQL (Hard Rule 3).
 const searchQuery = `
 query($q: String!, $n: Int!) {
+  viewer { login }
   search(query: $q, type: ISSUE, first: $n) {
     issueCount
     nodes {
@@ -55,6 +65,9 @@ query($q: String!, $n: Int!) {
         author { login }
         repository { nameWithOwner }
         reviewDecision
+        reviewRequests(first: 20) {
+          nodes { requestedReviewer { __typename ... on User { login } } }
+        }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
       ... on Issue {
@@ -67,6 +80,7 @@ query($q: String!, $n: Int!) {
 }`
 
 type searchResponse struct {
+	Viewer struct{ Login string }
 	Search struct {
 		IssueCount int `json:"issueCount"`
 		Nodes      []struct {
@@ -80,7 +94,15 @@ type searchResponse struct {
 			Author     struct{ Login string }
 			Repository struct{ NameWithOwner string }
 			ReviewDecision string
-			Commits        struct {
+			ReviewRequests struct {
+				Nodes []struct {
+					RequestedReviewer struct {
+						Typename string `json:"__typename"`
+						Login    string
+					}
+				}
+			}
+			Commits struct {
 				Nodes []struct {
 					Commit struct {
 						StatusCheckRollup *struct{ State string }
@@ -123,6 +145,14 @@ func SearchItems(filter string, limit int) (items []Item, total int, err error) 
 		if len(n.Commits.Nodes) > 0 {
 			if roll := n.Commits.Nodes[0].Commit.StatusCheckRollup; roll != nil {
 				it.Checks = CheckState(roll.State)
+			}
+		}
+		for _, rr := range n.ReviewRequests.Nodes {
+			r := rr.RequestedReviewer
+			if r.Typename == "User" && r.Login != "" && strings.EqualFold(r.Login, resp.Viewer.Login) {
+				it.ReviewReqFromMe = true
+			} else {
+				it.ReviewReqFromOthers = true
 			}
 		}
 		items = append(items, it)

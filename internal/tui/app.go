@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -86,6 +87,9 @@ func New(cfg config.Config) Model {
 		l.SetShowHelp(false)
 		l.SetShowPagination(true)
 		l.SetFilteringEnabled(false)
+		// The list's built-in quit binding maps to both q and esc; disable it so
+		// only our app-level q / ctrl+c quit (esc must not exit the dashboard).
+		l.DisableQuitKeybindings()
 		m.sections = append(m.sections, section{
 			title:   s.Title,
 			typ:     s.Type,
@@ -225,8 +229,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.headerLoading = true
 			return m, tea.Batch(cmds...)
 		}
-		// Forward navigation to the active section's list.
+		// Forward navigation to the active section's list, wrapping the cursor
+		// around the ends (down on the last row → first, up on the first → last).
 		if len(m.sections) > 0 {
+			lst := &m.sections[m.active].list
+			if n := len(lst.Items()); n > 0 && lst.FilterState() != list.Filtering {
+				switch msg.String() {
+				case "down", "j":
+					if lst.Index() == n-1 {
+						lst.Select(0)
+						return m, nil
+					}
+				case "up", "k":
+					if lst.Index() == 0 {
+						lst.Select(n - 1)
+						return m, nil
+					}
+				}
+			}
 			var cmd tea.Cmd
 			m.sections[m.active].list, cmd = m.sections[m.active].list.Update(msg)
 			return m, cmd
@@ -253,10 +273,11 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 	return m, m.detail.Init()
 }
 
-// chrome heights, used for both layout and list sizing.
+// chrome heights, used for both layout and list sizing. The tab strip is three
+// rows: the active tab's top border, the labels, and the body's top line.
 const (
 	headerH = 1
-	tabsH   = 1
+	tabsH   = 3
 	footerH = 1
 )
 
@@ -315,21 +336,40 @@ func (m Model) viewHeader() string {
 }
 
 func (m Model) viewTabs() string {
-	var tabs []string
+	// The active tab is a box whose bottom opens (┘ … └) into the body's top
+	// line; inactive tabs are plain labels sitting on that same line.
+	active := lipgloss.RoundedBorder()
+	active.BottomLeft, active.Bottom, active.BottomRight = "┘", " ", "└"
+
+	var cells []string
 	for i, s := range m.sections {
 		label := s.title
 		if s.loaded && s.err == nil {
 			label = fmt.Sprintf("%s (%d)", s.title, s.total)
 		}
-		style := lipgloss.NewStyle().Padding(0, 2).Foreground(m.th.Muted)
 		if i == m.active {
-			style = style.Foreground(m.th.Focus).Bold(true).
-				Underline(true)
+			cells = append(cells, lipgloss.NewStyle().
+				Border(active, true).BorderForeground(m.th.Focus).
+				Foreground(m.th.Focus).Bold(true).
+				Padding(0, 1).Render(label))
+		} else {
+			cells = append(cells, lipgloss.NewStyle().
+				Border(lipgloss.Border{Bottom: "─"}, false, false, true, false).
+				BorderForeground(m.th.Focus).
+				Foreground(m.th.Muted).
+				Padding(0, 1).Render(label))
 		}
-		tabs = append(tabs, style.Render(label))
 	}
-	bar := lipgloss.JoinHorizontal(lipgloss.Bottom, tabs...)
-	return lipgloss.NewStyle().Width(m.width).Render(bar)
+	row := lipgloss.JoinHorizontal(lipgloss.Bottom, cells...)
+
+	// Extend the body's top line to the full width past the last tab — the
+	// whole rule reads as one continuous focus-colored line.
+	gap := m.width - lipgloss.Width(row)
+	if gap < 0 {
+		gap = 0
+	}
+	filler := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", gap))
+	return lipgloss.JoinHorizontal(lipgloss.Bottom, row, filler)
 }
 
 func (m Model) viewBody() string {

@@ -49,7 +49,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	}
 
 	ci := ciGlyph(d.th, it.Checks)
-	rev := reviewGlyph(d.th, it.Review)
+	rev := reviewGlyph(d.th, it.Item)
 
 	refText := shortRepo(it.Repo)
 	if it.Number > 0 {
@@ -98,14 +98,20 @@ func ciGlyph(th theme.Theme, s gh.CheckState) string {
 	return lipgloss.NewStyle().Foreground(c).Render("●")
 }
 
-// reviewGlyph maps a review decision to a colored mark.
-func reviewGlyph(th theme.Theme, s gh.ReviewState) string {
-	switch s {
-	case gh.ReviewApproved:
+// reviewGlyph maps an item's review situation to a colored mark. A pending
+// review request from you (◆, bright) outranks everything else — it's your cue
+// to act; a request that's only on others shows a muted hollow ◇.
+func reviewGlyph(th theme.Theme, it gh.Item) string {
+	switch {
+	case it.ReviewReqFromMe:
+		return lipgloss.NewStyle().Foreground(th.Focus).Bold(true).Render("◆")
+	case it.Review == gh.ReviewApproved:
 		return lipgloss.NewStyle().Foreground(th.Success).Render("✓")
-	case gh.ReviewChangesRequested:
+	case it.Review == gh.ReviewChangesRequested:
 		return lipgloss.NewStyle().Foreground(th.Danger).Render("✗")
-	case gh.ReviewRequired:
+	case it.ReviewReqFromOthers:
+		return lipgloss.NewStyle().Foreground(th.Muted).Render("◇")
+	case it.Review == gh.ReviewRequired:
 		return lipgloss.NewStyle().Foreground(th.Warning).Render("•")
 	default:
 		return lipgloss.NewStyle().Foreground(th.Muted).Render("–")
