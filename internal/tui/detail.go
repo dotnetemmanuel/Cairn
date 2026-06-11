@@ -68,9 +68,10 @@ type detailModel struct {
 	convVP viewport.Model
 	hunks     []int          // hunk start line offsets for the selected file
 	curHunk   int            // index into hunks of the currently-marked hunk
-	diffCursor int           // rendered-line index of the diff line cursor
-	diffNLines int           // number of rendered diff lines (for clamping)
-	lineMeta  []diffLineMeta // per rendered diff line: side + file line + code
+	diffCursor int           // patch-line index of the diff line cursor
+	diffNLines int           // number of patch lines (for clamping)
+	lineMeta  []diffLineMeta // per patch line: side + file line + code
+	rowAt     []int          // patch-line index → first visual (wrapped) row
 
 	state    detailState
 	composer textarea.Model
@@ -227,6 +228,12 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+// composing reports whether a text composer is open and should receive raw
+// keystrokes (so global shortcuts like ? must not steal them).
+func (m detailModel) composing() bool {
+	return m.state == stateComment || m.state == stateReject || m.state == stateLineComment
 }
 
 func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
@@ -449,7 +456,15 @@ func (m *detailModel) gotoHunk(dir int) {
 	m.diffCursor = m.hunks[m.curHunk]
 	m.renderDiffContent()
 	m.refreshInfo()
-	m.diffVP.SetYOffset(m.hunks[m.curHunk])
+	m.diffVP.SetYOffset(m.visualRow(m.curHunkRow()))
+}
+
+// curHunkRow is the patch-line index of the active hunk header.
+func (m *detailModel) curHunkRow() int {
+	if m.curHunk >= 0 && m.curHunk < len(m.hunks) {
+		return m.hunks[m.curHunk]
+	}
+	return 0
 }
 
 // commentCounts maps each rendered diff-line index to the number of inline
@@ -498,8 +513,19 @@ func (m *detailModel) renderDiffContent() {
 	if len(m.files) == 0 {
 		return
 	}
-	m.diffVP.SetContent(renderDiff(m.th, m.files[m.selected], m.diffVP.Width,
-		m.curHunk, m.diffCursor, m.commentCounts()))
+	content, rowAt := renderDiff(m.th, m.files[m.selected], m.diffVP.Width,
+		m.curHunk, m.diffCursor, m.commentCounts())
+	m.rowAt = rowAt
+	m.diffVP.SetContent(content)
+}
+
+// visualRow maps a patch-line index to its first visual row (accounting for
+// soft-wrapped lines), for scrolling the viewport.
+func (m *detailModel) visualRow(patchIdx int) int {
+	if patchIdx >= 0 && patchIdx < len(m.rowAt) {
+		return m.rowAt[patchIdx]
+	}
+	return 0
 }
 
 // moveCursor steps the diff line cursor, keeps it on screen, and refreshes the
@@ -523,13 +549,22 @@ func (m *detailModel) moveCursor(dir int) {
 // ensureCursorVisible scrolls the diff viewport just enough to keep the cursor
 // line within view.
 func (m *detailModel) ensureCursorVisible() {
+	row := m.visualRow(m.diffCursor)
+	end := row // last visual row of this (possibly wrapped) line
+	if m.diffCursor+1 < len(m.rowAt) {
+		end = m.rowAt[m.diffCursor+1] - 1
+	}
 	top := m.diffVP.YOffset
 	bottom := top + m.diffVP.Height - 1
 	switch {
-	case m.diffCursor < top:
-		m.diffVP.SetYOffset(m.diffCursor)
-	case m.diffCursor > bottom:
-		m.diffVP.SetYOffset(m.diffCursor - m.diffVP.Height + 1)
+	case row < top:
+		m.diffVP.SetYOffset(row)
+	case end > bottom:
+		off := end - m.diffVP.Height + 1
+		if off > row { // a line taller than the pane: prefer showing its start
+			off = row
+		}
+		m.diffVP.SetYOffset(off)
 	}
 }
 

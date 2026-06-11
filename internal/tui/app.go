@@ -62,6 +62,7 @@ type Model struct {
 	localStack *stack.Tree
 	localRepo  string // owner/name of the cwd repo, "" if none
 	showStack  bool
+	showHelp   bool
 
 	spinner spinner.Model
 
@@ -187,6 +188,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailExitMsg:
 		m.mode = modeDashboard
 		return m, nil
+
+	case tea.KeyMsg:
+		// The help overlay is global and captures keys while open.
+		if m.showHelp {
+			switch msg.String() {
+			case "?", "esc", "q":
+				m.showHelp = false
+			}
+			return m, nil
+		}
+		// Open help on ? — unless the detail composer is capturing text, where
+		// ? is a literal character.
+		if msg.String() == "?" && !(m.mode == modeDetail && m.detail.composing()) {
+			m.showHelp = true
+			return m, nil
+		}
 	}
 
 	// In detail mode, everything else routes to the detail screen.
@@ -378,6 +395,9 @@ func (m Model) sidebarVisible() bool {
 func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
+	}
+	if m.showHelp {
+		return m.renderHelp()
 	}
 	if m.mode == modeDetail {
 		return m.detail.View()
@@ -611,7 +631,7 @@ func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w
 }
 
 func (m Model) viewFooter() string {
-	help := "↑/↓ move · ←/→ or tab section · enter open · s stack · r refresh · q quit"
+	help := "↑/↓ move · ←/→ section · enter open · s stack · r refresh · ? help · q quit"
 	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).
 		Padding(0, 1).Render(help)
 }

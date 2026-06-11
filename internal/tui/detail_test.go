@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 )
@@ -121,7 +122,7 @@ func TestEscEmitsExit(t *testing.T) {
 
 func TestRenderDiffMarksAddsAndDels(t *testing.T) {
 	th := theme.New(theme.DefaultPalette())
-	out := renderDiff(th, gh.FileDiff{
+	out, _ := renderDiff(th, gh.FileDiff{
 		Filename: "x.go",
 		Patch:    "@@ -1,2 +1,2 @@\n-removed\n+added\n unchanged",
 	}, 80, 0, -1, nil)
@@ -366,6 +367,32 @@ func TestConversationPageShowsComments(t *testing.T) {
 	if cmd != nil {
 		if _, ok := cmd().(detailExitMsg); ok {
 			t.Fatalf("esc from conversation should not exit to dashboard")
+		}
+	}
+}
+
+func TestRenderDiffWrapsLongLinesAndMapsRows(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	longAdd := "+" + strings.Repeat("x", 200) // one very long added line
+	f := gh.FileDiff{Filename: "x.txt", Patch: "@@ -1,1 +1,2 @@\n ctx\n" + longAdd}
+	content, rowAt := renderDiff(th, f, 40, 0, -1, nil)
+
+	// 3 patch lines (header, ctx, long add); the long add must span many rows.
+	if len(rowAt) != 3 {
+		t.Fatalf("expected rowAt for 3 patch lines, got %d", len(rowAt))
+	}
+	rows := strings.Count(content, "\n") + 1
+	if rows <= 3 {
+		t.Fatalf("long line should wrap to extra rows; got only %d visual rows", rows)
+	}
+	// rowAt is monotonic and the last line starts well past its patch index.
+	if !(rowAt[0] == 0 && rowAt[1] == 1 && rowAt[2] >= 2) {
+		t.Errorf("rowAt mapping wrong: %v", rowAt)
+	}
+	// No visual row exceeds the pane width (no terminal-level wrapping).
+	for _, line := range strings.Split(content, "\n") {
+		if lipgloss.Width(line) > 40 {
+			t.Errorf("row exceeds width 40 (=%d): %q", lipgloss.Width(line), line)
 		}
 	}
 }
