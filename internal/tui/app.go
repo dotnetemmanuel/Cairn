@@ -11,8 +11,10 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/dotnetemmanuel/cairn/internal/config"
 	"github.com/dotnetemmanuel/cairn/internal/gh"
+	"github.com/dotnetemmanuel/cairn/internal/stack"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 )
 
@@ -54,6 +56,13 @@ type Model struct {
 	sections []section
 	active   int
 
+	// Stack tree: remote stacks reconstructed from loaded PRs (any repo), plus
+	// the local git-town tree for the cwd repo (drift-aware overlay).
+	stacks     []*stack.Tree
+	localStack *stack.Tree
+	localRepo  string // owner/name of the cwd repo, "" if none
+	showStack  bool
+
 	spinner spinner.Model
 
 	// header state
@@ -77,6 +86,16 @@ func New(cfg config.Config) Model {
 		th:            th,
 		spinner:       sp,
 		headerLoading: true,
+		showStack:     true,
+	}
+
+	// Read the cwd repo's git-town lineage once (fast, local) for the drift
+	// overlay, and resolve its GitHub slug to match against PR repos.
+	if t, err := stack.Load(""); err == nil {
+		m.localStack = t
+	}
+	if r, err := repository.Current(); err == nil {
+		m.localRepo = r.Owner + "/" + r.Name
 	}
 
 	delegate := itemDelegate{th: th}
@@ -205,6 +224,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				items[i] = prItem{it}
 			}
 			s.list.SetItems(items)
+			m.rebuildStacks()
+			m.resizeLists() // sidebar visibility may have changed
 		}
 		return m, nil
 
@@ -219,6 +240,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "shift+tab", "h", "left":
 			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
+			return m, nil
+		case "s":
+			m.showStack = !m.showStack
+			m.resizeLists()
 			return m, nil
 		case "r":
 			cmds := []tea.Cmd{fetchViewer}
@@ -286,11 +311,67 @@ func (m *Model) resizeLists() {
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	delegate := itemDelegate{th: m.th, width: m.width}
+	listW := m.width
+	listH := bodyH
+	if m.sidebarVisible() {
+		listW = m.width - stackPaneW - 1 // sidebar + vertical separator
+		if listW < 20 {
+			listW = 20
+		}
+		listH = bodyH - 2 // the list pane gains a focused title + rule
+		if listH < 1 {
+			listH = 1
+		}
+	}
+	delegate := itemDelegate{th: m.th, width: listW}
 	for i := range m.sections {
 		m.sections[i].list.SetDelegate(delegate)
-		m.sections[i].list.SetSize(m.width, bodyH)
+		m.sections[i].list.SetSize(listW, listH)
 	}
+}
+
+// stackPaneW is the fixed width of the stack sidebar.
+const stackPaneW = 34
+
+// rebuildStacks reconstructs remote stacks from every loaded PR across all
+// sections (deduped), so the sidebar can follow the selected PR.
+func (m *Model) rebuildStacks() {
+	seen := map[string]bool{}
+	var refs []stack.PRRef
+	for i := range m.sections {
+		for _, li := range m.sections[i].list.Items() {
+			it, ok := li.(prItem)
+			if !ok || !it.IsPR || it.HeadBranch == "" {
+				continue
+			}
+			key := fmt.Sprintf("%s#%d", it.Repo, it.Number)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			refs = append(refs, stack.PRRef{
+				Repo: it.Repo, Number: it.Number,
+				Head: it.HeadBranch, Base: it.BaseBranch,
+				Review: string(it.Review), Checks: string(it.Checks),
+			})
+		}
+	}
+	m.stacks = stack.BuildRemoteStacks(refs)
+}
+
+// hasStacks reports whether any reconstructed or local stack is non-trivial (a
+// trunk plus at least two branches) — the bar for reserving sidebar space.
+func (m Model) hasStacks() bool {
+	for _, t := range m.stacks {
+		if len(t.Order) >= 3 {
+			return true
+		}
+	}
+	return m.localStack != nil && len(m.localStack.Order) >= 3
+}
+
+func (m Model) sidebarVisible() bool {
+	return m.showStack && m.width >= 90 && m.hasStacks()
 }
 
 // View renders header + tab bar + active section + footer.
@@ -382,24 +463,155 @@ func (m Model) viewBody() string {
 			Foreground(m.th.Muted).Render("  no sections configured")
 	}
 
+	sidebar := m.sidebarVisible()
+	listW, listH := m.width, bodyH
+	if sidebar {
+		listW = m.width - stackPaneW - 1
+		listH = bodyH - 2
+	}
+
 	s := m.sections[m.active]
-	box := lipgloss.NewStyle().Width(m.width).Height(bodyH)
+	box := lipgloss.NewStyle().Width(listW).Height(listH)
+	var body string
 	switch {
 	case s.loading:
-		return box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
+		body = box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
 	case s.err != nil:
-		return box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
+		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
 			Render("  error: " + s.err.Error()))
 	case len(s.list.Items()) == 0:
-		return box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).
-			Render("  nothing here"))
+		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).Render("  nothing here"))
 	default:
-		return s.list.View()
+		body = s.list.View()
 	}
+
+	if !sidebar {
+		return body
+	}
+
+	// The list is the focused pane: a blue title (with a position counter so
+	// it's obvious you're moving the PR list, not the stack) over a blue rule.
+	label := s.title
+	if n := len(s.list.Items()); n > 0 {
+		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, s.list.Index()+1, n)
+	}
+	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
+	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
+	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, body)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, m.renderStackSidebar(stackPaneW, bodyH), stackVBar(m.th, bodyH), listPane)
+}
+
+// Source icons (Nerd Font): a GitHub mark for remote-reconstructed nodes, a
+// laptop for branches also present in the local git-town config.
+const (
+	iconRemote = "" // nf-fa-github
+	iconLocal  = "" // nf-fa-laptop
+)
+
+func stackVBar(th theme.Theme, h int) string {
+	bar := lipgloss.NewStyle().Foreground(th.Overlay).Render("│")
+	lines := make([]string, h)
+	for i := range lines {
+		lines[i] = bar
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) selectedItem() (gh.Item, bool) {
+	if len(m.sections) == 0 {
+		return gh.Item{}, false
+	}
+	if it, ok := m.sections[m.active].list.SelectedItem().(prItem); ok {
+		return it.Item, true
+	}
+	return gh.Item{}, false
+}
+
+// renderStackSidebar draws the stack of the currently-selected PR — its chain
+// reconstructed from PR bases (remote), with local git-town drift overlaid where
+// the cwd repo matches.
+func (m Model) renderStackSidebar(w, h int) string {
+	// Muted title/rule: the sidebar is passive — it mirrors the PR list's
+	// selection rather than being scrolled itself.
+	title := lipgloss.NewStyle().Width(w).Foreground(m.th.Muted).Render("Stack (follows selection)")
+	rule := lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Repeat("─", w))
+
+	var nodes []*stack.Node
+	repo := ""
+	it, ok := m.selectedItem()
+	if ok && it.IsPR {
+		if tree := stack.FindStackInRepo(m.stacks, it.Repo, it.HeadBranch); tree != nil {
+			nodes = tree.Focused(it.HeadBranch) // only this PR's lineage, not siblings
+			repo = it.Repo
+		}
+	}
+
+	var body string
+	if len(nodes) < 2 {
+		body = mutedStyle(m.th).Render("  No stack for this PR.\n  Select a stacked PR to\n  see its lineage.")
+	} else {
+		legend := mutedStyle(m.th).Render(fmt.Sprintf("  %s remote  %s local", iconRemote, iconLocal))
+		body = m.renderStackTree(nodes, repo, it.HeadBranch, w) + "\n" + legend
+	}
+	bodyBox := lipgloss.NewStyle().Width(w).Height(h - 2).MaxHeight(h - 2).Render(body)
+	return lipgloss.JoinVertical(lipgloss.Left, title, rule, bodyBox)
+}
+
+func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w int) string {
+	var b strings.Builder
+	for _, n := range nodes {
+		// Local overlay: if this branch exists in the cwd repo's git-town config,
+		// mark it local and surface drift.
+		var local *stack.Node
+		if repo == m.localRepo {
+			local = m.localStack.NodeByName(n.Name)
+		}
+		icon := lipgloss.NewStyle().Foreground(m.th.Muted).Render(iconRemote)
+		if local != nil {
+			icon = lipgloss.NewStyle().Foreground(m.th.Info).Render(iconLocal)
+		}
+
+		indent := strings.Repeat("  ", n.Depth)
+		drifted := local != nil && local.Drifted
+
+		name := n.Name
+		nameStyle := lipgloss.NewStyle().Foreground(m.th.Text)
+		switch {
+		case n.Name == selectedHead:
+			// Selection wins over drift: the current PR is always pink.
+			nameStyle = lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true)
+		case n.IsTrunk:
+			nameStyle = lipgloss.NewStyle().Foreground(m.th.Muted)
+		case drifted:
+			nameStyle = lipgloss.NewStyle().Foreground(m.th.Warning) // amber drift
+		}
+
+		// PR suffix + status glyphs.
+		suffix := ""
+		if n.HasPR {
+			suffix = " " + lipgloss.NewStyle().Foreground(m.th.Info).Render(fmt.Sprintf("#%d", n.PRNumber))
+			suffix += " " + reviewGlyph(m.th, gh.Item{Review: gh.ReviewState(n.Review)})
+			suffix += ciGlyph(m.th, gh.CheckState(n.Checks))
+		}
+		if drifted {
+			suffix += " " + lipgloss.NewStyle().Foreground(m.th.Warning).Render("⚠")
+		}
+
+		// Budget the branch name to the remaining width.
+		used := 2 + len(indent) + lipgloss.Width(suffix) + 1
+		nameMax := w - used
+		if nameMax < 4 {
+			nameMax = 4
+		}
+		line := icon + " " + indent + nameStyle.Render(truncate(name, nameMax)) + suffix
+		b.WriteString(line + "\n")
+	}
+	return b.String()
 }
 
 func (m Model) viewFooter() string {
-	help := "↑/↓ or j/k move · ←/→ or tab section · enter open · r refresh · q quit"
+	help := "↑/↓ move · ←/→ or tab section · enter open · s stack · r refresh · q quit"
 	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).
 		Padding(0, 1).Render(help)
 }

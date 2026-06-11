@@ -44,6 +44,10 @@ type Item struct {
 	Checks    CheckState
 	UpdatedAt time.Time
 
+	// Branch refs, used to reconstruct stacks from PR base/head chains.
+	HeadBranch string
+	BaseBranch string
+
 	// Review-request routing: whether a review is pending from the current
 	// user vs only from other reviewers. (Team requests count as "others" —
 	// membership isn't resolved.)
@@ -62,6 +66,7 @@ query($q: String!, $n: Int!) {
       __typename
       ... on PullRequest {
         number title url isDraft state updatedAt
+        headRefName baseRefName
         author { login }
         repository { nameWithOwner }
         reviewDecision
@@ -88,11 +93,13 @@ type searchResponse struct {
 			Number     int
 			Title      string
 			URL        string
-			IsDraft    bool
-			State      string
-			UpdatedAt  time.Time
-			Author     struct{ Login string }
-			Repository struct{ NameWithOwner string }
+			IsDraft     bool
+			State       string
+			UpdatedAt   time.Time
+			HeadRefName string
+			BaseRefName string
+			Author      struct{ Login string }
+			Repository  struct{ NameWithOwner string }
 			ReviewDecision string
 			ReviewRequests struct {
 				Nodes []struct {
@@ -138,9 +145,11 @@ func SearchItems(filter string, limit int) (items []Item, total int, err error) 
 			Author:    n.Author.Login,
 			URL:       n.URL,
 			IsDraft:   n.IsDraft,
-			State:     n.State,
-			Review:    ReviewState(n.ReviewDecision),
-			UpdatedAt: n.UpdatedAt,
+			State:      n.State,
+			Review:     ReviewState(n.ReviewDecision),
+			UpdatedAt:  n.UpdatedAt,
+			HeadBranch: n.HeadRefName,
+			BaseBranch: n.BaseRefName,
 		}
 		if len(n.Commits.Nodes) > 0 {
 			if roll := n.Commits.Nodes[0].Commit.StatusCheckRollup; roll != nil {

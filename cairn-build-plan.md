@@ -206,12 +206,16 @@ Three panes, vim-style navigation, rebindable keys, `?` help overlay.
 - Actions: comment (Markdown composer, submit), approve, request-changes, open-in-browser as escape hatch.
 **Acceptance:** can read a real PR's diff, leave a comment, and approve it entirely from the TUI; the action reflects on github.com.
 
-### Phase 3 — Stack engine read path + stack tree `[ ]`
+### Phase 3 — Stack engine read path + stack tree `[x]`
 **Goal:** see the stack. No mutations yet.
 - Read git-town lineage from git config; build an in-memory stack model for the current repo.
 - Render the **stack tree** in the left pane: nodes with branch, PR#, review state, CI dot.
 - Drift detection: compare recorded parent vs actual merge-base; flag amber.
-- `up`/`down`/`top`/`bottom` navigation maps selection to branches.
+- ~~`up`/`down`/`top`/`bottom` navigation maps selection to branches.~~ Replaced
+  by a hybrid: the left **Stack pane** (toggle `s`) follows the selected PR in
+  the list. Stacks are reconstructed from PR base/head chains (remote, any repo)
+  and overlaid with local git-town drift (cwd repo); a GitHub icon marks remote
+  nodes, a laptop icon marks branches in local git-town config.
 **Acceptance:** in a repo with an existing git-town stack, the tree renders correctly and flags an artificially-drifted branch amber.
 
 ### Phase 4 — Stack authoring + maintenance `[ ]`
