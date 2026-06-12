@@ -30,6 +30,7 @@ type Comment struct {
 
 // Review is a submitted PR review.
 type Review struct {
+	ID        string // GraphQL node id, so inline comments can group under it
 	Author    string
 	State     string // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
 	Body      string
@@ -51,6 +52,8 @@ type ReviewComment struct {
 	Path      string
 	Line      int
 	Side      string // RIGHT (new) or LEFT (old); GitHub's diffSide
+	DiffHunk  string // the cited code context GitHub anchors the comment to
+	ReviewID  string // the review this inline comment belongs to ("" if none)
 	CreatedAt time.Time
 }
 
@@ -93,43 +96,80 @@ const (
 	KindInline
 )
 
-// TimelineEntry is one item in the unified, chronological conversation.
+// TimelineEntry is one item in the unified, chronological conversation. A
+// KindReview entry may carry Children: the inline comments left as part of that
+// review, rendered indented beneath it. KindInline entries carry DiffHunk (the
+// cited code context).
 type TimelineEntry struct {
 	Kind      TimelineKind
 	Author    string
 	Body      string
-	State     string // review state, for KindReview
-	Path      string // for KindInline
-	Line      int    // for KindInline
+	State     string          // review state, for KindReview
+	Path      string          // for KindInline
+	Line      int             // for KindInline
+	DiffHunk  string          // for KindInline: the cited code context
+	Children  []TimelineEntry // for KindReview: its inline comments
 	CreatedAt time.Time
 }
 
 // Timeline merges the PR description, conversation comments, review summaries,
 // and inline code comments into a single list ordered by creation time. The
-// description always leads.
+// description always leads. Inline comments that belong to a review are nested as
+// Children of that review's entry (so a reviewer's batch of suggestions/comments
+// renders indented under their one review), rather than scattered chronologically.
 func (d PRDetail) Timeline() []TimelineEntry {
-	var rest []TimelineEntry
-	for _, c := range d.Comments {
-		rest = append(rest, TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
-	}
+	var top []*TimelineEntry
+	byReview := map[string]*TimelineEntry{} // review id -> its entry, for nesting
+
 	for _, r := range d.Reviews {
-		// Skip bare COMMENTED reviews with no body (their substance is the
-		// inline comments, surfaced separately).
-		if r.State == "COMMENTED" && strings.TrimSpace(r.Body) == "" {
-			continue
+		e := &TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, CreatedAt: r.CreatedAt}
+		if r.ID != "" {
+			byReview[r.ID] = e
 		}
-		rest = append(rest, TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, CreatedAt: r.CreatedAt})
+		top = append(top, e)
+	}
+	for _, c := range d.Comments {
+		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
 	for _, rc := range d.ReviewComments {
-		rest = append(rest, TimelineEntry{Kind: KindInline, Author: rc.Author, Body: rc.Body, Path: rc.Path, Line: rc.Line, CreatedAt: rc.CreatedAt})
+		child := TimelineEntry{
+			Kind: KindInline, Author: rc.Author, Body: rc.Body,
+			Path: rc.Path, Line: rc.Line, DiffHunk: rc.DiffHunk, CreatedAt: rc.CreatedAt,
+		}
+		// Nest under the parent review when known; otherwise stand alone.
+		if parent := byReview[rc.ReviewID]; rc.ReviewID != "" && parent != nil {
+			parent.Children = append(parent.Children, child)
+		} else {
+			c := child
+			top = append(top, &c)
+		}
 	}
-	sort.SliceStable(rest, func(i, j int) bool {
-		return rest[i].CreatedAt.Before(rest[j].CreatedAt)
-	})
 
-	out := make([]TimelineEntry, 0, len(rest)+1)
+	// Drop bare COMMENTED reviews that carry neither a body nor any inline
+	// comments (their substance lived elsewhere); keep ones with nested comments.
+	kept := top[:0]
+	for _, e := range top {
+		if e.Kind == KindReview && e.State == "COMMENTED" &&
+			strings.TrimSpace(e.Body) == "" && len(e.Children) == 0 {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	top = kept
+
+	sort.SliceStable(top, func(i, j int) bool { return top[i].CreatedAt.Before(top[j].CreatedAt) })
+	for _, e := range top {
+		sort.SliceStable(e.Children, func(i, j int) bool {
+			return e.Children[i].CreatedAt.Before(e.Children[j].CreatedAt)
+		})
+	}
+
+	out := make([]TimelineEntry, 0, len(top)+1)
 	out = append(out, TimelineEntry{Kind: KindDescription, Author: d.Author, Body: d.Body, CreatedAt: d.CreatedAt})
-	return append(out, rest...)
+	for _, e := range top {
+		out = append(out, *e)
+	}
+	return out
 }
 
 const prDetailQuery = `
@@ -143,8 +183,8 @@ query($owner:String!,$repo:String!,$number:Int!){
       author{login}
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
       comments(first:50){nodes{author{login} body createdAt}}
-      reviews(first:50){nodes{author{login} state body createdAt}}
-      reviewThreads(first:50){nodes{path line diffSide comments(first:20){nodes{author{login} body createdAt}}}}
+      reviews(first:50){nodes{id author{login} state body createdAt}}
+      reviewThreads(first:50){nodes{path line diffSide comments(first:20){nodes{author{login} body createdAt diffHunk pullRequestReview{id}}}}}
       commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
@@ -196,6 +236,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				}
 				Reviews struct {
 					Nodes []struct {
+						ID        string
 						Author    struct{ Login string }
 						State     string
 						Body      string
@@ -209,9 +250,11 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 						DiffSide string
 						Comments struct {
 							Nodes []struct {
-								Author    struct{ Login string }
-								Body      string
-								CreatedAt time.Time
+								Author            struct{ Login string }
+								Body              string
+								CreatedAt         time.Time
+								DiffHunk          string
+								PullRequestReview struct{ ID string }
 							}
 						}
 					}
@@ -284,7 +327,8 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		}
 		for _, c := range th.Comments.Nodes {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
-				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, Side: side, CreatedAt: c.CreatedAt,
+				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, Side: side,
+				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, CreatedAt: c.CreatedAt,
 			})
 		}
 	}
@@ -293,7 +337,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		if r.State == "" || r.State == "PENDING" {
 			continue
 		}
-		d.Reviews = append(d.Reviews, Review{Author: r.Author.Login, State: r.State, Body: r.Body, CreatedAt: r.CreatedAt})
+		d.Reviews = append(d.Reviews, Review{ID: r.ID, Author: r.Author.Login, State: r.State, Body: r.Body, CreatedAt: r.CreatedAt})
 	}
 	if len(pr.Commits.Nodes) > 0 {
 		if roll := pr.Commits.Nodes[0].Commit.StatusCheckRollup; roll != nil {

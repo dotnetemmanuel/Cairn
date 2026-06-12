@@ -21,6 +21,9 @@ const (
 	pageConversation
 )
 
+// iconChat marks files/threads that carry inline review comments (width 2).
+const iconChat = "💬"
+
 // focusPane identifies which detail-screen region receives navigation keys.
 type focusPane int
 
@@ -733,7 +736,9 @@ func (m detailModel) viewConversation() string {
 	return m.paneBox(title, m.convVP.View(), m.width, bodyH, true)
 }
 
-// renderConversation builds the full-width, chronological thread.
+// renderConversation builds the full-width thread. Reviews lead with their
+// summary; the inline comments left as part of that review are rendered indented
+// beneath it, each with the cited code shown above the comment.
 func (m detailModel) renderConversation() string {
 	w := m.convVP.Width
 	if w < 8 {
@@ -745,19 +750,122 @@ func (m detailModel) renderConversation() string {
 		if i > 0 {
 			b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", w)) + "\n")
 		}
+
+		// A standalone inline comment (not surfaced under a review) renders its own
+		// header + cited code + body.
+		if e.Kind == gh.KindInline {
+			b.WriteString(m.renderInlineComment(e, w) + "\n")
+			continue
+		}
+
 		b.WriteString(m.conversationHeader(e) + "\n")
 		body := strings.TrimSpace(e.Body)
-		if body == "" {
-			body = mutedStyle(m.th).Render("(no message)")
-		} else {
-			body = wrap(body, w)
+		switch {
+		case body != "":
+			b.WriteString(wrap(body, w) + "\n")
+		case len(e.Children) > 0:
+			b.WriteString(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
+		default:
+			b.WriteString(mutedStyle(m.th).Render("(no message)") + "\n")
 		}
-		b.WriteString(body + "\n")
+
+		// A review's inline comments, indented under it with a guide.
+		if len(e.Children) > 0 {
+			prefix := mutedStyle(m.th).Render("  ┊ ")
+			childW := w - 4
+			if childW < 8 {
+				childW = 8
+			}
+			for _, ch := range e.Children {
+				b.WriteString(indentBlock(m.renderInlineComment(ch, childW), prefix) + "\n")
+			}
+		}
 	}
 	if len(entries) <= 1 && strings.TrimSpace(m.detail.Body) == "" {
 		return mutedStyle(m.th).Render("No conversation yet. Press c to comment.")
 	}
 	return b.String()
+}
+
+// renderInlineComment renders one inline code comment: a "who · where" header,
+// the cited code context, then the comment body.
+func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
+	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
+	loc := mutedStyle(m.th).Render(fmt.Sprintf("on %s:%d", shortRepo(e.Path), e.Line))
+	header := who + " " + loc + " · " + mutedStyle(m.th).Render(relTime(e.CreatedAt))
+
+	var b strings.Builder
+	b.WriteString(header + "\n")
+	if cite := m.renderCitation(e.DiffHunk, w); cite != "" {
+		b.WriteString(cite + "\n")
+	}
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		b.WriteString(mutedStyle(m.th).Render("(no message)"))
+	} else {
+		b.WriteString(wrap(body, w))
+	}
+	return b.String()
+}
+
+// renderCitation renders the cited code above a comment: the trailing lines of
+// the diff hunk the comment is anchored to, with a left guide and add/remove
+// coloring. It is a code citation, not the full diff — just enough context.
+func (m detailModel) renderCitation(diffHunk string, w int) string {
+	if strings.TrimSpace(diffHunk) == "" {
+		return ""
+	}
+	var code []string
+	for _, ln := range strings.Split(strings.TrimRight(diffHunk, "\n"), "\n") {
+		if strings.HasPrefix(ln, "@@") {
+			continue // drop the hunk header(s)
+		}
+		code = append(code, ln)
+	}
+	// Trim leading blank context so the citation starts on real code.
+	for len(code) > 0 && strings.TrimSpace(code[0]) == "" {
+		code = code[1:]
+	}
+	const maxLines = 4 // the lines just before/at the anchored line
+	if len(code) > maxLines {
+		code = code[len(code)-maxLines:]
+	}
+
+	bar := mutedStyle(m.th).Render("│ ")
+	var out []string
+	for _, ln := range code {
+		marker := byte(' ')
+		if len(ln) > 0 {
+			marker, ln = ln[0], ln[1:]
+		}
+		st := mutedStyle(m.th)
+		switch marker {
+		case '+':
+			st = lipgloss.NewStyle().Foreground(m.th.Success)
+		case '-':
+			st = lipgloss.NewStyle().Foreground(m.th.Danger)
+		}
+		out = append(out, bar+st.Render(truncate(ln, max(1, w-2))))
+	}
+	return strings.Join(out, "\n")
+}
+
+// reviewInlineNote labels a review that has only inline comments (empty body).
+func reviewInlineNote(n int) string {
+	if n == 1 {
+		return "left 1 inline comment:"
+	}
+	return fmt.Sprintf("left %d inline comments:", n)
+}
+
+// indentBlock prefixes every line of s with prefix (for nesting a rendered
+// block under a parent entry).
+func indentBlock(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = prefix + ln
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m detailModel) conversationHeader(e gh.TimelineEntry) string {
@@ -877,19 +985,37 @@ func (m detailModel) renderFileList(w, h int) string {
 	var lines []string
 	for i := start; i < end; i++ {
 		f := m.files[i]
+		// A 💬 to the right of files that carry inline review comments, so you
+		// know to open them. Reserve its slot (2 cols) even when absent so the
+		// rows stay aligned.
+		bubble := "  "
+		if m.fileHasComments(f.Filename) {
+			bubble = iconChat
+		}
 		if i == m.selected {
 			// A filled bar + ▸ arrow makes the current file unmistakable.
 			sel := lipgloss.NewStyle().Width(w).Foreground(m.th.Base).Background(m.th.Primary).Bold(true)
-			name := truncate(shortRepo(f.Filename), w-6)
-			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s", statusLetterPlain(f.Status), name)))
+			name := truncate(shortRepo(f.Filename), max(1, w-8))
+			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s %s", statusLetterPlain(f.Status), pad(name, max(1, w-8)), bubble)))
 			continue
 		}
 		letter := statusLetter(m.th, f.Status)
-		name := mutedStyle(m.th).Render(pad(truncate(shortRepo(f.Filename), w-10), w-10))
+		name := mutedStyle(m.th).Render(pad(truncate(shortRepo(f.Filename), w-13), max(1, w-13)))
 		counts := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", f.Additions))
-		lines = append(lines, fmt.Sprintf("  %s %s %s", letter, name, counts))
+		lines = append(lines, fmt.Sprintf("  %s %s %s %s", letter, name, bubble, counts))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// fileHasComments reports whether path carries any inline review comments — used
+// to flag files in the list with a 💬 so the reader knows to look.
+func (m detailModel) fileHasComments(path string) bool {
+	for _, c := range m.detail.ReviewComments {
+		if c.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (m detailModel) renderInfo() string {
