@@ -122,38 +122,42 @@ func Catalog() []Command {
 			Key: "n", Verb: "new", Title: "new", NeedsName: true, Mutates: true,
 			Short: "stack a new branch on top of this one",
 			Long: "Creates a new feature branch as a CHILD of the current branch — " +
-				"the next layer of the stack. Its PR will target the current branch, " +
-				"not main. Use this when your next change builds on the one you're on.",
+				"the next layer of the stack. When you propose it, its PR will target " +
+				"the current branch, not main. Use this when your next change builds on " +
+				"the one you're on.",
 		},
 		{
 			Key: "I", Verb: "insert", Title: "insert", NeedsName: true, Mutates: true,
 			Short: "wedge a new branch below the current one",
-			Long: "Creates a new branch as the PARENT of the current branch, slotting a " +
-				"change UNDERNEATH it in the stack. git-town then restacks everything " +
-				"above onto it. Use this when you realize a prerequisite change is missing.",
+			Long: "Creates a new, EMPTY branch as the PARENT of the current branch, wedging " +
+				"a slot UNDERNEATH it. Nothing moves yet — git-town just re-parents the " +
+				"current branch (and everything above) onto the new slot. Commit your " +
+				"prerequisite there, then sync to flow it up. Use this when you realize a " +
+				"lower change is missing.",
 		},
 		{
 			Key: "S", Verb: "sync", Title: "sync", Mutates: true,
 			Short: "pull trunk + rebase the whole stack, then push",
-			Long: "Fetches the latest trunk (main) and rebases every branch in the stack " +
-				"on top of it, removes branches whose PRs have merged, and pushes the " +
-				"results. This is how you keep a stack current with main and with each " +
+			Long: "Fetches the latest trunk (main) and rebases the whole stack back onto " +
+				"it — the base onto trunk, each branch above onto its parent — deletes " +
+				"local branches whose remote is gone (e.g. after a PR merges), and pushes " +
+				"the results. This is how you keep a stack current with main and with each " +
 				"other. (Cairn assumes git-town's rebase sync strategy.)",
 		},
 		{
 			Key: "R", Verb: "restack", Title: "restack", Mutates: true,
 			Short: "re-rebase the stack without pushing",
-			Long: "Like sync but WITHOUT pushing: re-rebases descendant branches onto " +
-				"their parents (it still fetches the latest trunk). Use it to clear a " +
-				"drift (amber ⚠) after you've amended or rewritten a lower branch, before " +
-				"you're ready to push.",
+			Long: "A full stack sync WITHOUT the push: fetches the latest trunk and " +
+				"rebases the stack locally — the base onto trunk, each branch onto its " +
+				"parent. Use it to clear a drift (amber ⚠) after you've amended or " +
+				"rewritten a lower branch, before you're ready to push.",
 		},
 		{
 			Key: "A", Verb: "amend", Title: "amend", Mutates: true,
 			Short: "fold staged changes into this branch, then restack",
-			Long: "Adds your currently-staged changes into the current branch's commit " +
-				"(git commit --amend), then restacks the branches above so they sit on " +
-				"the updated commit. Use it to revise a change already in the stack.",
+			Long: "Folds your currently-staged changes into the current branch's LATEST " +
+				"commit (git commit --amend), then restacks the branches above so they sit " +
+				"on the updated commit. Use it to revise a change already in the stack.",
 		},
 	}
 }

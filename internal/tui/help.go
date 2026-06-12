@@ -34,37 +34,67 @@ func (m Model) renderHelp() string {
 		return indent + wrapPlain(s, inner-len(indent), indent)
 	}
 
+	// The overlay is global, but its keys are context-specific: the stack
+	// mutation commands (n/I/S/R/A) only act inside stack mode, and several
+	// navigation keys (enter→open PR, s→sidebar, S→open stack mode, q→quit) only
+	// act on the dashboard. So we render the section that matches the mode the
+	// help was opened from — otherwise the same box would list, e.g., `S` as both
+	// "sync" and "open stack mode".
+	inStack := m.mode == modeStack
+
 	var b strings.Builder
-	b.WriteString(head("Stack commands") + "\n")
-	b.WriteString(dim(wrapPlain(
-		"A stack is a chain of branches where each PR targets the one below "+
-			"it instead of main. git-town keeps the chain rebased; Cairn drives it. "+
-			"New to git-town? Start with new, then sync.", inner, "")) + "\n\n")
 
-	for _, c := range townie.Catalog() {
-		name := c.Title
-		if c.NeedsName {
-			name += " <name>"
+	if inStack {
+		// Stack mode: the five mutation commands are live here. List them in full.
+		b.WriteString(head("Stack commands") + "\n")
+		b.WriteString(dim(wrapPlain(
+			"A stack is a chain of branches where each PR targets the one below "+
+				"it instead of main. git-town keeps the chain rebased; Cairn drives it. "+
+				"New to git-town? Start with new, then sync.", inner, "")) + "\n\n")
+
+		for _, c := range townie.Catalog() {
+			name := c.Title
+			if c.NeedsName {
+				name += " <name>"
+			}
+			b.WriteString(key(pad(c.Key, 3)) +
+				lipgloss.NewStyle().Foreground(th.Text).Bold(true).Render(name) + "\n")
+			b.WriteString(lipgloss.NewStyle().Foreground(th.Info).Render(indentWrap(c.Short, "    ")) + "\n")
+			b.WriteString(dim(indentWrap(c.Long, "    ")) + "\n")
+			b.WriteString("    " + dim("↳ "+c.Hint()) + "\n\n")
 		}
-		b.WriteString(key(pad(c.Key, 3)) +
-			lipgloss.NewStyle().Foreground(th.Text).Bold(true).Render(name) + "\n")
-		b.WriteString(lipgloss.NewStyle().Foreground(th.Info).Render(indentWrap(c.Short, "    ")) + "\n")
-		b.WriteString(dim(indentWrap(c.Long, "    ")) + "\n")
-		b.WriteString("    " + dim("↳ "+c.Hint()) + "\n\n")
-	}
 
-	b.WriteString(head("Navigation") + "\n")
-	for _, nav := range [][2]string{
-		{"↑/↓", "move within the list / stack"},
-		{"←/→ tab", "switch section"},
-		{"enter", "open the selected PR"},
-		{"s", "toggle the stack sidebar"},
-		{"S", "open stack mode (author/maintain the cwd repo's stack)"},
-		{"r", "refresh"},
-		{"?", "toggle this help"},
-		{"q", "quit"},
-	} {
-		b.WriteString(key(pad(nav[0], 9)) + " " + dim(nav[1]) + "\n")
+		b.WriteString(head("Navigation") + "\n")
+		for _, nav := range [][2]string{
+			{"↑/↓ j/k", "move within actions / stack"},
+			{"←/→ tab", "switch actions ⇄ tree"},
+			{"enter", "run the action / check out the branch"},
+			{"esc", "back to the dashboard"},
+			{"?", "toggle this help"},
+		} {
+			b.WriteString(key(pad(nav[0], 9)) + " " + dim(nav[1]) + "\n")
+		}
+	} else {
+		// Dashboard: list only keys that act here. Point at stack mode for the
+		// mutation commands (they're documented by stack mode's own `?`).
+		b.WriteString(head("Navigation") + "\n")
+		for _, nav := range [][2]string{
+			{"↑/↓", "move within the list / stack"},
+			{"←/→ tab", "switch section"},
+			{"enter", "open the selected PR"},
+			{"s", "toggle the stack sidebar"},
+			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
+			{"r", "refresh"},
+			{"?", "toggle this help"},
+			{"q", "quit"},
+		} {
+			b.WriteString(key(pad(nav[0], 9)) + " " + dim(nav[1]) + "\n")
+		}
+		b.WriteString("\n" + head("Stacks") + "\n")
+		b.WriteString(dim(wrapPlain(
+			"Press S to open stack mode and author/maintain stacked PRs in the "+
+				"current repo. Its own ? lists the stack commands (new, insert, sync, "+
+				"restack, amend).", inner, "")) + "\n")
 	}
 	b.WriteString("\n" + dim("? or esc to close"))
 

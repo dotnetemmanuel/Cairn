@@ -306,13 +306,15 @@ func (s stackModel) updateConfirming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 func (s stackModel) affectedBranches(c townie.Command, name string) []string {
 	cur := s.status.Branch
 	switch c.Verb {
-	case "amend", "restack":
+	case "amend":
+		// The amend rewrites cur's commit; only the branches ABOVE it must rebase.
 		return s.descendants(cur)
 	case "insert":
-		// The new branch slots under cur; cur and everything above it rebases.
+		// The new branch slots under cur; cur and everything above it re-parents.
 		return append([]string{cur}, s.descendants(cur)...)
-	case "sync":
-		// The whole stack rebases onto trunk.
+	case "restack", "sync":
+		// sync --stack [--no-push] operates on the WHOLE stack the branch belongs
+		// to (ancestors included), not just descendants of cur.
 		var all []string
 		if s.tree != nil {
 			for _, n := range s.tree.Order {
@@ -482,29 +484,26 @@ func (s stackModel) renderConfirm(w int) string {
 		effect = fmt.Sprintf("Creates %s as a child of %s; also syncs the affected branches if your tree is clean.", val(name), cur)
 	case "insert":
 		if len(desc) > 0 {
-			effect = fmt.Sprintf("Slots %s beneath %s; %s and %s re-stack onto it.",
+			effect = fmt.Sprintf("Wedges empty %s beneath %s; %s and %s are re-parented onto it — no commits move yet.",
 				val(name), cur, cur, humanList(desc))
 		} else {
-			effect = fmt.Sprintf("Slots %s beneath %s; %s re-stacks onto it.", val(name), cur, cur)
+			effect = fmt.Sprintf("Wedges empty %s beneath %s; %s is re-parented onto it — no commits move yet.", val(name), cur, cur)
 		}
 	case "amend":
 		if len(desc) > 0 {
-			effect = fmt.Sprintf("Rewrites %s's commit, then rebases %s onto it.", cur, humanList(desc))
+			effect = fmt.Sprintf("Rewrites %s's latest commit, then rebases %s onto it.", cur, humanList(desc))
 		} else {
-			effect = fmt.Sprintf("Rewrites %s's commit (no branches above to restack).", cur)
+			effect = fmt.Sprintf("Rewrites %s's latest commit (no branches above to restack).", cur)
 		}
 	case "restack":
-		switch len(desc) {
-		case 0:
-			effect = fmt.Sprintf("Nothing stacked above %s to restack.", cur)
-		case 1:
-			effect = fmt.Sprintf("Re-rebases %s onto its parent — no push (still fetches trunk).", desc[0])
-		default:
-			effect = fmt.Sprintf("Re-rebases %s onto their parents — no push (still fetches trunk).", humanList(desc))
+		if len(s.affected) > 0 {
+			effect = "Rebases the whole stack (" + humanList(s.affected) + ") locally onto the latest trunk — each branch onto its parent. No push."
+		} else {
+			effect = fmt.Sprintf("Rebases %s onto the latest trunk locally. No push.", cur)
 		}
 	case "sync":
 		if len(s.affected) > 0 {
-			effect = "Rebases the whole stack (" + humanList(s.affected) + ") onto the updated trunk, then pushes."
+			effect = "Rebases the stack (" + humanList(s.affected) + ") onto the updated trunk — each branch onto its parent — then pushes."
 		} else {
 			effect = "Pulls the trunk and pushes; no other stack branches to move."
 		}
