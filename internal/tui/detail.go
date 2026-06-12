@@ -24,6 +24,10 @@ const (
 // iconChat marks files/threads that carry inline review comments (width 2).
 const iconChat = "💬"
 
+// convReadW caps the conversation's text column so prose stays readable on wide
+// terminals instead of wrapping edge-to-edge.
+const convReadW = 100
+
 // focusPane identifies which detail-screen region receives navigation keys.
 type focusPane int
 
@@ -744,17 +748,24 @@ func (m detailModel) renderConversation() string {
 	if w < 8 {
 		w = 8
 	}
+	// Cap prose at a comfortable reading column on wide terminals — full-width
+	// wrapping is what made long comments hard to scan.
+	tw := w
+	if tw > convReadW {
+		tw = convReadW
+	}
+
 	entries := m.detail.Timeline()
 	var b strings.Builder
 	for i, e := range entries {
 		if i > 0 {
-			b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", w)) + "\n")
+			b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n")
 		}
 
 		// A standalone inline comment (not surfaced under a review) renders its own
 		// header + cited code + body.
 		if e.Kind == gh.KindInline {
-			b.WriteString(m.renderInlineComment(e, w) + "\n")
+			b.WriteString(m.renderInlineComment(e, tw) + "\n")
 			continue
 		}
 
@@ -762,21 +773,26 @@ func (m detailModel) renderConversation() string {
 		body := strings.TrimSpace(e.Body)
 		switch {
 		case body != "":
-			b.WriteString(wrap(body, w) + "\n")
+			b.WriteString(wrap(body, tw) + "\n")
 		case len(e.Children) > 0:
 			b.WriteString(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
 		default:
 			b.WriteString(mutedStyle(m.th).Render("(no message)") + "\n")
 		}
 
-		// A review's inline comments, indented under it with a guide.
+		// A review's inline comments, indented under it with a dotted guide and a
+		// blank guide line between them for separation.
 		if len(e.Children) > 0 {
 			prefix := mutedStyle(m.th).Render("  ┊ ")
-			childW := w - 4
+			childW := tw - 4
 			if childW < 8 {
 				childW = 8
 			}
-			for _, ch := range e.Children {
+			b.WriteString(prefix + "\n")
+			for j, ch := range e.Children {
+				if j > 0 {
+					b.WriteString(prefix + "\n")
+				}
 				b.WriteString(indentBlock(m.renderInlineComment(ch, childW), prefix) + "\n")
 			}
 		}
@@ -788,16 +804,16 @@ func (m detailModel) renderConversation() string {
 }
 
 // renderInlineComment renders one inline code comment: a "who · where" header,
-// the cited code context, then the comment body.
+// the cited code context, a blank line, then the comment body.
 func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
 	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
-	loc := mutedStyle(m.th).Render(fmt.Sprintf("on %s:%d", shortRepo(e.Path), e.Line))
-	header := who + " " + loc + " · " + mutedStyle(m.th).Render(relTime(e.CreatedAt))
+	loc := infoStyle(m.th).Render(fmt.Sprintf("%s:%d", shortRepo(e.Path), e.Line))
+	header := who + " " + mutedStyle(m.th).Render("on ") + loc + mutedStyle(m.th).Render(" · "+relTime(e.CreatedAt))
 
 	var b strings.Builder
 	b.WriteString(header + "\n")
-	if cite := m.renderCitation(e.DiffHunk, w); cite != "" {
-		b.WriteString(cite + "\n")
+	if cite := m.renderCitation(e.DiffHunk, e.Side, w); cite != "" {
+		b.WriteString(cite + "\n\n") // blank line separates the code from the comment
 	}
 	body := strings.TrimSpace(e.Body)
 	if body == "" {
@@ -808,46 +824,126 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
 	return b.String()
 }
 
+// citeLine is one line of a code citation: its file line number on the comment's
+// side (0 if the line doesn't exist on that side, e.g. a deletion shown on the
+// new side), the diff marker, and the de-tabbed text.
+type citeLine struct {
+	num    int
+	marker byte
+	text   string
+}
+
 // renderCitation renders the cited code above a comment: the trailing lines of
-// the diff hunk the comment is anchored to, with a left guide and add/remove
-// coloring. It is a code citation, not the full diff — just enough context.
-func (m detailModel) renderCitation(diffHunk string, w int) string {
+// the diff hunk the comment is anchored to, with file line numbers in a gutter,
+// a guide, and add/remove coloring. It is a code citation, not the full diff —
+// just enough context. Tabs are expanded and common indentation stripped so the
+// snippet stays inside the column (raw tabs were overflowing the pane).
+func (m detailModel) renderCitation(diffHunk, side string, w int) string {
 	if strings.TrimSpace(diffHunk) == "" {
 		return ""
 	}
-	var code []string
+	leftSide := side == "LEFT"
+
+	// Walk the hunk, tracking old/new line counters from the @@ header, and tag
+	// each line with the number to show for the comment's side.
+	var rows []citeLine
+	oldLn, newLn := 0, 0
 	for _, ln := range strings.Split(strings.TrimRight(diffHunk, "\n"), "\n") {
 		if strings.HasPrefix(ln, "@@") {
-			continue // drop the hunk header(s)
+			oldLn, newLn = parseHunkStarts(ln)
+			continue
 		}
-		code = append(code, ln)
+		marker, body := byte(' '), ln
+		if len(ln) > 0 {
+			marker, body = ln[0], ln[1:]
+		}
+		num := 0
+		switch marker {
+		case '+':
+			if !leftSide {
+				num = newLn
+			}
+			newLn++
+		case '-':
+			if leftSide {
+				num = oldLn
+			}
+			oldLn++
+		default: // context line — present on both sides
+			if leftSide {
+				num = oldLn
+			} else {
+				num = newLn
+			}
+			oldLn++
+			newLn++
+		}
+		rows = append(rows, citeLine{num: num, marker: marker, text: strings.ReplaceAll(body, "\t", "  ")})
 	}
-	// Trim leading blank context so the citation starts on real code.
-	for len(code) > 0 && strings.TrimSpace(code[0]) == "" {
-		code = code[1:]
+	for len(rows) > 0 && strings.TrimSpace(rows[0].text) == "" {
+		rows = rows[1:] // start on real code, not blank context
 	}
 	const maxLines = 4 // the lines just before/at the anchored line
-	if len(code) > maxLines {
-		code = code[len(code)-maxLines:]
+	if len(rows) > maxLines {
+		rows = rows[len(rows)-maxLines:]
 	}
 
-	bar := mutedStyle(m.th).Render("│ ")
-	var out []string
-	for _, ln := range code {
-		marker := byte(' ')
-		if len(ln) > 0 {
-			marker, ln = ln[0], ln[1:]
+	// Strip the common leading indentation so deep code starts near the guide.
+	texts := make([]string, len(rows))
+	for i, r := range rows {
+		texts[i] = r.text
+	}
+	if d := commonIndent(texts); d > 0 {
+		for i := range rows {
+			if len(rows[i].text) >= d {
+				rows[i].text = rows[i].text[d:]
+			}
 		}
+	}
+
+	// Gutter wide enough for the largest line number.
+	gw := 1
+	for _, r := range rows {
+		if n := len(fmt.Sprintf("%d", r.num)); r.num > 0 && n > gw {
+			gw = n
+		}
+	}
+	var out []string
+	for _, r := range rows {
 		st := mutedStyle(m.th)
-		switch marker {
+		switch r.marker {
 		case '+':
 			st = lipgloss.NewStyle().Foreground(m.th.Success)
 		case '-':
 			st = lipgloss.NewStyle().Foreground(m.th.Danger)
 		}
-		out = append(out, bar+st.Render(truncate(ln, max(1, w-2))))
+		gutter := strings.Repeat(" ", gw)
+		if r.num > 0 {
+			gutter = fmt.Sprintf("%*d", gw, r.num)
+		}
+		prefix := mutedStyle(m.th).Render(gutter + " │ ")
+		out = append(out, prefix+st.Render(truncate(r.text, max(1, w-gw-3))))
 	}
 	return strings.Join(out, "\n")
+}
+
+// commonIndent returns the number of leading spaces shared by all non-blank
+// lines (for de-indenting a code citation).
+func commonIndent(lines []string) int {
+	min := -1
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		lead := len(ln) - len(strings.TrimLeft(ln, " "))
+		if min < 0 || lead < min {
+			min = lead
+		}
+	}
+	if min < 0 {
+		return 0
+	}
+	return min
 }
 
 // reviewInlineNote labels a review that has only inline comments (empty body).

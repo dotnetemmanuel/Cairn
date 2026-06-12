@@ -49,12 +49,13 @@ type Check struct {
 type ReviewComment struct {
 	Author    string
 	Body      string
-	Path      string
-	Line      int
-	Side      string // RIGHT (new) or LEFT (old); GitHub's diffSide
-	DiffHunk  string // the cited code context GitHub anchors the comment to
-	ReviewID  string // the review this inline comment belongs to ("" if none)
-	CreatedAt time.Time
+	Path         string
+	Line         int
+	OriginalLine int    // line at the comment's original commit (matches DiffHunk)
+	Side         string // RIGHT (new) or LEFT (old); GitHub's diffSide
+	DiffHunk     string // the cited code context GitHub anchors the comment to
+	ReviewID     string // the review this inline comment belongs to ("" if none)
+	CreatedAt    time.Time
 }
 
 // ReviewRequest is a pending (not-yet-submitted) review request on a PR.
@@ -107,6 +108,7 @@ type TimelineEntry struct {
 	State     string          // review state, for KindReview
 	Path      string          // for KindInline
 	Line      int             // for KindInline
+	Side      string          // for KindInline: RIGHT (new) or LEFT (old)
 	DiffHunk  string          // for KindInline: the cited code context
 	Children  []TimelineEntry // for KindReview: its inline comments
 	CreatedAt time.Time
@@ -132,9 +134,16 @@ func (d PRDetail) Timeline() []TimelineEntry {
 		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
 	for _, rc := range d.ReviewComments {
+		// The diff hunk (and so the citation gutter) is anchored at the comment's
+		// original line; show that in the header too, so they agree even when the
+		// PR moved on. ReviewComment.Line stays the current line for diff badges.
+		line := rc.Line
+		if rc.OriginalLine > 0 {
+			line = rc.OriginalLine
+		}
 		child := TimelineEntry{
 			Kind: KindInline, Author: rc.Author, Body: rc.Body,
-			Path: rc.Path, Line: rc.Line, DiffHunk: rc.DiffHunk, CreatedAt: rc.CreatedAt,
+			Path: rc.Path, Line: line, Side: rc.Side, DiffHunk: rc.DiffHunk, CreatedAt: rc.CreatedAt,
 		}
 		// Nest under the parent review when known; otherwise stand alone.
 		if parent := byReview[rc.ReviewID]; rc.ReviewID != "" && parent != nil {
@@ -184,7 +193,7 @@ query($owner:String!,$repo:String!,$number:Int!){
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
       comments(first:50){nodes{author{login} body createdAt}}
       reviews(first:50){nodes{id author{login} state body createdAt}}
-      reviewThreads(first:50){nodes{path line diffSide comments(first:20){nodes{author{login} body createdAt diffHunk pullRequestReview{id}}}}}
+      reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{author{login} body createdAt diffHunk pullRequestReview{id}}}}}
       commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
@@ -245,9 +254,10 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				}
 				ReviewThreads struct {
 					Nodes []struct {
-						Path     string
-						Line     int
-						DiffSide string
+						Path         string
+						Line         int
+						OriginalLine int
+						DiffSide     string
 						Comments struct {
 							Nodes []struct {
 								Author            struct{ Login string }
@@ -327,7 +337,8 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		}
 		for _, c := range th.Comments.Nodes {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
-				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, Side: side,
+				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line,
+				OriginalLine: th.OriginalLine, Side: side,
 				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, CreatedAt: c.CreatedAt,
 			})
 		}
