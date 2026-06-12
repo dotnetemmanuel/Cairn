@@ -46,6 +46,7 @@ type stackModel struct {
 	repo   string
 	status stack.RepoStatus
 	tree   *stack.Tree // local git-town tree (drift-aware); nil when no git-town
+	trunk  string      // best-effort trunk guess, for the git-town init prompt
 
 	commands []townie.Command
 	cursor   int
@@ -115,6 +116,30 @@ func (s *stackModel) reload() {
 		} else if s.treeCursor >= len(s.tree.Order) {
 			s.treeCursor = 0
 		}
+	}
+	// When the repo lacks git-town, guess a trunk to pre-fill the init prompt.
+	if s.status.InRepo && s.tree == nil {
+		s.trunk = stack.DetectTrunk("")
+	}
+}
+
+// needsInit reports whether the cwd is a git repo that has no git-town config —
+// the state where Cairn offers to initialize git-town instead of dead-ending.
+func (s stackModel) needsInit() bool {
+	return s.status.InRepo && !s.hasGitTown()
+}
+
+// initCommand is the synthetic command behind the "set up git-town" affordance.
+// It is not in townie.Catalog() (it's contextual, shown only when git-town is
+// missing), but it routes through the same naming → confirm → run flow.
+func initCommand() townie.Command {
+	return townie.Command{
+		Verb: "init", Title: "set up git-town", NeedsName: true, Mutates: true,
+		Short: "configure this repo for stacks",
+		Long: "Sets up git-town for this repo: marks a trunk branch (your stack's " +
+			"base, usually main) and standardizes on rebase syncing. This only writes " +
+			"local .git/config — nothing is committed, staged, or pushed, and no file " +
+			"is added to the repo. Afterwards the stack commands light up.",
 	}
 }
 
@@ -208,6 +233,20 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 
 	if s.focus == focusTree {
 		return s.updateTree(msg)
+	}
+
+	// No git-town here: the right pane is the init call-to-action, so enter starts
+	// the guided setup (pre-filled with the detected trunk) rather than the list.
+	if s.needsInit() {
+		if msg.String() == "enter" {
+			s.pending = initCommand()
+			s.name.SetValue(s.trunk)
+			s.name.CursorEnd()
+			s.name.Focus()
+			s.phase = stackNaming
+			return s, textinput.Blink
+		}
+		return s, nil
 	}
 
 	switch msg.String() {
@@ -412,8 +451,38 @@ func (s stackModel) renderRight(w int) string {
 	case stackRunning, stackDone:
 		return s.renderOutput(w)
 	default:
+		if s.needsInit() {
+			return s.renderInitCTA(w)
+		}
 		return s.renderActions(w)
 	}
+}
+
+// renderInitCTA is shown when the repo has no git-town config: a single, guided
+// call-to-action to initialize it, so stack mode isn't a dead end.
+func (s stackModel) renderInitCTA(w int) string {
+	title := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render("Set up git-town")
+	rule := lipgloss.NewStyle().Foreground(s.th.Focus).Render(strings.Repeat("─", w))
+
+	intro := mutedStyle(s.th).Render(wrapPlain(
+		"This repo isn't configured for stacks yet. Cairn can initialize git-town "+
+			"for you — it only writes local .git/config, nothing is committed or pushed.", w-2, ""))
+
+	trunk := s.trunk
+	if trunk == "" {
+		trunk = "(none detected — you'll name it)"
+	}
+	bullets := []string{
+		"mark the trunk branch — detected: " + trunk,
+		"standardize on rebase syncing (right for stacks)",
+	}
+	var bl strings.Builder
+	for _, b := range bullets {
+		bl.WriteString(lipgloss.NewStyle().Foreground(s.th.Text).Render("• "+b) + "\n")
+	}
+
+	cta := lipgloss.NewStyle().Foreground(s.th.Success).Bold(true).Render("[enter] set up git-town")
+	return lipgloss.JoinVertical(lipgloss.Left, title, rule, "", intro, "", bl.String(), cta)
 }
 
 func (s stackModel) renderActions(w int) string {
@@ -454,7 +523,11 @@ func (s stackModel) renderActions(w int) string {
 }
 
 func (s stackModel) renderNaming(w int) string {
-	title := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render(s.pending.Title + " — name the new branch")
+	prompt := " — name the new branch"
+	if s.pending.Verb == "init" {
+		prompt = " — which branch is the trunk?"
+	}
+	title := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render(s.pending.Title + prompt)
 	rule := lipgloss.NewStyle().Foreground(s.th.Focus).Render(strings.Repeat("─", w))
 	explain := mutedStyle(s.th).Render(wrapPlain(s.pending.Long, w-2, ""))
 	field := lipgloss.NewStyle().Foreground(s.th.Text).Render(s.name.View())
@@ -466,7 +539,9 @@ func (s stackModel) renderConfirm(w int) string {
 	c := s.pending
 	name := strings.TrimSpace(s.name.Value())
 	headline := c.Title
-	if name != "" {
+	// init's "name" is the trunk, already shown in the effect + runs lines, so
+	// keep its headline clean ("set up git-town — confirm").
+	if name != "" && c.Verb != "init" {
 		headline += " " + name
 	}
 	title := lipgloss.NewStyle().Foreground(s.th.Primary).Bold(true).Render(headline + " — confirm")
@@ -507,6 +582,8 @@ func (s stackModel) renderConfirm(w int) string {
 		} else {
 			effect = "Pulls the trunk and pushes; no other stack branches to move."
 		}
+	case "init":
+		effect = fmt.Sprintf("Marks %s as the trunk and sets rebase syncing — writes local .git/config only, nothing committed or pushed.", val(name))
 	default:
 		effect = "Affects " + cur + "."
 	}
@@ -555,9 +632,12 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	var help string
 	switch s.phase {
 	case stackBrowsing:
-		if s.focus == focusTree {
+		switch {
+		case s.needsInit():
+			help = "enter set up git-town · esc dashboard"
+		case s.focus == focusTree:
 			help = "↑/↓ j/k branch · enter checkout · tab ←/→ actions · esc dashboard"
-		} else {
+		default:
 			help = "↑/↓ j/k move · enter choose · tab ←/→ tree (checkout) · esc dashboard"
 		}
 	case stackNaming:
@@ -579,6 +659,9 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 func commandLine(c townie.Command, name string) string {
 	if c.Verb == "amend" {
 		return "git commit --amend --no-edit  →  git town sync --stack --no-push"
+	}
+	if c.Verb == "init" {
+		return fmt.Sprintf("git config git-town.main-branch %s  →  git config git-town.sync-feature-strategy rebase", val(name))
 	}
 	line := c.Hint()
 	if name != "" {

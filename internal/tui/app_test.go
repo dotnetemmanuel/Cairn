@@ -153,8 +153,11 @@ func TestEnterStackModeFromDashboard(t *testing.T) {
 		t.Fatalf("S should switch to stack mode, got mode %d", m.mode)
 	}
 	view := m.View()
-	if !strings.Contains(view, "Stack actions") {
-		t.Errorf("stack mode view should show the action list:\n%s", view)
+	// The local-stack pane title is present in stack mode regardless of whether
+	// the cwd repo has git-town configured (the action list vs the init CTA
+	// depends on that, but this pane always renders).
+	if !strings.Contains(view, "Local stack (cwd)") {
+		t.Errorf("stack mode view should render the local stack pane:\n%s", view)
 	}
 	// Esc emits a stackExitMsg command; run it and feed the result back.
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})

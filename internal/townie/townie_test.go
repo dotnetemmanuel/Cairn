@@ -57,6 +57,34 @@ func TestAmendIsTwoSteps(t *testing.T) {
 	}
 }
 
+func TestInitRunsTwoConfigCommands(t *testing.T) {
+	rr := &recordRunner{out: "ok"}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	if _, err := ops.Run("init", "main"); err != nil {
+		t.Fatalf("init err: %v", err)
+	}
+	if len(rr.calls) != 2 {
+		t.Fatalf("init should run 2 commands, ran %d: %v", len(rr.calls), rr.calls)
+	}
+	if got := strings.Join(rr.calls[0], " "); got != "git config git-town.main-branch main" {
+		t.Errorf("step 1 = %q", got)
+	}
+	if got := strings.Join(rr.calls[1], " "); got != "git config git-town.sync-feature-strategy rebase" {
+		t.Errorf("step 2 = %q", got)
+	}
+}
+
+func TestInitStopsIfFirstStepFails(t *testing.T) {
+	rr := &recordRunner{err: errors.New("exit 1")}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	if _, err := ops.Run("init", "main"); err == nil {
+		t.Fatal("expected error to propagate")
+	}
+	if len(rr.calls) != 1 {
+		t.Errorf("second config must not run after the first fails; calls = %v", rr.calls)
+	}
+}
+
 func TestAmendStopsIfFirstStepFails(t *testing.T) {
 	rr := &recordRunner{out: "nothing to amend", err: errors.New("exit 1")}
 	ops := Ops{Dir: "/repo", Runner: rr}

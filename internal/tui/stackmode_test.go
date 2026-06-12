@@ -156,6 +156,69 @@ func TestStackRunTransitionsAndReloads(t *testing.T) {
 	}
 }
 
+// fakeRunner records the commands a stack op delegates, for asserting the init
+// flow without touching real git.
+type fakeRunner struct{ calls [][]string }
+
+func (f *fakeRunner) Run(_, name string, args ...string) (string, error) {
+	f.calls = append(f.calls, append([]string{name}, args...))
+	return "configured", nil
+}
+
+func TestInitCTAAndFlow(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	s := newStackModelBare(th, "o/sandbox")
+	s.status = stack.RepoStatus{InRepo: true} // in a repo…
+	s.tree = nil                              // …but no git-town config
+	s.trunk = "main"                          // detected trunk for the prompt
+	fr := &fakeRunner{}
+	s.ops = townie.Ops{Runner: fr}
+
+	if !s.needsInit() {
+		t.Fatal("InRepo + no git-town should need init")
+	}
+	if v := s.renderInitCTA(60); !strings.Contains(v, "Set up git-town") || !strings.Contains(v, "main") {
+		t.Errorf("init CTA should show the title and detected trunk:\n%s", v)
+	}
+
+	// enter starts the guided setup, pre-filled with the detected trunk.
+	s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyEnter})
+	if s2.phase != stackNaming || s2.pending.Verb != "init" {
+		t.Fatalf("enter should start init naming; phase=%d verb=%q", s2.phase, s2.pending.Verb)
+	}
+	if s2.name.Value() != "main" {
+		t.Errorf("init prompt should pre-fill trunk 'main', got %q", s2.name.Value())
+	}
+
+	// Naming → confirmation, which shows the two config commands.
+	s3, _ := s2.updateNaming(tea.KeyMsg{Type: tea.KeyEnter})
+	if s3.phase != stackConfirming {
+		t.Fatalf("naming enter → confirming, got phase %d", s3.phase)
+	}
+	cv := s3.renderConfirm(72)
+	for _, w := range []string{"git config git-town.main-branch main", "rebase", "do it"} {
+		if !strings.Contains(cv, w) {
+			t.Errorf("init confirm missing %q:\n%s", w, cv)
+		}
+	}
+
+	// Confirm → run; the closure delegates the two git config writes in order.
+	s4, cmd := s3.updateConfirming(tea.KeyMsg{Type: tea.KeyEnter})
+	if s4.phase != stackRunning || cmd == nil {
+		t.Fatalf("confirm enter → running, got phase %d cmd=%v", s4.phase, cmd != nil)
+	}
+	s4.Update(cmd()) // executes the op; fr records the calls
+	if len(fr.calls) != 2 {
+		t.Fatalf("init should run 2 git config commands, ran %d: %v", len(fr.calls), fr.calls)
+	}
+	if got := strings.Join(fr.calls[0], " "); got != "git config git-town.main-branch main" {
+		t.Errorf("step 1 = %q", got)
+	}
+	if got := strings.Join(fr.calls[1], " "); got != "git config git-town.sync-feature-strategy rebase" {
+		t.Errorf("step 2 = %q", got)
+	}
+}
+
 func TestStackTabFocusesTreeAndCheckout(t *testing.T) {
 	s := fixtureModel() // current = feat-mid
 	// Tab moves focus to the tree.

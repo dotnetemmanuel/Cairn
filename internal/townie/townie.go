@@ -67,7 +67,8 @@ func argv(verb, name string) []string {
 }
 
 // Run executes the given verb (with an optional branch name) and returns the
-// combined output. amend is a two-step sequence (amend, then restack).
+// combined output. amend is a two-step sequence (amend, then restack); init is a
+// two-step sequence that writes git-town's config keys (name = the trunk branch).
 func (o Ops) Run(verb, name string) (string, error) {
 	if verb == "amend" {
 		out, err := o.exec(argv("amend", ""))
@@ -77,11 +78,41 @@ func (o Ops) Run(verb, name string) (string, error) {
 		rest, rerr := o.exec(argv("restack", ""))
 		return strings.TrimRight(out, "\n") + "\n" + rest, rerr
 	}
+	if verb == "init" {
+		return o.runSeq(InitArgv(name))
+	}
 	a := argv(verb, name)
 	if a == nil {
 		return "", &UnknownVerbError{Verb: verb}
 	}
 	return o.exec(a)
+}
+
+// runSeq runs each command in order, accumulating output, and stops at the first
+// error (so a failed first step never runs the second).
+func (o Ops) runSeq(cmds [][]string) (string, error) {
+	var out []string
+	for _, a := range cmds {
+		s, err := o.exec(a)
+		out = append(out, strings.TrimRight(s, "\n"))
+		if err != nil {
+			return strings.Join(out, "\n"), err
+		}
+	}
+	return strings.Join(out, "\n"), nil
+}
+
+// InitArgv is the command sequence that initializes git-town for a repo: it marks
+// the trunk branch and standardizes on rebase syncing (right for stacked PRs).
+// git-town 23 has no non-interactive config setter — its own `init` is a
+// full-screen wizard — so Cairn writes the exact git-town.* keys git-town reads
+// from local .git/config. These touch only local config: nothing is committed,
+// staged, or pushed, and no tracked file is created.
+func InitArgv(trunk string) [][]string {
+	return [][]string{
+		{"git", "config", "git-town.main-branch", trunk},
+		{"git", "config", "git-town.sync-feature-strategy", "rebase"},
+	}
 }
 
 func (o Ops) exec(a []string) (string, error) {
