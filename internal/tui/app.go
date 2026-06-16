@@ -131,10 +131,11 @@ type viewerMsg struct {
 }
 
 type sectionLoadedMsg struct {
-	idx   int
-	items []gh.Item
-	total int
-	err   error
+	idx    int
+	items  []gh.Item
+	closed []gh.Item // recently closed/merged matches, shown under a divider
+	total  int
+	err    error
 }
 
 func fetchViewer() tea.Msg {
@@ -142,19 +143,124 @@ func fetchViewer() tea.Msg {
 	return viewerMsg{v: v, err: err}
 }
 
+// closedLimit caps the recently-closed tail shown under a section's open
+// items — enough for recency context without burying the open list.
+const closedLimit = 15
+
 func loadSection(idx int, typ, filter string) tea.Cmd {
 	return func() tea.Msg {
-		var (
-			items []gh.Item
-			total int
-			err   error
-		)
 		if typ == config.SectionNotifications {
-			items, total, err = gh.FetchNotifications(searchLimit)
-		} else {
-			items, total, err = gh.SearchItems(filter, searchLimit)
+			items, total, err := gh.FetchNotifications(searchLimit)
+			return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
 		}
-		return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
+		items, total, err := gh.SearchItems(filter, searchLimit)
+		if err != nil {
+			return sectionLoadedMsg{idx: idx, err: err}
+		}
+		// A best-effort recent-closed tail: failures here don't fail the
+		// section — the open list is what matters.
+		closed, _, _ := gh.SearchItems(closedFilter(filter), closedLimit)
+		return sectionLoadedMsg{idx: idx, items: items, closed: closed, total: total}
+	}
+}
+
+// closedFilter turns a section's (open) search into its closed counterpart:
+// flip is:open to is:closed (or append it), and pin a recency sort so the
+// freshest closed items surface.
+func closedFilter(filter string) string {
+	fields := strings.Fields(filter)
+	flipped, hasSort := false, false
+	for i, t := range fields {
+		switch {
+		case strings.EqualFold(t, "is:open"):
+			fields[i] = "is:closed"
+			flipped = true
+		case strings.HasPrefix(strings.ToLower(t), "sort:"):
+			hasSort = true
+		}
+	}
+	if !flipped {
+		fields = append(fields, "is:closed")
+	}
+	if !hasSort {
+		fields = append(fields, "sort:updated-desc")
+	}
+	return strings.Join(fields, " ")
+}
+
+// sectionRows assembles a section's list rows: open items, then any recently
+// closed/merged items beneath a divider. The "OPEN"/"CLOSED" labels appear
+// only when both groups are present — a lone group needs no header.
+func sectionRows(open, closed []gh.Item) []list.Item {
+	rows := make([]list.Item, 0, len(open)+len(closed)+2)
+	both := len(open) > 0 && len(closed) > 0
+	if both {
+		rows = append(rows, sectionHeader{"OPEN"})
+	}
+	for _, it := range open {
+		rows = append(rows, prItem{it})
+	}
+	if both {
+		rows = append(rows, sectionHeader{"CLOSED"})
+	}
+	for _, it := range closed {
+		rows = append(rows, prItem{it})
+	}
+	return rows
+}
+
+// ensureSelectable nudges the cursor off a divider row onto the nearest
+// selectable item (searching forward, then wrapping). No-op when already on a
+// real item or when the list holds none.
+func ensureSelectable(lst *list.Model) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	if _, ok := items[lst.Index()].(prItem); ok {
+		return
+	}
+	for i := 1; i <= n; i++ {
+		idx := (lst.Index() + i) % n
+		if _, ok := items[idx].(prItem); ok {
+			lst.Select(idx)
+			return
+		}
+	}
+}
+
+// selectablePos reports the 1-based rank of the selected item among the
+// selectable (non-divider) rows, and the total selectable count — so the
+// position counter ignores divider headers.
+func selectablePos(lst *list.Model) (pos, total int) {
+	for i, li := range lst.Items() {
+		if _, ok := li.(prItem); !ok {
+			continue
+		}
+		total++
+		if i <= lst.Index() {
+			pos = total
+		}
+	}
+	return pos, total
+}
+
+// selectAdjacent moves the cursor to the next selectable item in direction dir
+// (+1 down, -1 up), skipping divider rows and wrapping at the ends.
+func selectAdjacent(lst *list.Model, dir int) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	cur := lst.Index()
+	for i := 0; i < n; i++ {
+		cur = (cur + dir + n) % n
+		if _, ok := items[cur].(prItem); ok {
+			lst.Select(cur)
+			return
+		}
 	}
 }
 
@@ -256,11 +362,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.err = msg.err
 		s.total = msg.total
 		if msg.err == nil {
-			items := make([]list.Item, len(msg.items))
-			for i, it := range msg.items {
-				items[i] = prItem{it}
-			}
-			s.list.SetItems(items)
+			s.list.SetItems(sectionRows(msg.items, msg.closed))
+			ensureSelectable(&s.list)
 			m.rebuildStacks()
 			m.resizeLists() // sidebar visibility may have changed
 		}
@@ -297,26 +400,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.headerLoading = true
 			return m, tea.Batch(cmds...)
 		}
-		// Forward navigation to the active section's list, wrapping the cursor
-		// around the ends (down on the last row → first, up on the first → last).
+		// Forward navigation to the active section's list. j/k/arrows move to the
+		// next selectable row, skipping divider headers and wrapping at the ends.
 		if len(m.sections) > 0 {
 			lst := &m.sections[m.active].list
-			if n := len(lst.Items()); n > 0 && lst.FilterState() != list.Filtering {
+			if len(lst.Items()) > 0 && lst.FilterState() != list.Filtering {
 				switch msg.String() {
 				case "down", "j":
-					if lst.Index() == n-1 {
-						lst.Select(0)
-						return m, nil
-					}
+					selectAdjacent(lst, +1)
+					return m, nil
 				case "up", "k":
-					if lst.Index() == 0 {
-						lst.Select(n - 1)
-						return m, nil
-					}
+					selectAdjacent(lst, -1)
+					return m, nil
 				}
 			}
 			var cmd tea.Cmd
 			m.sections[m.active].list, cmd = m.sections[m.active].list.Update(msg)
+			ensureSelectable(&m.sections[m.active].list)
 			return m, cmd
 		}
 	}
@@ -549,8 +649,8 @@ func (m Model) viewBody() string {
 	// The list is the focused pane: a blue title (with a position counter so
 	// it's obvious you're moving the PR list, not the stack) over a blue rule.
 	label := s.title
-	if n := len(s.list.Items()); n > 0 {
-		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, s.list.Index()+1, n)
+	if pos, n := selectablePos(&s.list); n > 0 {
+		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
 	}
 	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
 	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
