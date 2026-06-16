@@ -371,6 +371,41 @@ func TestConversationPageShowsComments(t *testing.T) {
 	}
 }
 
+func TestConversationThreadsReplyUnderAnchor(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 9})
+	base := time.Now().Add(-3 * time.Hour)
+	detail := gh.PRDetail{
+		Number: 9, State: "OPEN", HeadSHA: "deadbeef",
+		Reviews: []gh.Review{
+			{ID: "REV1", Author: "daniel", State: "CHANGES_REQUESTED", Body: "see comments", CreatedAt: base},
+		},
+		ReviewComments: []gh.ReviewComment{
+			{ThreadID: 1, Author: "daniel", Body: "rename this var", Path: "a.go", Line: 5,
+				DiffHunk: "@@ -1 +1 @@\n+x := 1", ReviewID: "REV1", CreatedAt: base.Add(time.Minute)},
+			{ThreadID: 1, Author: "emmanuel", Body: "renamed in fixup", Path: "a.go", Line: 5,
+				CreatedAt: base.Add(time.Hour)},
+		},
+	}
+	files := []gh.FileDiff{{Filename: "a.go", Status: "modified", Additions: 1, Patch: "@@ -1 +1 @@\n+x := 1"}}
+	m = driveDetail(m,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")}, // open full conversation
+	)
+	view := m.View()
+	// The anchor, its citation, and the reply all show; the reply carries the ↳ guide.
+	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "↳"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("threaded conversation missing %q", w)
+		}
+	}
+	// The reply must appear AFTER the anchor body (threaded beneath, not before).
+	if strings.Index(view, "renamed in fixup") < strings.Index(view, "rename this var") {
+		t.Error("reply should render beneath the anchor, not above it")
+	}
+}
+
 func TestRenderDiffWrapsLongLinesAndMapsRows(t *testing.T) {
 	th := theme.New(theme.DefaultPalette())
 	longAdd := "+" + strings.Repeat("x", 200) // one very long added line

@@ -78,3 +78,62 @@ func TestTimelineNestsInlineCommentsUnderReview(t *testing.T) {
 		t.Errorf("inline with no review id should stay top-level, got %+v", tl[2])
 	}
 }
+
+func TestTimelineThreadsRepliesUnderAnchor(t *testing.T) {
+	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	d := PRDetail{
+		Author: "author", Body: "desc", CreatedAt: base,
+		Reviews: []Review{
+			{ID: "REV1", Author: "daniel", State: "CHANGES_REQUESTED", Body: "see comments", CreatedAt: base.Add(time.Hour)},
+		},
+		ReviewComments: []ReviewComment{
+			// Thread 1: daniel's suggestion (anchor, part of REV1), then the author's
+			// reply submitted later as a standalone comment (no review id).
+			{ThreadID: 1, Author: "daniel", Body: "rename this", Path: "a.go", Line: 5, DiffHunk: "@@ -1 +1 @@\n+code", ReviewID: "REV1", CreatedAt: base.Add(61 * time.Minute)},
+			{ThreadID: 1, Author: "author", Body: "done!", Path: "a.go", Line: 5, ReviewID: "", CreatedAt: base.Add(2 * time.Hour)},
+		},
+	}
+
+	tl := d.Timeline()
+	// description + Daniel's review = 2 top-level entries; the reply must NOT
+	// appear at top level (the bug: it was appended to the conversation).
+	if len(tl) != 2 {
+		t.Fatalf("want 2 top-level entries (reply threaded, not appended), got %d", len(tl))
+	}
+	rev := tl[1]
+	if rev.Kind != KindReview || len(rev.Children) != 1 {
+		t.Fatalf("review should carry the 1 thread anchor; kind=%d children=%d", rev.Kind, len(rev.Children))
+	}
+	anchor := rev.Children[0]
+	if anchor.Author != "daniel" || anchor.DiffHunk == "" {
+		t.Errorf("anchor should be daniel's suggestion with its citation, got %+v", anchor)
+	}
+	if len(anchor.Replies) != 1 || anchor.Replies[0].Author != "author" || anchor.Replies[0].Body != "done!" {
+		t.Fatalf("author's reply must thread under the anchor, got %+v", anchor.Replies)
+	}
+}
+
+func TestTimelineThreadsStandaloneAnchorKeepsReplies(t *testing.T) {
+	base := time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC)
+	d := PRDetail{
+		Author: "author", Body: "desc", CreatedAt: base,
+		ReviewComments: []ReviewComment{
+			// A thread whose anchor belongs to no surfaced review stays top-level,
+			// but still carries its reply nested beneath it.
+			{ThreadID: 7, Author: "stranger", Body: "is this right?", Path: "c.go", Line: 3, DiffHunk: "@@\n+x", CreatedAt: base.Add(time.Hour)},
+			{ThreadID: 7, Author: "author", Body: "yes", Path: "c.go", Line: 3, CreatedAt: base.Add(2 * time.Hour)},
+		},
+	}
+
+	tl := d.Timeline()
+	if len(tl) != 2 { // description + the standalone anchor (reply nested, not appended)
+		t.Fatalf("want 2 top-level entries, got %d", len(tl))
+	}
+	anchor := tl[1]
+	if anchor.Kind != KindInline || anchor.Author != "stranger" {
+		t.Fatalf("standalone thread anchor should be top-level inline, got %+v", anchor)
+	}
+	if len(anchor.Replies) != 1 || anchor.Replies[0].Author != "author" {
+		t.Fatalf("reply must thread under the standalone anchor, got %+v", anchor.Replies)
+	}
+}

@@ -821,6 +821,27 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
 	} else {
 		b.WriteString(wrap(body, w))
 	}
+
+	// Threaded replies render beneath the anchor with a deeper guide and no
+	// citation — they share the anchor's code location, so re-citing it is noise.
+	if len(e.Replies) > 0 {
+		prefix := mutedStyle(m.th).Render("    ↳ ")
+		replyW := w - 6
+		if replyW < 8 {
+			replyW = 8
+		}
+		for _, r := range e.Replies {
+			who := infoStyle(m.th).Bold(true).Render("@" + r.Author)
+			header := who + mutedStyle(m.th).Render(" · "+relTime(r.CreatedAt))
+			rbody := strings.TrimSpace(r.Body)
+			if rbody == "" {
+				rbody = mutedStyle(m.th).Render("(no message)")
+			} else {
+				rbody = wrap(rbody, replyW)
+			}
+			b.WriteString("\n" + indentBlock(header+"\n"+rbody, prefix))
+		}
+	}
 	return b.String()
 }
 

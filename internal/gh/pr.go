@@ -55,6 +55,7 @@ type ReviewComment struct {
 	Side         string // RIGHT (new) or LEFT (old); GitHub's diffSide
 	DiffHunk     string // the cited code context GitHub anchors the comment to
 	ReviewID     string // the review this inline comment belongs to ("" if none)
+	ThreadID     int    // review-thread group (1-based); comments sharing it are one thread, first = anchor. 0 = ungrouped.
 	CreatedAt    time.Time
 }
 
@@ -98,9 +99,10 @@ const (
 )
 
 // TimelineEntry is one item in the unified, chronological conversation. A
-// KindReview entry may carry Children: the inline comments left as part of that
-// review, rendered indented beneath it. KindInline entries carry DiffHunk (the
-// cited code context).
+// KindReview entry may carry Children: the thread anchors left as part of that
+// review, rendered indented beneath it. A KindInline entry is a review-thread
+// anchor: it carries DiffHunk (the cited code context) and may carry Replies —
+// the later comments in its thread, rendered indented beneath the anchor.
 type TimelineEntry struct {
 	Kind      TimelineKind
 	Author    string
@@ -110,7 +112,8 @@ type TimelineEntry struct {
 	Line      int             // for KindInline
 	Side      string          // for KindInline: RIGHT (new) or LEFT (old)
 	DiffHunk  string          // for KindInline: the cited code context
-	Children  []TimelineEntry // for KindReview: its inline comments
+	Children  []TimelineEntry // for KindReview: its thread anchors
+	Replies   []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
 	CreatedAt time.Time
 }
 
@@ -133,6 +136,17 @@ func (d PRDetail) Timeline() []TimelineEntry {
 	for _, c := range d.Comments {
 		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
+	// Group inline comments into their review threads. A thread's FIRST comment is
+	// the anchor (it carries the citation); later comments are Replies rendered
+	// beneath it. The whole thread nests under the review the ANCHOR belongs to —
+	// so a reply submitted as its own event threads under the suggestion instead
+	// of scattering. Comments with ThreadID 0 are ungrouped (each its own anchor).
+	type anchorRef struct {
+		e        *TimelineEntry
+		reviewID string
+	}
+	var anchors []anchorRef
+	threadAnchor := map[int]*TimelineEntry{} // 1-based thread id -> its anchor entry
 	for _, rc := range d.ReviewComments {
 		// The diff hunk (and so the citation gutter) is anchored at the comment's
 		// original line; show that in the header too, so they agree even when the
@@ -141,16 +155,30 @@ func (d PRDetail) Timeline() []TimelineEntry {
 		if rc.OriginalLine > 0 {
 			line = rc.OriginalLine
 		}
-		child := TimelineEntry{
+		entry := TimelineEntry{
 			Kind: KindInline, Author: rc.Author, Body: rc.Body,
 			Path: rc.Path, Line: line, Side: rc.Side, DiffHunk: rc.DiffHunk, CreatedAt: rc.CreatedAt,
 		}
-		// Nest under the parent review when known; otherwise stand alone.
-		if parent := byReview[rc.ReviewID]; rc.ReviewID != "" && parent != nil {
-			parent.Children = append(parent.Children, child)
+		// A reply (a later comment in an already-seen thread) folds under its anchor.
+		if rc.ThreadID != 0 {
+			if a := threadAnchor[rc.ThreadID]; a != nil {
+				a.Replies = append(a.Replies, entry)
+				continue
+			}
+		}
+		a := entry
+		if rc.ThreadID != 0 {
+			threadAnchor[rc.ThreadID] = &a
+		}
+		anchors = append(anchors, anchorRef{e: &a, reviewID: rc.ReviewID})
+	}
+	// Place each completed thread (anchor + its replies) under its review, or at
+	// the top level when the anchor belongs to no surfaced review.
+	for _, ar := range anchors {
+		if parent := byReview[ar.reviewID]; ar.reviewID != "" && parent != nil {
+			parent.Children = append(parent.Children, *ar.e)
 		} else {
-			c := child
-			top = append(top, &c)
+			top = append(top, ar.e)
 		}
 	}
 
@@ -167,10 +195,22 @@ func (d PRDetail) Timeline() []TimelineEntry {
 	top = kept
 
 	sort.SliceStable(top, func(i, j int) bool { return top[i].CreatedAt.Before(top[j].CreatedAt) })
+	// Order a review's thread anchors, and each anchor's replies, by time. Anchors
+	// are already first-in-thread by construction; this orders sibling anchors and
+	// the reply chain beneath each one.
+	sortReplies := func(e *TimelineEntry) {
+		sort.SliceStable(e.Replies, func(i, j int) bool {
+			return e.Replies[i].CreatedAt.Before(e.Replies[j].CreatedAt)
+		})
+	}
 	for _, e := range top {
 		sort.SliceStable(e.Children, func(i, j int) bool {
 			return e.Children[i].CreatedAt.Before(e.Children[j].CreatedAt)
 		})
+		for i := range e.Children {
+			sortReplies(&e.Children[i])
+		}
+		sortReplies(e)
 	}
 
 	out := make([]TimelineEntry, 0, len(top)+1)
@@ -330,16 +370,19 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 	for _, c := range pr.Comments.Nodes {
 		d.Comments = append(d.Comments, Comment{Author: c.Author.Login, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
-	for _, th := range pr.ReviewThreads.Nodes {
+	for ti, th := range pr.ReviewThreads.Nodes {
 		side := th.DiffSide
 		if side == "" {
 			side = "RIGHT"
 		}
+		// 1-based so 0 stays the "ungrouped" sentinel. Every comment in this thread
+		// shares the id; the first is the anchor, the rest are replies.
+		threadID := ti + 1
 		for _, c := range th.Comments.Nodes {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
 				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line,
 				OriginalLine: th.OriginalLine, Side: side,
-				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, CreatedAt: c.CreatedAt,
+				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, ThreadID: threadID, CreatedAt: c.CreatedAt,
 			})
 		}
 	}
