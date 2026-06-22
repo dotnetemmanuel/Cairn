@@ -52,11 +52,11 @@ func TestDetailRendersDiffConversationChecks(t *testing.T) {
 	wants := []string{
 		"#327", "Add a DrinkModal", "OPEN",
 		"main", "funfeat/emmanuel", "+246", "-10",
-		"DrinkModal.svelte",         // file list
-		"isOpen",                    // diff content of selected file
+		"DrinkModal.svelte", // file list
+		"isOpen",            // diff content of selected file
 		"Checks (2)", "review", "snyk",
-		"changes",                   // review badge for CHANGES_REQUESTED
-		"looks tasty",               // comment body
+		"changes",     // review badge for CHANGES_REQUESTED
+		"looks tasty", // comment body
 	}
 	for _, w := range wants {
 		if !strings.Contains(view, w) {
@@ -229,7 +229,7 @@ func inlineDetail(t *testing.T, width int, withComment bool) detailModel {
 	detail := gh.PRDetail{Number: 7, State: "OPEN", HeadSHA: "deadbeef"}
 	if withComment {
 		detail.ReviewComments = []gh.ReviewComment{
-			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", CreatedAt: time.Now()},
+			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", DatabaseID: 999, CreatedAt: time.Now()},
 		}
 	}
 	files := []gh.FileDiff{{
@@ -298,6 +298,39 @@ func TestContextualPaneShowsLineThread(t *testing.T) {
 	}
 }
 
+func TestReplyTargetsLineThread(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m.focus = focusDiff
+	// Move onto RIGHT:2 (the commented line), then reply.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
+	)
+	if m.state != stateReply {
+		t.Fatalf("expected stateReply after r on a commented line, got %d", m.state)
+	}
+	if m.replyTo != 999 {
+		t.Errorf("replyTo = %d, want 999 (the thread comment's databaseId)", m.replyTo)
+	}
+	if m.replyAuthor != "octocat" {
+		t.Errorf("replyAuthor = %q, want octocat", m.replyAuthor)
+	}
+	// The composer titles the reply target.
+	if v := m.viewComposer(); !strings.Contains(v, "Reply to octocat") {
+		t.Errorf("composer should title the reply; got %q", v)
+	}
+}
+
+func TestReplyNoopWithoutThread(t *testing.T) {
+	m := inlineDetail(t, 140, false) // no comments anywhere
+	m.focus = focusDiff
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if m.state == stateReply {
+		t.Error("r on a line without a thread must not open the reply composer")
+	}
+}
+
 func TestTabSkipsHiddenInfoPane(t *testing.T) {
 	m := inlineDetail(t, 90, false) // < 100 cols → info pane hidden
 	if m.infoVisible() {
@@ -354,7 +387,7 @@ func TestConversationPageShowsComments(t *testing.T) {
 		t.Fatalf("expected conversation page")
 	}
 	view := m.View()
-	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c reply"} {
+	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c comment"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("conversation view missing %q", w)
 		}

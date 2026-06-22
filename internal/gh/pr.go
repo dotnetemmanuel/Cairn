@@ -47,8 +47,8 @@ type Check struct {
 
 // ReviewComment is an inline comment left on a specific code line.
 type ReviewComment struct {
-	Author    string
-	Body      string
+	Author       string
+	Body         string
 	Path         string
 	Line         int
 	OriginalLine int    // line at the comment's original commit (matches DiffHunk)
@@ -56,6 +56,7 @@ type ReviewComment struct {
 	DiffHunk     string // the cited code context GitHub anchors the comment to
 	ReviewID     string // the review this inline comment belongs to ("" if none)
 	ThreadID     int    // review-thread group (1-based); comments sharing it are one thread, first = anchor. 0 = ungrouped.
+	DatabaseID   int    // REST comment id; reply to a thread via any member's id
 	CreatedAt    time.Time
 }
 
@@ -233,7 +234,7 @@ query($owner:String!,$repo:String!,$number:Int!){
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
       comments(first:50){nodes{author{login} body createdAt}}
       reviews(first:50){nodes{id author{login} state body createdAt}}
-      reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{author{login} body createdAt diffHunk pullRequestReview{id}}}}}
+      reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{databaseId author{login} body createdAt diffHunk pullRequestReview{id}}}}}
       commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
@@ -254,19 +255,19 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		Viewer     struct{ Login string }
 		Repository struct {
 			PullRequest struct {
-				Number       int
-				Title        string
-				Body         string
-				State        string
-				URL          string
-				CreatedAt    time.Time
-				Additions    int
-				Deletions    int
-				ChangedFiles int
-				BaseRefName  string
-				HeadRefName  string
-				HeadRefOid   string
-				Author       struct{ Login string }
+				Number         int
+				Title          string
+				Body           string
+				State          string
+				URL            string
+				CreatedAt      time.Time
+				Additions      int
+				Deletions      int
+				ChangedFiles   int
+				BaseRefName    string
+				HeadRefName    string
+				HeadRefOid     string
+				Author         struct{ Login string }
 				ReviewRequests struct {
 					Nodes []struct {
 						RequestedReviewer struct {
@@ -276,7 +277,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 						}
 					}
 				}
-				Comments     struct {
+				Comments struct {
 					Nodes []struct {
 						Author    struct{ Login string }
 						Body      string
@@ -298,8 +299,9 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 						Line         int
 						OriginalLine int
 						DiffSide     string
-						Comments struct {
+						Comments     struct {
 							Nodes []struct {
+								DatabaseID        int `json:"databaseId"`
 								Author            struct{ Login string }
 								Body              string
 								CreatedAt         time.Time
@@ -322,8 +324,8 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 										Conclusion string
 										DetailsURL string `json:"detailsUrl"`
 										// StatusContext
-										Context  string
-										State    string
+										Context   string
+										State     string
 										TargetURL string `json:"targetUrl"`
 									}
 								}
@@ -382,7 +384,8 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
 				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line,
 				OriginalLine: th.OriginalLine, Side: side,
-				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, ThreadID: threadID, CreatedAt: c.CreatedAt,
+				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, ThreadID: threadID,
+				DatabaseID: c.DatabaseID, CreatedAt: c.CreatedAt,
 			})
 		}
 	}
@@ -482,6 +485,20 @@ func AddReviewComment(owner, repo string, number int, commitID, path string, lin
 		"side":      side,
 	})
 	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments", owner, repo, number)
+	return client.Post(endpoint, bytes.NewReader(payload), nil)
+}
+
+// ReplyToReviewComment posts a reply that threads under an existing inline review
+// comment (GitHub's "Reply" on a review thread). commentID is the REST id of any
+// comment in the target thread; the reply joins that thread. Allowed on your own
+// PR, like AddReviewComment.
+func ReplyToReviewComment(owner, repo string, number, commentID int, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%d/replies", owner, repo, number, commentID)
 	return client.Post(endpoint, bytes.NewReader(payload), nil)
 }
 

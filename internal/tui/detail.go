@@ -45,18 +45,19 @@ const (
 	stateComment
 	stateReject      // request-changes reason
 	stateLineComment // inline comment anchored to a diff line
+	stateReply       // reply threaded under an existing inline comment
 	stateConfirmApprove
 	stateSubmitting
 )
 
 // detailModel is the PR review screen.
 type detailModel struct {
-	th    theme.Theme
-	owner string
-	repo  string
+	th     theme.Theme
+	owner  string
+	repo   string
 	number int
-	url   string
-	title string
+	url    string
+	title  string
 
 	width, height int
 
@@ -70,15 +71,15 @@ type detailModel struct {
 	focus    focusPane
 	showInfo bool
 
-	diffVP viewport.Model
-	infoVP viewport.Model
-	convVP viewport.Model
-	hunks     []int          // hunk start line offsets for the selected file
-	curHunk   int            // index into hunks of the currently-marked hunk
-	diffCursor int           // patch-line index of the diff line cursor
-	diffNLines int           // number of patch lines (for clamping)
-	lineMeta  []diffLineMeta // per patch line: side + file line + code
-	rowAt     []int          // patch-line index → first visual (wrapped) row
+	diffVP     viewport.Model
+	infoVP     viewport.Model
+	convVP     viewport.Model
+	hunks      []int          // hunk start line offsets for the selected file
+	curHunk    int            // index into hunks of the currently-marked hunk
+	diffCursor int            // patch-line index of the diff line cursor
+	diffNLines int            // number of patch lines (for clamping)
+	lineMeta   []diffLineMeta // per patch line: side + file line + code
+	rowAt      []int          // patch-line index → first visual (wrapped) row
 
 	state    detailState
 	composer textarea.Model
@@ -88,6 +89,10 @@ type detailModel struct {
 	anchorPath string
 	anchorLine int
 	anchorSide string
+
+	// Target review-comment id for an in-progress reply (stateReply).
+	replyTo     int
+	replyAuthor string // whose comment we're replying to (for the composer title)
 }
 
 func newDetail(th theme.Theme, it gh.Item) detailModel {
@@ -167,6 +172,13 @@ func doLineComment(owner, repo string, number int, sha, path string, line int, s
 	}
 }
 
+func doReply(owner, repo string, number, commentID int, body string) tea.Cmd {
+	return func() tea.Msg {
+		err := gh.ReplyToReviewComment(owner, repo, number, commentID, body)
+		return actionDoneMsg{verb: "reply", err: err}
+	}
+}
+
 func (m detailModel) Init() tea.Cmd {
 	return loadPR(m.owner, m.repo, m.number, false)
 }
@@ -240,12 +252,13 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 // composing reports whether a text composer is open and should receive raw
 // keystrokes (so global shortcuts like ? must not steal them).
 func (m detailModel) composing() bool {
-	return m.state == stateComment || m.state == stateReject || m.state == stateLineComment
+	return m.state == stateComment || m.state == stateReject ||
+		m.state == stateLineComment || m.state == stateReply
 }
 
 func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 	// Composer states capture most keys.
-	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
+	if m.composing() {
 		switch msg.String() {
 		case "esc":
 			m.state = stateBrowsing
@@ -265,6 +278,8 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			case stateLineComment:
 				return m, doLineComment(m.owner, m.repo, m.number, m.detail.HeadSHA,
 					m.anchorPath, m.anchorLine, m.anchorSide, body)
+			case stateReply:
+				return m, doReply(m.owner, m.repo, m.number, m.replyTo, body)
 			default:
 				return m, doReview(m.owner, m.repo, m.number, "REQUEST_CHANGES", body)
 			}
@@ -346,6 +361,11 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		// GitHub ```suggestion block seeded from the line's current content.
 		if m.page == pageDiff && m.focus == focusDiff {
 			return m.startLineComment("suggest")
+		}
+	case "r":
+		// Reply to the inline-comment thread on the cursor's diff line.
+		if m.page == pageDiff && m.focus == focusDiff {
+			return m.startReply()
 		}
 	case "x":
 		m.state = stateReject
@@ -575,6 +595,29 @@ func (m *detailModel) ensureCursorVisible() {
 	}
 }
 
+// startReply opens the composer to reply to the inline-comment thread on the
+// cursor's diff line, threading under the first comment found there. No-op when
+// the line carries no comment thread.
+func (m detailModel) startReply() (detailModel, tea.Cmd) {
+	cs := m.lineComments()
+	if len(cs) == 0 {
+		m.status = mutedStyle(m.th).Render("no comment thread on this line — press c to start one")
+		return m, nil
+	}
+	target := cs[0] // any comment in the thread; the reply joins that thread
+	if target.DatabaseID == 0 {
+		m.status = mutedStyle(m.th).Render("can't reply to this comment")
+		return m, nil
+	}
+	m.replyTo = target.DatabaseID
+	m.replyAuthor = target.Author
+	m.state = stateReply
+	m.composer.Reset()
+	m.composer.Placeholder = "Reply to " + target.Author + " (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
+}
+
 // startLineComment opens the composer anchored to the cursor's diff line. mode
 // "suggest" pre-fills a GitHub ```suggestion block seeded with the line's text.
 func (m detailModel) startLineComment(mode string) (detailModel, tea.Cmd) {
@@ -613,7 +656,7 @@ const (
 // while browsing, or the taller composer (textarea + its title) while writing.
 func (m detailModel) bottomReserve() int {
 	switch m.state {
-	case stateComment, stateReject, stateLineComment:
+	case stateComment, stateReject, stateLineComment, stateReply:
 		return composerH + 1
 	}
 	return detailFooterH
@@ -724,7 +767,7 @@ func (m detailModel) View() string {
 		body = m.viewBody()
 	}
 
-	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
+	if m.composing() {
 		return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewComposer())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewFooter())
@@ -1209,6 +1252,8 @@ func (m detailModel) viewComposer() string {
 		title = "Request changes — reason"
 	case stateLineComment:
 		title = fmt.Sprintf("Comment on %s:%d", shortRepo(m.anchorPath), m.anchorLine)
+	case stateReply:
+		title = "Reply to " + m.replyAuthor
 	}
 	head := warnStyle(m.th).Render(title) + mutedStyle(m.th).Render("   ctrl+s submit · esc cancel")
 	return lipgloss.JoinVertical(lipgloss.Left, head, m.composer.View())
@@ -1221,10 +1266,15 @@ func (m detailModel) viewFooter() string {
 	var help string
 	switch {
 	case m.page == pageConversation:
-		help = "↑/↓ scroll · c reply · a approve · x request-changes · o open · v/d/esc close"
+		help = "↑/↓ scroll · c comment · a approve · x request-changes · o open · v/d/esc close"
 	case m.focus == focusDiff:
-		// On the diff, c/s act on the cursor line.
-		help = "↑/↓ line · n/N change · c comment line · s suggest · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
+		// On the diff, c/s act on the cursor line; r replies when it has a thread.
+		reply := ""
+		if len(m.lineComments()) > 0 {
+			reply = " · r reply"
+		}
+		help = "↑/↓ line · n/N change · c comment line · s suggest" + reply +
+			" · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
 	default:
 		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · esc back"
 	}
