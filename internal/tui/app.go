@@ -212,7 +212,7 @@ func closedFilter(filter string) string {
 // closed/merged items beneath a divider. The "OPEN"/"CLOSED" labels appear
 // only when both groups are present — a lone group needs no header.
 func sectionRows(open, closed []gh.Item) []list.Item {
-	rows := make([]list.Item, 0, len(open)+len(closed)+2)
+	rows := make([]list.Item, 0, len(open)+len(closed)+3)
 	both := len(open) > 0 && len(closed) > 0
 	if both {
 		rows = append(rows, sectionHeader{"OPEN"})
@@ -221,7 +221,8 @@ func sectionRows(open, closed []gh.Item) []list.Item {
 		rows = append(rows, prItem{it})
 	}
 	if both {
-		rows = append(rows, sectionHeader{"CLOSED"})
+		// A blank spacer sets the closed group apart from the open list.
+		rows = append(rows, sectionHeader{""}, sectionHeader{"CLOSED"})
 	}
 	for _, it := range closed {
 		rows = append(rows, prItem{it})

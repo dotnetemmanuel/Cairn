@@ -87,16 +87,19 @@ func TestSectionRowsDividers(t *testing.T) {
 	open := []gh.Item{{IsPR: true, Number: 1, State: "OPEN"}}
 	closed := []gh.Item{{IsPR: true, Number: 2, State: "MERGED"}}
 
-	// Both groups present → labelled with OPEN/CLOSED dividers.
+	// Both groups present → OPEN header, items, a blank spacer, CLOSED header.
 	rows := sectionRows(open, closed)
-	if len(rows) != 4 {
-		t.Fatalf("want 4 rows (2 headers + 2 items), got %d", len(rows))
+	if len(rows) != 5 {
+		t.Fatalf("want 5 rows (OPEN + item + spacer + CLOSED + item), got %d", len(rows))
 	}
 	if h, ok := rows[0].(sectionHeader); !ok || h.label != "OPEN" {
 		t.Errorf("row 0 should be the OPEN header, got %#v", rows[0])
 	}
-	if h, ok := rows[2].(sectionHeader); !ok || h.label != "CLOSED" {
-		t.Errorf("row 2 should be the CLOSED header, got %#v", rows[2])
+	if h, ok := rows[2].(sectionHeader); !ok || h.label != "" {
+		t.Errorf("row 2 should be the blank spacer, got %#v", rows[2])
+	}
+	if h, ok := rows[3].(sectionHeader); !ok || h.label != "CLOSED" {
+		t.Errorf("row 3 should be the CLOSED header, got %#v", rows[3])
 	}
 
 	// A lone group needs no header.

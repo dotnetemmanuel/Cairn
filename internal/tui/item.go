@@ -43,6 +43,10 @@ func (d itemDelegate) Spacing() int                        { return 0 }
 func (d itemDelegate) Update(tea.Msg, *list.Model) tea.Cmd { return nil }
 func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
 	if h, ok := listItem.(sectionHeader); ok {
+		if h.label == "" {
+			// A blank spacer row (e.g. breathing room above the CLOSED divider).
+			return
+		}
 		style := lipgloss.NewStyle().Foreground(d.th.Muted).Bold(true)
 		text := "─ " + h.label + " "
 		fill := d.width - lipgloss.Width(text)
