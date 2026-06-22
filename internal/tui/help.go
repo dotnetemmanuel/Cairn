@@ -69,6 +69,7 @@ func (m Model) renderHelp() string {
 			{"↑/↓ j/k", "move within actions / stack"},
 			{"←/→ tab", "switch actions ⇄ tree"},
 			{"enter", "run the action / check out the branch"},
+			{"r", "refresh tree + status"},
 			{"esc", "back to the dashboard"},
 			{"?", "toggle this help"},
 		} {
@@ -133,4 +134,3 @@ func wrapPlain(s string, width int, indent string) string {
 	}
 	return strings.Join(lines, "\n"+indent)
 }
-

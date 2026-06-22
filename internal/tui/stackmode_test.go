@@ -141,6 +141,56 @@ func TestStackNewPromptsForName(t *testing.T) {
 	}
 }
 
+func TestStackCommandKeyAccelerators(t *testing.T) {
+	key := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+
+	// 'n' (new) needs a name → naming phase, even from the tree pane.
+	s := fixtureModel()
+	s.focus = focusTree
+	if s2, _ := s.updateBrowsing(key("n")); s2.phase != stackNaming {
+		t.Errorf("'n' should start new (naming), got phase %d", s2.phase)
+	}
+	// 'S' (sync) on a tracked branch → straight to confirming.
+	if s2, _ := s.updateBrowsing(key("S")); s2.phase != stackConfirming {
+		t.Errorf("'S' should start sync (confirming), got phase %d", s2.phase)
+	}
+	// 'A' (amend) is gated on staged changes — inert when clean.
+	clean := fixtureModel()
+	clean.status.Staged = 0
+	if s2, _ := clean.updateBrowsing(key("A")); s2.phase != stackBrowsing {
+		t.Errorf("'A' must be inert with a clean index, got phase %d", s2.phase)
+	}
+	// Command keys stay inert before git-town is set up.
+	noInit := fixtureModel()
+	noInit.tree = nil
+	noInit.status = stack.RepoStatus{InRepo: true} // needsInit
+	if s2, _ := noInit.updateBrowsing(key("n")); s2.phase != stackBrowsing {
+		t.Errorf("command keys must be inert when git-town isn't initialized, got phase %d", s2.phase)
+	}
+}
+
+func TestWrapBlockSanitizesCRAndOverflow(t *testing.T) {
+	// git rebase prints "Successfully…" with a leading \r to clear progress; it
+	// must not survive into the rendered output (would jump to column 0).
+	out := wrapBlock("Rebasing (1/3)\rSuccessfully rebased and updated refs/heads/feat-base.", 80)
+	if strings.Contains(out, "\r") {
+		t.Errorf("carriage returns must be stripped, got %q", out)
+	}
+	if strings.Contains(out, "Rebasing (1/3)") {
+		t.Errorf("progress before the last \\r should be dropped, got %q", out)
+	}
+	if !strings.HasPrefix(out, "Successfully rebased") {
+		t.Errorf("want the post-\\r text kept, got %q", out)
+	}
+	// A line longer than the width is hard-wrapped so nothing exceeds it.
+	long := "git -c rebase.updateRefs=false rebase --onto feat-base 7e9f6dc4ba5e1044f135d9ae8cd797153b221131"
+	for _, ln := range strings.Split(wrapBlock(long, 40), "\n") {
+		if len(ln) > 40 {
+			t.Errorf("wrapped line exceeds width: %q (%d)", ln, len(ln))
+		}
+	}
+}
+
 func TestStackRunTransitionsAndReloads(t *testing.T) {
 	s := fixtureModel()
 	s.phase = stackConfirming

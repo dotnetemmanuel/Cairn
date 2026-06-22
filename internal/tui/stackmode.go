@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/dotnetemmanuel/cairn/internal/stack"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 	"github.com/dotnetemmanuel/cairn/internal/townie"
@@ -218,6 +219,11 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		return s, func() tea.Msg { return stackExitMsg{} }
+	case "r":
+		// Re-read lineage + working-tree status, so external git changes (a
+		// checkout/commit in another terminal) show without leaving stack mode.
+		s.reload()
+		return s, nil
 	case "tab", "shift+tab", "h", "l", "left", "right":
 		// Toggle focus between the action list and the branch tree (only when
 		// there's a tree to check out from).
@@ -229,6 +235,17 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 			}
 		}
 		return s, nil
+	}
+
+	// Direct command-key accelerators (n/I/S/R/A) — the keys the help and footer
+	// advertise. They work from either pane: a mutation always acts on the
+	// checked-out branch (the HEAD model), independent of the tree cursor. Guard
+	// with !needsInit so they stay inert until git-town is set up.
+	if !s.needsInit() {
+		if c := townie.Find(msg.String()); c != nil {
+			s.cursor = s.commandIndex(c.Key)
+			return s.triggerAction(*c)
+		}
 	}
 
 	if s.focus == focusTree {
@@ -255,20 +272,41 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	case "k", "up":
 		s.cursor = (s.cursor - 1 + len(s.commands)) % len(s.commands)
 	case "enter":
-		c := s.commands[s.cursor]
-		if !s.actionEnabled(c) {
-			return s, nil
-		}
-		s.pending = c
-		if c.NeedsName {
-			s.name.SetValue("")
-			s.name.Focus()
-			s.phase = stackNaming
-			return s, textinput.Blink
-		}
-		s.affected = s.affectedBranches(c, "")
-		s.phase = stackConfirming
+		return s.triggerAction(s.commands[s.cursor])
 	}
+	return s, nil
+}
+
+// commandIndex returns the action-list index for a command key (for cursor
+// feedback when a key accelerator fires), falling back to the current cursor.
+func (s stackModel) commandIndex(key string) int {
+	for i := range s.commands {
+		if s.commands[i].Key == key {
+			return i
+		}
+	}
+	return s.cursor
+}
+
+// triggerAction starts a command: opens the name prompt for new/insert, or the
+// explained confirmation otherwise. Inert when the command isn't currently
+// actionable (gated). Shared by Enter and the key accelerators.
+func (s stackModel) triggerAction(c townie.Command) (stackModel, tea.Cmd) {
+	if !s.actionEnabled(c) {
+		return s, nil
+	}
+	s.pending = c
+	if c.NeedsName {
+		s.name.SetValue("")
+		s.name.Focus()
+		s.phase = stackNaming
+		return s, textinput.Blink
+	}
+	// No name for this verb — clear any value left over from a previous new/insert
+	// so the confirmation headline reads "restack" not "restack <stale-name>".
+	s.name.SetValue("")
+	s.affected = s.affectedBranches(c, "")
+	s.phase = stackConfirming
 	return s, nil
 }
 
@@ -466,7 +504,7 @@ func (s stackModel) renderInitCTA(w int) string {
 
 	intro := mutedStyle(s.th).Render(wrapPlain(
 		"This repo isn't configured for stacks yet. Cairn can initialize git-town "+
-			"for you — it only writes local .git/config, nothing is committed or pushed.", w-2, ""))
+			"for you — it only writes local .git/config, nothing is committed or pushed.", proseWidth(w), ""))
 
 	trunk := s.trunk
 	if trunk == "" {
@@ -529,7 +567,7 @@ func (s stackModel) renderNaming(w int) string {
 	}
 	title := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render(s.pending.Title + prompt)
 	rule := lipgloss.NewStyle().Foreground(s.th.Focus).Render(strings.Repeat("─", w))
-	explain := mutedStyle(s.th).Render(wrapPlain(s.pending.Long, w-2, ""))
+	explain := mutedStyle(s.th).Render(wrapPlain(s.pending.Long, proseWidth(w), ""))
 	field := lipgloss.NewStyle().Foreground(s.th.Text).Render(s.name.View())
 	hint := mutedStyle(s.th).Render("enter confirm · esc cancel")
 	return lipgloss.JoinVertical(lipgloss.Left, title, rule, "", explain, "", field, "", hint)
@@ -547,7 +585,8 @@ func (s stackModel) renderConfirm(w int) string {
 	title := lipgloss.NewStyle().Foreground(s.th.Primary).Bold(true).Render(headline + " — confirm")
 	rule := lipgloss.NewStyle().Foreground(s.th.Focus).Render(strings.Repeat("─", w))
 
-	what := lipgloss.NewStyle().Foreground(s.th.Text).Render(wrapPlain(c.Long, w-2, ""))
+	textW := proseWidth(w)
+	what := lipgloss.NewStyle().Foreground(s.th.Text).Render(wrapPlain(c.Long, textW, ""))
 
 	// Concrete effect on the local branches — phrased per verb so it's accurate
 	// (insert re-parents; it doesn't move commits yet, unlike amend/restack/sync).
@@ -587,7 +626,7 @@ func (s stackModel) renderConfirm(w int) string {
 	default:
 		effect = "Affects " + cur + "."
 	}
-	effectLine := lipgloss.NewStyle().Foreground(s.th.Warning).Render("• " + effect)
+	effectLine := lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain("• "+effect, textW, "  "))
 
 	cmdLine := lipgloss.NewStyle().Foreground(s.th.Muted).Render("runs:  " + commandLine(c, name))
 	confirm := lipgloss.NewStyle().Foreground(s.th.Success).Render("[enter] do it") +
@@ -619,7 +658,7 @@ func (s stackModel) renderOutput(w int) string {
 	if out == "" && s.phase == stackRunning {
 		out = "git-town " + s.pending.Verb + "…"
 	}
-	body := lipgloss.NewStyle().Foreground(s.th.Text).Render(out)
+	body := s.renderRunLog(out, w-1)
 
 	foot := ""
 	if s.phase == stackDone {
@@ -628,17 +667,49 @@ func (s stackModel) renderOutput(w int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, title, rule, "", body, foot)
 }
 
+// renderRunLog styles delegated git output for scannability: the git-town command
+// echoes (lines like "[feat-mid] git …") get an accent so the eye can find each
+// step, while the results below them stay plain text. Carriage returns are
+// sanitized and long lines hard-wrapped to the pane first.
+func (s stackModel) renderRunLog(out string, w int) string {
+	cmd := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true)
+	res := lipgloss.NewStyle().Foreground(s.th.Text)
+	// git-town colorizes its own output (e.g. bold command echoes wrapped in
+	// \x1b[1m…\x1b[0m). Strip that first so Cairn fully controls styling and the
+	// "[branch] …" command detection sees plain text, not an escape prefix.
+	var b strings.Builder
+	for i, ln := range strings.Split(sanitizeCR(ansi.Strip(out)), "\n") {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if isCommandEcho(ln) {
+			// Structural marker (color-independent) + accent so command rows stand
+			// out even where a terminal flattens truecolor.
+			b.WriteString(cmd.Render("❯ " + ansi.Wrap(ln, w-2, "")))
+		} else {
+			b.WriteString(res.Render(ansi.Wrap(ln, w, "")))
+		}
+	}
+	return b.String()
+}
+
+// isCommandEcho reports whether a run-log line is one of git-town's command
+// echoes, which it prints as "[<branch>] <command>".
+func isCommandEcho(line string) bool {
+	return strings.HasPrefix(line, "[") && strings.Contains(line, "] ")
+}
+
 func (s stackModel) viewFooter(spinnerFrame string) string {
 	var help string
 	switch s.phase {
 	case stackBrowsing:
 		switch {
 		case s.needsInit():
-			help = "enter set up git-town · esc dashboard"
+			help = "enter set up git-town · r refresh · esc dashboard"
 		case s.focus == focusTree:
-			help = "↑/↓ j/k branch · enter checkout · tab ←/→ actions · esc dashboard"
+			help = "↑/↓ j/k branch · enter checkout · tab ←/→ actions · r refresh · esc dashboard"
 		default:
-			help = "↑/↓ j/k move · enter choose · tab ←/→ tree (checkout) · esc dashboard"
+			help = "↑/↓ j/k move · enter choose · tab ←/→ tree (checkout) · r refresh · esc dashboard"
 		}
 	case stackNaming:
 		help = "type a name · enter confirm · esc cancel"
@@ -653,6 +724,53 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 }
 
 // --- small text helpers ---
+
+// proseMaxCol caps explanatory text at a comfortable reading width even when the
+// pane is much wider, so confirmations don't stretch into one giant line.
+const proseMaxCol = 88
+
+// proseWidth returns the wrap width for prose in a pane of width w: the pane
+// minus padding, but never wider than proseMaxCol.
+func proseWidth(w int) int {
+	tw := w - 2
+	if tw > proseMaxCol {
+		tw = proseMaxCol
+	}
+	if tw < 8 {
+		tw = 8
+	}
+	return tw
+}
+
+// sanitizeCR collapses carriage returns the way a terminal would: git (rebase,
+// fetch) overwrites progress with '\r', and prints "Successfully rebased…" with a
+// leading '\r' to clear the progress line. Left raw, that '\r' yanks the cursor
+// to column 0 and the text escapes the pane's left padding. Keep only what's
+// after the last '\r' on each line.
+func sanitizeCR(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if idx := strings.LastIndex(ln, "\r"); idx >= 0 {
+			ln = ln[idx+1:]
+		}
+		lines[i] = ln
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapBlock hard-wraps every line of s to width w (word-aware, breaking tokens
+// longer than w) so command output can't overflow its pane and get reflowed to
+// column 0 by the terminal. Carriage returns are sanitized first.
+func wrapBlock(s string, w int) string {
+	if w < 8 {
+		w = 8
+	}
+	lines := strings.Split(sanitizeCR(s), "\n")
+	for i, ln := range lines {
+		lines[i] = ansi.Wrap(ln, w, "")
+	}
+	return strings.Join(lines, "\n")
+}
 
 // commandLine renders the concrete shell invocation for the confirmation, with
 // the real branch name substituted in.

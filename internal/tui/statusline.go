@@ -11,18 +11,24 @@ import (
 
 // Statusline glyphs. The working/staged/stash marks deliberately match the
 // user's oh-my-posh Event Horizon prompt so the eye reads them the same way in
-// Cairn as in the shell.
+// Cairn as in the shell. The Nerd Font icons are built from code points via
+// string(rune(...)) so they stay pure-ASCII in source — non-ASCII stripping
+// can't silently blank them, which is exactly what happened once and left the
+// statusline glyph-less.
+var (
+	iconRepo   = string(rune(0xf401)) // nf-oct-repo
+	iconBranch = string(rune(0xe0a0)) // nf-pl-branch
+	iconWork   = string(rune(0xf044)) // working-tree changes (omp Working.Changed)
+	iconStaged = string(rune(0xf046)) // staged (omp Staging.Changed)
+	iconStash  = string(rune(0xeb4b)) // stash (omp)
+)
+
 const (
-	iconRepo     = "" // nf-oct-repo
-	iconBranch   = "" // nf-pl-branch (U+E0A0)
-	iconWork     = "" // nf-fa-pencil  — working-tree changes (omp)
-	iconStaged   = "" // nf-fa-check_square — staged (omp)
-	iconStash    = "" // nf-cod-archive — stash (omp)
 	chevron      = "›"
 	glyphAhead   = "↑"
 	glyphBehind  = "↓"
 	glyphClean   = "✓"
-	glyphConflic = "" // nf-fa-exclamation_triangle
+	glyphConflic = "⚠" // matches the stack tree's drift marker
 )
 
 // renderStatusline draws the "here you are" breadcrumb: repo › branch › status,
