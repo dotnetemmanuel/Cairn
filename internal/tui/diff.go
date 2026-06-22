@@ -186,12 +186,12 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 			gutter = gnum(0, newLine)
 			bg = addBG
 			newLine++
-			rendered = addMarker.Render("+") + hl.line(raw[1:])
+			rendered = addMarker.Render("+") + hl.line(expandTabs(raw[1:]))
 		case strings.HasPrefix(raw, "-"):
 			gutter = gnum(oldLine, 0)
 			bg = delBG
 			oldLine++
-			rendered = delMarker.Render("-") + hl.line(raw[1:])
+			rendered = delMarker.Render("-") + hl.line(expandTabs(raw[1:]))
 		case strings.HasPrefix(raw, "\\"):
 			gutter = blankGutter
 			rendered = metaStyle.Render(raw)
@@ -203,7 +203,7 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 			if strings.HasPrefix(raw, " ") {
 				code = raw[1:]
 			}
-			rendered = ctxMarker.Render(" ") + hl.line(code)
+			rendered = ctxMarker.Render(" ") + hl.line(expandTabs(code))
 		}
 
 		// One column on the left for the line cursor keeps every line aligned,
@@ -245,6 +245,33 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 		}
 	}
 	return strings.Join(out, "\n"), rowAt
+}
+
+// diffTabWidth is the column width tabs expand to in the diff pane.
+const diffTabWidth = 4
+
+// expandTabs replaces tabs with spaces aligned to diffTabWidth-column stops.
+// ansi.StringWidth counts a tab as zero width, so a tab-indented line measures
+// short, escapes soft-wrap, and the terminal hard-wraps it back to column 0 —
+// breaking the gutter alignment. Expanding first makes measured width match the
+// rendered width.
+func expandTabs(s string) string {
+	if !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	for _, r := range s {
+		if r == '\t' {
+			n := diffTabWidth - col%diffTabWidth
+			b.WriteString(strings.Repeat(" ", n))
+			col += n
+			continue
+		}
+		b.WriteRune(r)
+		col++
+	}
+	return b.String()
 }
 
 // hexRGB parses "#rrggbb" into 0-255 components.
