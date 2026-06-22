@@ -199,10 +199,14 @@ func TestStackRunTransitionsAndReloads(t *testing.T) {
 	if s2.phase != stackRunning || cmd == nil {
 		t.Fatalf("enter on confirm should run: phase=%d cmd=%v", s2.phase, cmd != nil)
 	}
-	// Feed a completion message; should land in Done with the output captured.
-	s3, _ := s2.Update(stackRanMsg{out: "restacked feat-top\n", err: nil})
-	if s3.phase != stackDone || !strings.Contains(s3.output, "restacked feat-top") {
-		t.Errorf("after run: phase=%d output=%q", s3.phase, s3.output)
+	// Stream a line, then completion; output accumulates and we land in Done.
+	s3, _ := s2.Update(stackStreamMsg{ev: townie.StreamEvent{Line: "restacked feat-top"}})
+	if s3.phase != stackRunning || !strings.Contains(s3.output, "restacked feat-top") {
+		t.Errorf("after line: phase=%d output=%q", s3.phase, s3.output)
+	}
+	s4, _ := s3.Update(stackStreamMsg{ev: townie.StreamEvent{Done: true}})
+	if s4.phase != stackDone {
+		t.Errorf("after done: phase=%d", s4.phase)
 	}
 }
 

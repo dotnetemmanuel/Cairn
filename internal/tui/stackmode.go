@@ -27,10 +27,12 @@ const (
 // stackExitMsg tells the root model to return to the dashboard.
 type stackExitMsg struct{}
 
-// stackRanMsg carries the result of a delegated git-town op.
-type stackRanMsg struct {
-	out string
-	err error
+// stackStreamMsg carries one unit of a delegated op's streamed output: a line as
+// it arrives, or the terminal completion event. ch lets Update re-arm the next
+// read without the model holding channel state.
+type stackStreamMsg struct {
+	ch <-chan townie.StreamEvent
+	ev townie.StreamEvent
 }
 
 // stackModel is the dedicated, local-context stack authoring screen — Cairn's
@@ -188,12 +190,19 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 		s.width, s.height = msg.Width, msg.Height
 		return s, nil
 
-	case stackRanMsg:
-		s.output = strings.TrimRight(msg.out, "\n")
-		s.runErr = msg.err
-		s.phase = stackDone
-		s.reload() // tree + status now reflect what git-town did
-		return s, nil
+	case stackStreamMsg:
+		if msg.ev.Done {
+			s.runErr = msg.ev.Err
+			s.phase = stackDone
+			s.reload() // tree + status now reflect what git-town did
+			return s, nil
+		}
+		// Append the line as it streams in; keep reading the next.
+		if s.output != "" {
+			s.output += "\n"
+		}
+		s.output += msg.ev.Line
+		return s, waitStream(msg.ch)
 
 	case tea.KeyMsg:
 		switch s.phase {
@@ -339,11 +348,29 @@ func (s stackModel) runOp(verb, name, title string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: verb, Title: title}
 	s.opName = name
+	s.output = ""
 	ops := s.ops
+	// Start streaming inside the Cmd (not here) so the process only launches when
+	// bubbletea runs the command — keeps unit tests that merely assert a non-nil
+	// Cmd from shelling out for real.
 	return s, func() tea.Msg {
-		out, err := ops.Run(verb, name)
-		return stackRanMsg{out: out, err: err}
+		return readStream(ops.Stream(verb, name))
 	}
+}
+
+// waitStream reads the next stream event as a tea.Cmd.
+func waitStream(ch <-chan townie.StreamEvent) tea.Cmd {
+	return func() tea.Msg { return readStream(ch) }
+}
+
+// readStream blocks for one event and wraps it, carrying ch so Update can re-arm
+// the next read. A closed channel is treated as completion.
+func readStream(ch <-chan townie.StreamEvent) stackStreamMsg {
+	ev, ok := <-ch
+	if !ok {
+		ev = townie.StreamEvent{Done: true}
+	}
+	return stackStreamMsg{ch: ch, ev: ev}
 }
 
 func (s stackModel) updateNaming(msg tea.KeyMsg) (stackModel, tea.Cmd) {

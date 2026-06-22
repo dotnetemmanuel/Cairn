@@ -18,6 +18,51 @@ func (r *recordRunner) Run(dir, name string, args ...string) (string, error) {
 	return r.out, r.err
 }
 
+// drain collects every event from a stream channel.
+func drain(ch <-chan StreamEvent) []StreamEvent {
+	var out []StreamEvent
+	for ev := range ch {
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestStreamFallbackEmitsLinesThenDone(t *testing.T) {
+	rr := &recordRunner{out: "line one\nline two\n"}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	evs := drain(ops.Stream("sync", ""))
+
+	// Last event is the terminal Done; the rest are output lines.
+	if len(evs) < 1 || !evs[len(evs)-1].Done {
+		t.Fatalf("expected a trailing Done event, got %+v", evs)
+	}
+	var lines []string
+	for _, e := range evs[:len(evs)-1] {
+		lines = append(lines, e.Line)
+	}
+	if strings.Join(lines, "|") != "line one|line two" {
+		t.Errorf("streamed lines = %v, want [line one, line two]", lines)
+	}
+	if len(rr.calls) != 1 || strings.Join(rr.calls[0], " ") != "git-town sync --stack" {
+		t.Errorf("stream should still delegate via Runner, got %v", rr.calls)
+	}
+}
+
+func TestStreamStopsOnError(t *testing.T) {
+	// amend is two steps; a failing first step must not run the second, and the
+	// Done event must carry the error.
+	rr := &recordRunner{out: "boom", err: errors.New("amend failed")}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	evs := drain(ops.Stream("amend", ""))
+	last := evs[len(evs)-1]
+	if !last.Done || last.Err == nil {
+		t.Errorf("want Done event with error, got %+v", last)
+	}
+	if len(rr.calls) != 1 {
+		t.Errorf("second step must be skipped after error, ran %d", len(rr.calls))
+	}
+}
+
 func TestRunDelegatesToGitTown(t *testing.T) {
 	cases := []struct {
 		verb, name string

@@ -6,6 +6,8 @@
 package townie
 
 import (
+	"bufio"
+	"io"
 	"os/exec"
 	"strings"
 )
@@ -66,26 +68,122 @@ func argv(verb, name string) []string {
 	}
 }
 
+// plan returns the ordered command(s) a verb runs. Most verbs are a single
+// command; amend (amend then restack) and init (two config writes) are
+// multi-step. Shared by Run (mock-testable) and Stream (live output).
+func plan(verb, name string) ([][]string, error) {
+	switch verb {
+	case "amend":
+		return [][]string{argv("amend", ""), argv("restack", "")}, nil
+	case "init":
+		return InitArgv(name), nil
+	default:
+		a := argv(verb, name)
+		if a == nil {
+			return nil, &UnknownVerbError{Verb: verb}
+		}
+		return [][]string{a}, nil
+	}
+}
+
 // Run executes the given verb (with an optional branch name) and returns the
 // combined output. amend is a two-step sequence (amend, then restack); init is a
 // two-step sequence that writes git-town's config keys (name = the trunk branch).
 func (o Ops) Run(verb, name string) (string, error) {
-	if verb == "amend" {
-		out, err := o.exec(argv("amend", ""))
+	cmds, err := plan(verb, name)
+	if err != nil {
+		return "", err
+	}
+	return o.runSeq(cmds)
+}
+
+// StreamEvent is one unit of streamed output: a Line as it is produced, or the
+// terminal completion event (Done, with Err set if a step failed).
+type StreamEvent struct {
+	Line string
+	Done bool
+	Err  error
+}
+
+// StreamRunner is an optional Runner capability: stream a command's combined
+// output line-by-line via emit instead of returning it all at once. ExecRunner
+// implements it; a plain Runner (e.g. a test mock) need only implement Run, and
+// Stream falls back to running it and emitting the captured output.
+type StreamRunner interface {
+	Stream(dir, name string, args []string, emit func(line string)) error
+}
+
+// Stream runs the verb's command(s) and emits each output line on the returned
+// channel as it arrives, then a single {Done:true} event (Err set on failure;
+// remaining steps are skipped after an error). It shares the verb→command mapping
+// with Run via plan, and routes execution through the Runner (so tests still
+// observe the commands). The channel is closed after the Done event.
+func (o Ops) Stream(verb, name string) <-chan StreamEvent {
+	ch := make(chan StreamEvent, 64)
+	go func() {
+		defer close(ch)
+		cmds, err := plan(verb, name)
 		if err != nil {
-			return out, err
+			ch <- StreamEvent{Done: true, Err: err}
+			return
 		}
-		rest, rerr := o.exec(argv("restack", ""))
-		return strings.TrimRight(out, "\n") + "\n" + rest, rerr
+		sr, live := o.Runner.(StreamRunner)
+		for _, a := range cmds {
+			if live {
+				err = sr.Stream(o.Dir, a[0], a[1:], func(line string) {
+					ch <- StreamEvent{Line: line}
+				})
+			} else {
+				// Non-streaming Runner (tests): run it, emit the captured output.
+				var out string
+				out, err = o.Runner.Run(o.Dir, a[0], a[1:]...)
+				for _, ln := range splitLines(out) {
+					ch <- StreamEvent{Line: ln}
+				}
+			}
+			if err != nil {
+				ch <- StreamEvent{Done: true, Err: err}
+				return
+			}
+		}
+		ch <- StreamEvent{Done: true}
+	}()
+	return ch
+}
+
+// Stream is ExecRunner's live implementation: pipe the process's combined output
+// and emit each line as it is produced.
+func (ExecRunner) Stream(dir, name string, args []string, emit func(line string)) error {
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
 	}
-	if verb == "init" {
-		return o.runSeq(InitArgv(name))
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	a := argv(verb, name)
-	if a == nil {
-		return "", &UnknownVerbError{Verb: verb}
+	wait := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		pw.Close() // unblock the scanner with EOF once the process exits
+		wait <- err
+	}()
+	sc := bufio.NewScanner(pr)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		emit(sc.Text())
 	}
-	return o.exec(a)
+	return <-wait
+}
+
+// splitLines splits trimmed output into lines (nil for empty).
+func splitLines(s string) []string {
+	if s = strings.TrimRight(s, "\n"); s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
 }
 
 // runSeq runs each command in order, accumulating output, and stops at the first
