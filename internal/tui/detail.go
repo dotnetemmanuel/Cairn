@@ -868,7 +868,10 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
 	// Threaded replies render beneath the anchor with a deeper guide and no
 	// citation — they share the anchor's code location, so re-citing it is noise.
 	if len(e.Replies) > 0 {
-		prefix := mutedStyle(m.th).Render("    ↳ ")
+		// The ↳ marks the author line once; the body aligns beneath it (6 cols:
+		// 4 indent + "↳ "), so multi-line replies don't repeat the arrow.
+		marker := mutedStyle(m.th).Render("    ↳ ")
+		cont := "      "
 		replyW := w - 6
 		if replyW < 8 {
 			replyW = 8
@@ -882,7 +885,8 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
 			} else {
 				rbody = wrap(rbody, replyW)
 			}
-			b.WriteString("\n" + indentBlock(header+"\n"+rbody, prefix))
+			b.WriteString("\n" + indentBlock(header, marker))
+			b.WriteString("\n" + indentBlock(rbody, cont))
 		}
 	}
 	return b.String()
