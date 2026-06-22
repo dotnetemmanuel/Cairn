@@ -18,6 +18,18 @@ type prItem struct{ gh.Item }
 
 func (i prItem) FilterValue() string { return i.Title }
 
+// sectionHeader is a non-selectable divider row that labels the group of items
+// that follows it (e.g. "OPEN", "CLOSED"). Navigation skips over it; see
+// ensureSelectable / selectAdjacent in app.go.
+type sectionHeader struct{ label string }
+
+func (sectionHeader) FilterValue() string { return "" }
+
+// isClosed reports whether an item is no longer open (CLOSED or MERGED).
+func isClosed(it gh.Item) bool {
+	return it.State != "" && !strings.EqualFold(it.State, "OPEN")
+}
+
 // itemDelegate renders one item as a single colored row of columns:
 //
 //	<ci> <repo#num>  <review>  <title>                <author>  <updated>
@@ -26,10 +38,24 @@ type itemDelegate struct {
 	width int
 }
 
-func (d itemDelegate) Height() int                             { return 1 }
-func (d itemDelegate) Spacing() int                            { return 0 }
-func (d itemDelegate) Update(tea.Msg, *list.Model) tea.Cmd     { return nil }
+func (d itemDelegate) Height() int                         { return 1 }
+func (d itemDelegate) Spacing() int                        { return 0 }
+func (d itemDelegate) Update(tea.Msg, *list.Model) tea.Cmd { return nil }
 func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	if h, ok := listItem.(sectionHeader); ok {
+		if h.label == "" {
+			// A blank spacer row (e.g. breathing room above the CLOSED divider).
+			return
+		}
+		style := lipgloss.NewStyle().Foreground(d.th.Muted).Bold(true)
+		text := "─ " + h.label + " "
+		fill := d.width - lipgloss.Width(text)
+		if fill < 0 {
+			fill = 0
+		}
+		fmt.Fprint(w, style.Render(text+strings.Repeat("─", fill)))
+		return
+	}
 	it, ok := listItem.(prItem)
 	if !ok {
 		return
@@ -73,6 +99,20 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		return
 	}
 
+	// Closed/merged rows recede: the whole row is muted so the eye skips past
+	// them, and the leading dot carries the only color — pink for merged, gray
+	// for plain-closed — so the two are distinguishable at a glance.
+	if isClosed(it.Item) {
+		muted := lipgloss.NewStyle().Foreground(d.th.Muted)
+		row := strings.Join([]string{
+			stateDot(d.th, it.State),
+			muted.Render(ref), muted.Render("–"),
+			muted.Render(title), muted.Render(author), muted.Render(upd),
+		}, " ")
+		fmt.Fprint(w, row)
+		return
+	}
+
 	refStyled := lipgloss.NewStyle().Foreground(d.th.Info).Render(ref)
 	titleStyled := lipgloss.NewStyle().Foreground(d.th.Text).Render(title)
 	authorStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(author)
@@ -94,6 +134,17 @@ func ciGlyph(th theme.Theme, s gh.CheckState) string {
 		c = th.Warning
 	default:
 		return lipgloss.NewStyle().Foreground(th.Muted).Render("○")
+	}
+	return lipgloss.NewStyle().Foreground(c).Render("●")
+}
+
+// stateDot marks a non-open row by lifecycle, replacing the CI dot (whose
+// status is moot once a PR is closed): a merged PR gets a bright dot, a
+// plain-closed one stays muted.
+func stateDot(th theme.Theme, state string) string {
+	c := th.Muted
+	if strings.EqualFold(state, "MERGED") {
+		c = th.Primary
 	}
 	return lipgloss.NewStyle().Foreground(c).Render("●")
 }

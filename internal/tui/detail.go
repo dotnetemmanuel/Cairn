@@ -21,6 +21,13 @@ const (
 	pageConversation
 )
 
+// iconChat marks files/threads that carry inline review comments (width 2).
+const iconChat = "💬"
+
+// convReadW caps the conversation's text column so prose stays readable on wide
+// terminals instead of wrapping edge-to-edge.
+const convReadW = 100
+
 // focusPane identifies which detail-screen region receives navigation keys.
 type focusPane int
 
@@ -38,18 +45,19 @@ const (
 	stateComment
 	stateReject      // request-changes reason
 	stateLineComment // inline comment anchored to a diff line
+	stateReply       // reply threaded under an existing inline comment
 	stateConfirmApprove
 	stateSubmitting
 )
 
 // detailModel is the PR review screen.
 type detailModel struct {
-	th    theme.Theme
-	owner string
-	repo  string
+	th     theme.Theme
+	owner  string
+	repo   string
 	number int
-	url   string
-	title string
+	url    string
+	title  string
 
 	width, height int
 
@@ -63,14 +71,15 @@ type detailModel struct {
 	focus    focusPane
 	showInfo bool
 
-	diffVP viewport.Model
-	infoVP viewport.Model
-	convVP viewport.Model
-	hunks     []int          // hunk start line offsets for the selected file
-	curHunk   int            // index into hunks of the currently-marked hunk
-	diffCursor int           // rendered-line index of the diff line cursor
-	diffNLines int           // number of rendered diff lines (for clamping)
-	lineMeta  []diffLineMeta // per rendered diff line: side + file line + code
+	diffVP     viewport.Model
+	infoVP     viewport.Model
+	convVP     viewport.Model
+	hunks      []int          // hunk start line offsets for the selected file
+	curHunk    int            // index into hunks of the currently-marked hunk
+	diffCursor int            // patch-line index of the diff line cursor
+	diffNLines int            // number of patch lines (for clamping)
+	lineMeta   []diffLineMeta // per patch line: side + file line + code
+	rowAt      []int          // patch-line index → first visual (wrapped) row
 
 	state    detailState
 	composer textarea.Model
@@ -80,6 +89,24 @@ type detailModel struct {
 	anchorPath string
 	anchorLine int
 	anchorSide string
+
+	// Target review-comment id for an in-progress reply (stateReply).
+	replyTo     int
+	replyAuthor string // whose comment we're replying to (for the composer title)
+
+	// Conversation-page thread cursor: repliable inline threads in render order,
+	// and the selected one (-1 = none). Lets you n/N to any thread and reply.
+	convThreads []convThread
+	convCursor  int
+}
+
+// convThread is a repliable inline-comment thread located in the rendered
+// conversation: its starting visual row (for scrolling) and the anchor comment's
+// REST id + author (for the reply).
+type convThread struct {
+	row    int
+	id     int
+	author string
 }
 
 func newDetail(th theme.Theme, it gh.Item) detailModel {
@@ -159,6 +186,13 @@ func doLineComment(owner, repo string, number int, sha, path string, line int, s
 	}
 }
 
+func doReply(owner, repo string, number, commentID int, body string) tea.Cmd {
+	return func() tea.Msg {
+		err := gh.ReplyToReviewComment(owner, repo, number, commentID, body)
+		return actionDoneMsg{verb: "reply", err: err}
+	}
+}
+
 func (m detailModel) Init() tea.Cmd {
 	return loadPR(m.owner, m.repo, m.number, false)
 }
@@ -229,9 +263,16 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 	return m, nil
 }
 
+// composing reports whether a text composer is open and should receive raw
+// keystrokes (so global shortcuts like ? must not steal them).
+func (m detailModel) composing() bool {
+	return m.state == stateComment || m.state == stateReject ||
+		m.state == stateLineComment || m.state == stateReply
+}
+
 func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 	// Composer states capture most keys.
-	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
+	if m.composing() {
 		switch msg.String() {
 		case "esc":
 			m.state = stateBrowsing
@@ -251,6 +292,8 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			case stateLineComment:
 				return m, doLineComment(m.owner, m.repo, m.number, m.detail.HeadSHA,
 					m.anchorPath, m.anchorLine, m.anchorSide, body)
+			case stateReply:
+				return m, doReply(m.owner, m.repo, m.number, m.replyTo, body)
 			default:
 				return m, doReview(m.owner, m.repo, m.number, "REQUEST_CHANGES", body)
 			}
@@ -333,6 +376,15 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		if m.page == pageDiff && m.focus == focusDiff {
 			return m.startLineComment("suggest")
 		}
+	case "r":
+		// Reply to a thread: the selected one in the conversation view, or the
+		// thread on the cursor's diff line.
+		if m.page == pageConversation {
+			return m.startConvReply()
+		}
+		if m.page == pageDiff && m.focus == focusDiff {
+			return m.startReply()
+		}
 	case "x":
 		m.state = stateReject
 		m.composer.Reset()
@@ -352,9 +404,17 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		m.selectFile(m.selected + 1)
 		return m, nil
 	case "n":
+		if m.page == pageConversation {
+			m.moveConvThread(1)
+			return m, nil
+		}
 		m.gotoHunk(1)
 		return m, nil
 	case "N":
+		if m.page == pageConversation {
+			m.moveConvThread(-1)
+			return m, nil
+		}
 		m.gotoHunk(-1)
 		return m, nil
 	}
@@ -449,7 +509,15 @@ func (m *detailModel) gotoHunk(dir int) {
 	m.diffCursor = m.hunks[m.curHunk]
 	m.renderDiffContent()
 	m.refreshInfo()
-	m.diffVP.SetYOffset(m.hunks[m.curHunk])
+	m.diffVP.SetYOffset(m.visualRow(m.curHunkRow()))
+}
+
+// curHunkRow is the patch-line index of the active hunk header.
+func (m *detailModel) curHunkRow() int {
+	if m.curHunk >= 0 && m.curHunk < len(m.hunks) {
+		return m.hunks[m.curHunk]
+	}
+	return 0
 }
 
 // commentCounts maps each rendered diff-line index to the number of inline
@@ -498,8 +566,19 @@ func (m *detailModel) renderDiffContent() {
 	if len(m.files) == 0 {
 		return
 	}
-	m.diffVP.SetContent(renderDiff(m.th, m.files[m.selected], m.diffVP.Width,
-		m.curHunk, m.diffCursor, m.commentCounts()))
+	content, rowAt := renderDiff(m.th, m.files[m.selected], m.diffVP.Width,
+		m.curHunk, m.diffCursor, m.commentCounts())
+	m.rowAt = rowAt
+	m.diffVP.SetContent(content)
+}
+
+// visualRow maps a patch-line index to its first visual row (accounting for
+// soft-wrapped lines), for scrolling the viewport.
+func (m *detailModel) visualRow(patchIdx int) int {
+	if patchIdx >= 0 && patchIdx < len(m.rowAt) {
+		return m.rowAt[patchIdx]
+	}
+	return 0
 }
 
 // moveCursor steps the diff line cursor, keeps it on screen, and refreshes the
@@ -523,14 +602,63 @@ func (m *detailModel) moveCursor(dir int) {
 // ensureCursorVisible scrolls the diff viewport just enough to keep the cursor
 // line within view.
 func (m *detailModel) ensureCursorVisible() {
+	row := m.visualRow(m.diffCursor)
+	end := row // last visual row of this (possibly wrapped) line
+	if m.diffCursor+1 < len(m.rowAt) {
+		end = m.rowAt[m.diffCursor+1] - 1
+	}
 	top := m.diffVP.YOffset
 	bottom := top + m.diffVP.Height - 1
 	switch {
-	case m.diffCursor < top:
-		m.diffVP.SetYOffset(m.diffCursor)
-	case m.diffCursor > bottom:
-		m.diffVP.SetYOffset(m.diffCursor - m.diffVP.Height + 1)
+	case row < top:
+		m.diffVP.SetYOffset(row)
+	case end > bottom:
+		off := end - m.diffVP.Height + 1
+		if off > row { // a line taller than the pane: prefer showing its start
+			off = row
+		}
+		m.diffVP.SetYOffset(off)
 	}
+}
+
+// startReply opens the composer to reply to the inline-comment thread on the
+// cursor's diff line, threading under the first comment found there. No-op when
+// the line carries no comment thread.
+func (m detailModel) startReply() (detailModel, tea.Cmd) {
+	cs := m.lineComments()
+	if len(cs) == 0 {
+		m.status = mutedStyle(m.th).Render("no comment thread on this line — press c to start one")
+		return m, nil
+	}
+	target := cs[0] // any comment in the thread; the reply joins that thread
+	if target.DatabaseID == 0 {
+		m.status = mutedStyle(m.th).Render("can't reply to this comment")
+		return m, nil
+	}
+	m.replyTo = target.DatabaseID
+	m.replyAuthor = target.Author
+	m.state = stateReply
+	m.composer.Reset()
+	m.composer.Placeholder = "Reply to " + target.Author + " (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
+}
+
+// startConvReply opens the composer to reply to the conversation thread under the
+// thread cursor (full-conversation view). No-op when nothing is selected.
+func (m detailModel) startConvReply() (detailModel, tea.Cmd) {
+	if m.convCursor < 0 || m.convCursor >= len(m.convThreads) {
+		m.status = mutedStyle(m.th).Render("no thread selected — press n/N to pick one")
+		return m, nil
+	}
+	t := m.convThreads[m.convCursor]
+	m.replyTo = t.id
+	m.replyAuthor = t.author
+	m.state = stateReply
+	m.composer.Reset()
+	m.composer.Placeholder = "Reply to " + t.author + " (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
 }
 
 // startLineComment opens the composer anchored to the cursor's diff line. mode
@@ -571,7 +699,7 @@ const (
 // while browsing, or the taller composer (textarea + its title) while writing.
 func (m detailModel) bottomReserve() int {
 	switch m.state {
-	case stateComment, stateReject, stateLineComment:
+	case stateComment, stateReject, stateLineComment, stateReply:
 		return composerH + 1
 	}
 	return detailFooterH
@@ -656,9 +784,54 @@ func (m *detailModel) refreshInfo() {
 	m.infoVP.SetContent(m.renderInfo())
 }
 
+// refreshConv re-renders the conversation, places the thread cursor on the first
+// repliable thread (if any), and scrolls to the top — a full reload.
 func (m *detailModel) refreshConv() {
-	m.convVP.SetContent(m.renderConversation())
+	_, threads := m.renderConversation()
+	switch {
+	case len(threads) == 0:
+		m.convCursor = -1
+	case m.convCursor < 0 || m.convCursor >= len(threads):
+		m.convCursor = 0
+	}
+	m.renderConvContent()
 	m.convVP.GotoTop()
+}
+
+// renderConvContent rebuilds the conversation viewport content + thread index for
+// the current cursor, leaving scroll position untouched.
+func (m *detailModel) renderConvContent() {
+	content, threads := m.renderConversation()
+	m.convThreads = threads
+	m.convVP.SetContent(content)
+}
+
+// moveConvThread steps the conversation thread cursor (dir +1/-1), re-renders to
+// move the highlight, and scrolls the selected thread into view.
+func (m *detailModel) moveConvThread(dir int) {
+	n := len(m.convThreads)
+	if n == 0 {
+		m.status = mutedStyle(m.th).Render("no inline threads to navigate")
+		return
+	}
+	if m.convCursor < 0 {
+		m.convCursor = 0
+	} else {
+		m.convCursor = (m.convCursor + dir + n) % n
+	}
+	m.renderConvContent()
+	// Only scroll when the selected thread's header is outside the viewport —
+	// staying put when it's already visible (no jolt on a short hop).
+	row := m.convThreads[m.convCursor].row
+	top := m.convVP.YOffset
+	bottom := top + m.convVP.Height - 1
+	if row < top || row > bottom {
+		target := row - 2 // a little lead-in above the header
+		if target < 0 {
+			target = 0
+		}
+		m.convVP.SetYOffset(target)
+	}
 }
 
 // ---- view ----
@@ -682,7 +855,7 @@ func (m detailModel) View() string {
 		body = m.viewBody()
 	}
 
-	if m.state == stateComment || m.state == stateReject || m.state == stateLineComment {
+	if m.composing() {
 		return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewComposer())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewFooter())
@@ -698,31 +871,276 @@ func (m detailModel) viewConversation() string {
 	return m.paneBox(title, m.convVP.View(), m.width, bodyH, true)
 }
 
-// renderConversation builds the full-width, chronological thread.
-func (m detailModel) renderConversation() string {
+// renderConversation builds the full-width thread. Reviews lead with their
+// summary; the inline comments left as part of that review are rendered indented
+// beneath it, each with the cited code shown above the comment.
+func (m detailModel) renderConversation() (string, []convThread) {
 	w := m.convVP.Width
 	if w < 8 {
 		w = 8
 	}
+	// Cap prose at a comfortable reading column on wide terminals — full-width
+	// wrapping is what made long comments hard to scan.
+	tw := w
+	if tw > convReadW {
+		tw = convReadW
+	}
+
 	entries := m.detail.Timeline()
 	var b strings.Builder
+	var threads []convThread
+	row := 0
+	write := func(s string) { b.WriteString(s); row += strings.Count(s, "\n") }
+	// anchor records a repliable inline thread at the current row and reports
+	// whether it is the selected one (so its header gets the cursor bar).
+	anchor := func(e gh.TimelineEntry, startRow int) bool {
+		if e.DatabaseID == 0 {
+			return false
+		}
+		sel := len(threads) == m.convCursor
+		threads = append(threads, convThread{row: startRow, id: e.DatabaseID, author: e.Author})
+		return sel
+	}
+
 	for i, e := range entries {
 		if i > 0 {
-			b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", w)) + "\n")
+			write(mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n")
 		}
-		b.WriteString(m.conversationHeader(e) + "\n")
+
+		// A standalone inline comment (not surfaced under a review) renders its own
+		// header + cited code + body.
+		if e.Kind == gh.KindInline {
+			sel := anchor(e, row)
+			write(m.renderInlineComment(e, tw, sel) + "\n")
+			continue
+		}
+
+		write(m.conversationHeader(e) + "\n")
 		body := strings.TrimSpace(e.Body)
-		if body == "" {
-			body = mutedStyle(m.th).Render("(no message)")
-		} else {
-			body = wrap(body, w)
+		switch {
+		case body != "":
+			write(wrap(body, tw) + "\n")
+		case len(e.Children) > 0:
+			write(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
+		default:
+			write(mutedStyle(m.th).Render("(no message)") + "\n")
 		}
-		b.WriteString(body + "\n")
+
+		// A review's inline comments, indented under it with a dotted guide and a
+		// blank guide line between them for separation.
+		if len(e.Children) > 0 {
+			prefix := mutedStyle(m.th).Render("  ┊ ")
+			childW := tw - 4
+			if childW < 8 {
+				childW = 8
+			}
+			write(prefix + "\n")
+			for j, ch := range e.Children {
+				if j > 0 {
+					write(prefix + "\n")
+				}
+				sel := anchor(ch, row)
+				write(indentBlock(m.renderInlineComment(ch, childW, sel), prefix) + "\n")
+			}
+		}
 	}
 	if len(entries) <= 1 && strings.TrimSpace(m.detail.Body) == "" {
-		return mutedStyle(m.th).Render("No conversation yet. Press c to comment.")
+		return mutedStyle(m.th).Render("No conversation yet. Press c to comment."), nil
+	}
+	return b.String(), threads
+}
+
+// renderInlineComment renders one inline code comment: a "who · where" header,
+// the cited code context, a blank line, then the comment body.
+func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected bool) string {
+	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
+	loc := infoStyle(m.th).Render(fmt.Sprintf("%s:%d", shortRepo(e.Path), e.Line))
+	header := who + " " + mutedStyle(m.th).Render("on ") + loc + mutedStyle(m.th).Render(" · "+relTime(e.CreatedAt))
+	if selected {
+		// Conversation thread cursor: a full-width primary-on-surface bar makes the
+		// selected thread unmistakable (a lone ▌ read too faint).
+		plain := fmt.Sprintf("▌ @%s on %s:%d · %s", e.Author, shortRepo(e.Path), e.Line, relTime(e.CreatedAt))
+		header = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+			Bold(true).Width(w).Render(plain)
+	}
+
+	var b strings.Builder
+	b.WriteString(header + "\n")
+	if cite := m.renderCitation(e.DiffHunk, e.Side, w); cite != "" {
+		b.WriteString(cite + "\n\n") // blank line separates the code from the comment
+	}
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		b.WriteString(mutedStyle(m.th).Render("(no message)"))
+	} else {
+		b.WriteString(wrap(body, w))
+	}
+
+	// Threaded replies render beneath the anchor with a deeper guide and no
+	// citation — they share the anchor's code location, so re-citing it is noise.
+	if len(e.Replies) > 0 {
+		// The ↳ marks the author line once; the body aligns beneath it (6 cols:
+		// 4 indent + "↳ "), so multi-line replies don't repeat the arrow.
+		marker := mutedStyle(m.th).Render("    ↳ ")
+		cont := "      "
+		replyW := w - 6
+		if replyW < 8 {
+			replyW = 8
+		}
+		for _, r := range e.Replies {
+			who := infoStyle(m.th).Bold(true).Render("@" + r.Author)
+			header := who + mutedStyle(m.th).Render(" · "+relTime(r.CreatedAt))
+			rbody := strings.TrimSpace(r.Body)
+			if rbody == "" {
+				rbody = mutedStyle(m.th).Render("(no message)")
+			} else {
+				rbody = wrap(rbody, replyW)
+			}
+			b.WriteString("\n" + indentBlock(header, marker))
+			b.WriteString("\n" + indentBlock(rbody, cont))
+		}
 	}
 	return b.String()
+}
+
+// citeLine is one line of a code citation: its file line number on the comment's
+// side (0 if the line doesn't exist on that side, e.g. a deletion shown on the
+// new side), the diff marker, and the de-tabbed text.
+type citeLine struct {
+	num    int
+	marker byte
+	text   string
+}
+
+// renderCitation renders the cited code above a comment: the trailing lines of
+// the diff hunk the comment is anchored to, with file line numbers in a gutter,
+// a guide, and add/remove coloring. It is a code citation, not the full diff —
+// just enough context. Tabs are expanded and common indentation stripped so the
+// snippet stays inside the column (raw tabs were overflowing the pane).
+func (m detailModel) renderCitation(diffHunk, side string, w int) string {
+	if strings.TrimSpace(diffHunk) == "" {
+		return ""
+	}
+	leftSide := side == "LEFT"
+
+	// Walk the hunk, tracking old/new line counters from the @@ header, and tag
+	// each line with the number to show for the comment's side.
+	var rows []citeLine
+	oldLn, newLn := 0, 0
+	for _, ln := range strings.Split(strings.TrimRight(diffHunk, "\n"), "\n") {
+		if strings.HasPrefix(ln, "@@") {
+			oldLn, newLn = parseHunkStarts(ln)
+			continue
+		}
+		marker, body := byte(' '), ln
+		if len(ln) > 0 {
+			marker, body = ln[0], ln[1:]
+		}
+		num := 0
+		switch marker {
+		case '+':
+			if !leftSide {
+				num = newLn
+			}
+			newLn++
+		case '-':
+			if leftSide {
+				num = oldLn
+			}
+			oldLn++
+		default: // context line — present on both sides
+			if leftSide {
+				num = oldLn
+			} else {
+				num = newLn
+			}
+			oldLn++
+			newLn++
+		}
+		rows = append(rows, citeLine{num: num, marker: marker, text: strings.ReplaceAll(body, "\t", "  ")})
+	}
+	for len(rows) > 0 && strings.TrimSpace(rows[0].text) == "" {
+		rows = rows[1:] // start on real code, not blank context
+	}
+	const maxLines = 4 // the lines just before/at the anchored line
+	if len(rows) > maxLines {
+		rows = rows[len(rows)-maxLines:]
+	}
+
+	// Strip the common leading indentation so deep code starts near the guide.
+	texts := make([]string, len(rows))
+	for i, r := range rows {
+		texts[i] = r.text
+	}
+	if d := commonIndent(texts); d > 0 {
+		for i := range rows {
+			if len(rows[i].text) >= d {
+				rows[i].text = rows[i].text[d:]
+			}
+		}
+	}
+
+	// Gutter wide enough for the largest line number.
+	gw := 1
+	for _, r := range rows {
+		if n := len(fmt.Sprintf("%d", r.num)); r.num > 0 && n > gw {
+			gw = n
+		}
+	}
+	var out []string
+	for _, r := range rows {
+		st := mutedStyle(m.th)
+		switch r.marker {
+		case '+':
+			st = lipgloss.NewStyle().Foreground(m.th.Success)
+		case '-':
+			st = lipgloss.NewStyle().Foreground(m.th.Danger)
+		}
+		gutter := strings.Repeat(" ", gw)
+		if r.num > 0 {
+			gutter = fmt.Sprintf("%*d", gw, r.num)
+		}
+		prefix := mutedStyle(m.th).Render(gutter + " │ ")
+		out = append(out, prefix+st.Render(truncate(r.text, max(1, w-gw-3))))
+	}
+	return strings.Join(out, "\n")
+}
+
+// commonIndent returns the number of leading spaces shared by all non-blank
+// lines (for de-indenting a code citation).
+func commonIndent(lines []string) int {
+	min := -1
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		lead := len(ln) - len(strings.TrimLeft(ln, " "))
+		if min < 0 || lead < min {
+			min = lead
+		}
+	}
+	if min < 0 {
+		return 0
+	}
+	return min
+}
+
+// reviewInlineNote labels a review that has only inline comments (empty body).
+func reviewInlineNote(n int) string {
+	if n == 1 {
+		return "left 1 inline comment:"
+	}
+	return fmt.Sprintf("left %d inline comments:", n)
+}
+
+// indentBlock prefixes every line of s with prefix (for nesting a rendered
+// block under a parent entry).
+func indentBlock(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = prefix + ln
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m detailModel) conversationHeader(e gh.TimelineEntry) string {
@@ -842,19 +1260,37 @@ func (m detailModel) renderFileList(w, h int) string {
 	var lines []string
 	for i := start; i < end; i++ {
 		f := m.files[i]
+		// A 💬 to the right of files that carry inline review comments, so you
+		// know to open them. Reserve its slot (2 cols) even when absent so the
+		// rows stay aligned.
+		bubble := "  "
+		if m.fileHasComments(f.Filename) {
+			bubble = iconChat
+		}
 		if i == m.selected {
 			// A filled bar + ▸ arrow makes the current file unmistakable.
 			sel := lipgloss.NewStyle().Width(w).Foreground(m.th.Base).Background(m.th.Primary).Bold(true)
-			name := truncate(shortRepo(f.Filename), w-6)
-			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s", statusLetterPlain(f.Status), name)))
+			name := truncate(shortRepo(f.Filename), max(1, w-8))
+			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s %s", statusLetterPlain(f.Status), pad(name, max(1, w-8)), bubble)))
 			continue
 		}
 		letter := statusLetter(m.th, f.Status)
-		name := mutedStyle(m.th).Render(pad(truncate(shortRepo(f.Filename), w-10), w-10))
+		name := mutedStyle(m.th).Render(pad(truncate(shortRepo(f.Filename), w-13), max(1, w-13)))
 		counts := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", f.Additions))
-		lines = append(lines, fmt.Sprintf("  %s %s %s", letter, name, counts))
+		lines = append(lines, fmt.Sprintf("  %s %s %s %s", letter, name, bubble, counts))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// fileHasComments reports whether path carries any inline review comments — used
+// to flag files in the list with a 💬 so the reader knows to look.
+func (m detailModel) fileHasComments(path string) bool {
+	for _, c := range m.detail.ReviewComments {
+		if c.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (m detailModel) renderInfo() string {
@@ -870,7 +1306,7 @@ func (m detailModel) renderInfo() string {
 			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
 			b.WriteString(wrap(c.Body, m.infoVP.Width) + "\n\n")
 		}
-		b.WriteString(mutedStyle(m.th).Render("c reply · v full conversation") + "\n")
+		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
 	}
@@ -931,6 +1367,8 @@ func (m detailModel) viewComposer() string {
 		title = "Request changes — reason"
 	case stateLineComment:
 		title = fmt.Sprintf("Comment on %s:%d", shortRepo(m.anchorPath), m.anchorLine)
+	case stateReply:
+		title = "Reply to " + m.replyAuthor
 	}
 	head := warnStyle(m.th).Render(title) + mutedStyle(m.th).Render("   ctrl+s submit · esc cancel")
 	return lipgloss.JoinVertical(lipgloss.Left, head, m.composer.View())
@@ -943,10 +1381,19 @@ func (m detailModel) viewFooter() string {
 	var help string
 	switch {
 	case m.page == pageConversation:
-		help = "↑/↓ scroll · c reply · a approve · x request-changes · o open · v/d/esc close"
+		thread := ""
+		if len(m.convThreads) > 0 {
+			thread = " · n/N thread · r reply"
+		}
+		help = "↑/↓ scroll" + thread + " · c comment · a approve · x request-changes · o open · v/d/esc close"
 	case m.focus == focusDiff:
-		// On the diff, c/s act on the cursor line.
-		help = "↑/↓ line · n/N change · c comment line · s suggest · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
+		// On the diff, c/s act on the cursor line; r replies when it has a thread.
+		reply := ""
+		if len(m.lineComments()) > 0 {
+			reply = " · r reply"
+		}
+		help = "↑/↓ line · n/N change · c comment line · s suggest" + reply +
+			" · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
 	default:
 		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · esc back"
 	}

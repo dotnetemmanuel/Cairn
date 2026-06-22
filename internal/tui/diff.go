@@ -75,9 +75,27 @@ type highlighter struct {
 func newHighlighter(filename string) highlighter {
 	l := lexers.Match(filename)
 	if l == nil {
+		l = lexerForExt(filename) // chroma misses a few extensions
+	}
+	if l == nil {
 		l = lexers.Fallback
 	}
 	return highlighter{lexer: chroma.Coalesce(l)}
+}
+
+// lexerForExt maps extensions chroma doesn't recognize to the closest lexer.
+// Razor-family files are HTML with embedded @C#, so HTML highlights them well.
+func lexerForExt(filename string) chroma.Lexer {
+	lower := strings.ToLower(filename)
+	dot := strings.LastIndexByte(lower, '.')
+	if dot < 0 {
+		return nil
+	}
+	switch lower[dot+1:] {
+	case "cshtml", "razor", "vbhtml", "aspx", "ascx", "master":
+		return lexers.Get("HTML")
+	}
+	return nil
 }
 
 func (h highlighter) line(code string) string {
@@ -102,13 +120,17 @@ func (h highlighter) line(code string) string {
 // even when the whole diff fits on screen (pass -1 for none). The line at
 // index cursor gets a ▌ line cursor (pass -1 for none). Lines whose rendered
 // index appears in commentCounts get a 💬N badge.
-func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, commentCounts map[int]int) string {
+// renderDiff returns the rendered block and rowAt, a map from patch-line index
+// to the first visual row that line occupies. Because long lines soft-wrap onto
+// several visual rows, callers must translate patch-line positions (hunks, the
+// cursor) through rowAt before scrolling the viewport.
+func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, commentCounts map[int]int) (string, []int) {
 	if width < 6 {
 		width = 6
 	}
 	if strings.TrimSpace(f.Patch) == "" {
 		note := "(no textual diff — binary file, or too large to display)"
-		return lipgloss.NewStyle().Foreground(th.Muted).Render(note)
+		return lipgloss.NewStyle().Foreground(th.Muted).Render(note), nil
 	}
 
 	ensureChromaStyle(th)
@@ -122,12 +144,38 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 	cursorStyle := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
 	badgeStyle := lipgloss.NewStyle().Foreground(th.Info)
 
+	// Line-number gutter: old | new, each right-aligned to gw digits. A number
+	// is blank on the side where the line doesn't exist (new side of a deletion,
+	// old side of an addition).
+	gw := diffGutterWidth(f.Patch)
+	gutW := 2*gw + 1 // old + │ + new
+	gutStyle := lipgloss.NewStyle().Foreground(th.Muted)
+	sepStyle := lipgloss.NewStyle().Foreground(th.Overlay)
+	num := func(n int) string {
+		if n <= 0 {
+			return strings.Repeat(" ", gw)
+		}
+		return fmt.Sprintf("%*d", gw, n)
+	}
+	// gnum renders "old│new" with a subtle divider between the two columns.
+	gnum := func(o, n int) string {
+		return gutStyle.Render(num(o)) + sepStyle.Render("│") + gutStyle.Render(num(n))
+	}
+	blankGutter := gutStyle.Render(strings.Repeat(" ", gutW))
+	// Faint add/del line tints, derived from the theme's success/danger.
+	addBG := blendRGB(th.Base, th.Success, 0.16)
+	delBG := blendRGB(th.Base, th.Danger, 0.16)
+	oldLine, newLine := 0, 0
+
 	hunkIdx := -1
-	var lines []string
+	var out []string
+	var rowAt []int
 	for i, raw := range strings.Split(f.Patch, "\n") {
-		var rendered string
+		var rendered, gutter, bg string
 		switch {
 		case strings.HasPrefix(raw, "@@"):
+			oldLine, newLine = parseHunkStarts(raw)
+			gutter = blankGutter
 			hunkIdx++
 			if hunkIdx == activeHunk {
 				rendered = activeStyle.Render("▶ " + raw)
@@ -135,38 +183,162 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 				rendered = hunkStyle.Render("  " + raw)
 			}
 		case strings.HasPrefix(raw, "+"):
-			rendered = addMarker.Render("+") + hl.line(raw[1:])
+			gutter = gnum(0, newLine)
+			bg = addBG
+			newLine++
+			rendered = addMarker.Render("+") + hl.line(expandTabs(raw[1:]))
 		case strings.HasPrefix(raw, "-"):
-			rendered = delMarker.Render("-") + hl.line(raw[1:])
+			gutter = gnum(oldLine, 0)
+			bg = delBG
+			oldLine++
+			rendered = delMarker.Render("-") + hl.line(expandTabs(raw[1:]))
 		case strings.HasPrefix(raw, "\\"):
+			gutter = blankGutter
 			rendered = metaStyle.Render(raw)
 		default:
+			gutter = gnum(oldLine, newLine)
+			oldLine++
+			newLine++
 			code := raw
 			if strings.HasPrefix(raw, " ") {
 				code = raw[1:]
 			}
-			rendered = ctxMarker.Render(" ") + hl.line(code)
+			rendered = ctxMarker.Render(" ") + hl.line(expandTabs(code))
 		}
 
-		// One column on the left for the line cursor keeps every line aligned.
+		// One column on the left for the line cursor keeps every line aligned,
+		// then the line-number gutter (old │ new).
 		cur := " "
 		if i == cursor {
 			cur = cursorStyle.Render("▌")
 		}
-		// A trailing 💬N badge advertises inline comments; reserve its width so
-		// the line still fits and the viewport never wraps.
-		badge := ""
-		inner := width - 1
+		// A 💬N badge advertises inline comments; reserve its width on the first
+		// visual row so the badge always fits.
+		badge, badgeW := "", 0
 		if n := commentCounts[i]; n > 0 {
 			badge = badgeStyle.Render(fmt.Sprintf(" 💬%d", n))
-			inner -= lipgloss.Width(badge)
+			badgeW = lipgloss.Width(badge)
 		}
-		if inner < 4 {
-			inner = 4
+		// Soft-wrap the code to the available width so no change is hidden off
+		// the right edge. Word-aware (ansi.Wrap) so wraps fall on boundaries
+		// where possible, hard-breaking only tokens longer than the line. The
+		// gutter shows on the first row; continuation rows are blank-gutter.
+		avail := width - 1 - gutW - 1 - badgeW
+		if avail < 8 {
+			avail = 8
 		}
-		lines = append(lines, cur+ansi.Truncate(rendered, inner, "…")+badge)
+		rows := strings.Split(ansi.Wrap(rendered, avail, ""), "\n")
+		rowAt = append(rowAt, len(out))
+		for j, r := range rows {
+			g := blankGutter
+			b := ""
+			if j == 0 {
+				g = gutter
+				b = badge
+			}
+			// Tint the code area (after the gutter) on added/removed lines.
+			code := r
+			if bg != "" {
+				code = tintRow(r, bg, avail)
+			}
+			out = append(out, cur+g+" "+code+b)
+		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(out, "\n"), rowAt
+}
+
+// diffTabWidth is the column width tabs expand to in the diff pane.
+const diffTabWidth = 4
+
+// expandTabs replaces tabs with spaces aligned to diffTabWidth-column stops.
+// ansi.StringWidth counts a tab as zero width, so a tab-indented line measures
+// short, escapes soft-wrap, and the terminal hard-wraps it back to column 0 —
+// breaking the gutter alignment. Expanding first makes measured width match the
+// rendered width.
+func expandTabs(s string) string {
+	if !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	for _, r := range s {
+		if r == '\t' {
+			n := diffTabWidth - col%diffTabWidth
+			b.WriteString(strings.Repeat(" ", n))
+			col += n
+			continue
+		}
+		b.WriteRune(r)
+		col++
+	}
+	return b.String()
+}
+
+// hexRGB parses "#rrggbb" into 0-255 components.
+func hexRGB(h string) (int, int, int) {
+	h = strings.TrimPrefix(string(h), "#")
+	if len(h) != 6 {
+		return 0, 0, 0
+	}
+	r, _ := strconv.ParseInt(h[0:2], 16, 0)
+	g, _ := strconv.ParseInt(h[2:4], 16, 0)
+	b, _ := strconv.ParseInt(h[4:6], 16, 0)
+	return int(r), int(g), int(b)
+}
+
+// blendRGB mixes base toward accent by t (0..1) and returns an "R;G;B" string
+// for an SGR background — used for the faint add/del line tints derived from the
+// active theme.
+func blendRGB(base, accent lipgloss.Color, t float64) string {
+	br, bg, bb := hexRGB(string(base))
+	ar, ag, ab := hexRGB(string(accent))
+	mix := func(b, a int) int { return b + int((float64(a)-float64(b))*t) }
+	return fmt.Sprintf("%d;%d;%d", mix(br, ar), mix(bg, ag), mix(bb, ab))
+}
+
+// tintRow gives a wrapped code row a full-width background: it re-asserts the bg
+// after each ANSI reset (chroma emits per-token resets that would otherwise
+// clear it) and pads to width so the tint spans the whole line.
+func tintRow(row, rgb string, width int) string {
+	open := "\x1b[48;2;" + rgb + "m"
+	body := open + strings.ReplaceAll(row, "\x1b[0m", "\x1b[0m"+open)
+	if pad := width - ansi.StringWidth(row); pad > 0 {
+		body += strings.Repeat(" ", pad)
+	}
+	return body + "\x1b[0m"
+}
+
+// diffGutterWidth returns the per-side digit width needed for line numbers in a
+// patch (min 2), by finding the largest old/new line number it reaches.
+func diffGutterWidth(patch string) int {
+	maxN, oldLine, newLine := 0, 0, 0
+	bump := func(n int) {
+		if n > maxN {
+			maxN = n
+		}
+	}
+	for _, raw := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(raw, "@@"):
+			oldLine, newLine = parseHunkStarts(raw)
+		case strings.HasPrefix(raw, "+"):
+			bump(newLine)
+			newLine++
+		case strings.HasPrefix(raw, "-"):
+			bump(oldLine)
+			oldLine++
+		case strings.HasPrefix(raw, "\\"):
+		default:
+			bump(oldLine)
+			bump(newLine)
+			oldLine++
+			newLine++
+		}
+	}
+	if w := len(strconv.Itoa(maxN)); w > 2 {
+		return w
+	}
+	return 2
 }
 
 // diffLineMeta describes, for one rendered diff line, which side of the diff it

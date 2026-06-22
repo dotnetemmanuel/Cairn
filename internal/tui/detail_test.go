@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 )
@@ -51,11 +52,11 @@ func TestDetailRendersDiffConversationChecks(t *testing.T) {
 	wants := []string{
 		"#327", "Add a DrinkModal", "OPEN",
 		"main", "funfeat/emmanuel", "+246", "-10",
-		"DrinkModal.svelte",         // file list
-		"isOpen",                    // diff content of selected file
+		"DrinkModal.svelte", // file list
+		"isOpen",            // diff content of selected file
 		"Checks (2)", "review", "snyk",
-		"changes",                   // review badge for CHANGES_REQUESTED
-		"looks tasty",               // comment body
+		"changes",     // review badge for CHANGES_REQUESTED
+		"looks tasty", // comment body
 	}
 	for _, w := range wants {
 		if !strings.Contains(view, w) {
@@ -121,7 +122,7 @@ func TestEscEmitsExit(t *testing.T) {
 
 func TestRenderDiffMarksAddsAndDels(t *testing.T) {
 	th := theme.New(theme.DefaultPalette())
-	out := renderDiff(th, gh.FileDiff{
+	out, _ := renderDiff(th, gh.FileDiff{
 		Filename: "x.go",
 		Patch:    "@@ -1,2 +1,2 @@\n-removed\n+added\n unchanged",
 	}, 80, 0, -1, nil)
@@ -228,7 +229,7 @@ func inlineDetail(t *testing.T, width int, withComment bool) detailModel {
 	detail := gh.PRDetail{Number: 7, State: "OPEN", HeadSHA: "deadbeef"}
 	if withComment {
 		detail.ReviewComments = []gh.ReviewComment{
-			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", CreatedAt: time.Now()},
+			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", DatabaseID: 999, CreatedAt: time.Now()},
 		}
 	}
 	files := []gh.FileDiff{{
@@ -297,6 +298,74 @@ func TestContextualPaneShowsLineThread(t *testing.T) {
 	}
 }
 
+func TestReplyTargetsLineThread(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m.focus = focusDiff
+	// Move onto RIGHT:2 (the commented line), then reply.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
+	)
+	if m.state != stateReply {
+		t.Fatalf("expected stateReply after r on a commented line, got %d", m.state)
+	}
+	if m.replyTo != 999 {
+		t.Errorf("replyTo = %d, want 999 (the thread comment's databaseId)", m.replyTo)
+	}
+	if m.replyAuthor != "octocat" {
+		t.Errorf("replyAuthor = %q, want octocat", m.replyAuthor)
+	}
+	// The composer titles the reply target.
+	if v := m.viewComposer(); !strings.Contains(v, "Reply to octocat") {
+		t.Errorf("composer should title the reply; got %q", v)
+	}
+}
+
+func TestConversationThreadReply(t *testing.T) {
+	m := inlineDetail(t, 140, true) // one inline thread, DatabaseID 999
+	// Open the full conversation; the thread index should be built.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if m.page != pageConversation {
+		t.Fatalf("expected conversation page")
+	}
+	if len(m.convThreads) != 1 || m.convThreads[0].id != 999 {
+		t.Fatalf("expected 1 conv thread with id 999, got %+v", m.convThreads)
+	}
+	// n keeps the cursor on the (only) thread; r replies to it.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
+	)
+	if m.state != stateReply {
+		t.Fatalf("expected stateReply from conversation, got %d", m.state)
+	}
+	if m.replyTo != 999 {
+		t.Errorf("replyTo = %d, want 999", m.replyTo)
+	}
+	// The footer advertises the thread nav.
+	if f := m.viewFooter(); m.state == stateReply {
+		_ = f // composer is open now; footer check happens before reply below
+	}
+}
+
+func TestConversationThreadNavFooter(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if !strings.Contains(m.viewFooter(), "n/N thread") {
+		t.Errorf("conversation footer should advertise thread nav; got %q", m.viewFooter())
+	}
+}
+
+func TestReplyNoopWithoutThread(t *testing.T) {
+	m := inlineDetail(t, 140, false) // no comments anywhere
+	m.focus = focusDiff
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if m.state == stateReply {
+		t.Error("r on a line without a thread must not open the reply composer")
+	}
+}
+
 func TestTabSkipsHiddenInfoPane(t *testing.T) {
 	m := inlineDetail(t, 90, false) // < 100 cols → info pane hidden
 	if m.infoVisible() {
@@ -353,7 +422,7 @@ func TestConversationPageShowsComments(t *testing.T) {
 		t.Fatalf("expected conversation page")
 	}
 	view := m.View()
-	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c reply"} {
+	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c comment"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("conversation view missing %q", w)
 		}
@@ -366,6 +435,67 @@ func TestConversationPageShowsComments(t *testing.T) {
 	if cmd != nil {
 		if _, ok := cmd().(detailExitMsg); ok {
 			t.Fatalf("esc from conversation should not exit to dashboard")
+		}
+	}
+}
+
+func TestConversationThreadsReplyUnderAnchor(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 9})
+	base := time.Now().Add(-3 * time.Hour)
+	detail := gh.PRDetail{
+		Number: 9, State: "OPEN", HeadSHA: "deadbeef",
+		Reviews: []gh.Review{
+			{ID: "REV1", Author: "daniel", State: "CHANGES_REQUESTED", Body: "see comments", CreatedAt: base},
+		},
+		ReviewComments: []gh.ReviewComment{
+			{ThreadID: 1, Author: "daniel", Body: "rename this var", Path: "a.go", Line: 5,
+				DiffHunk: "@@ -1 +1 @@\n+x := 1", ReviewID: "REV1", CreatedAt: base.Add(time.Minute)},
+			{ThreadID: 1, Author: "emmanuel", Body: "renamed in fixup", Path: "a.go", Line: 5,
+				CreatedAt: base.Add(time.Hour)},
+		},
+	}
+	files := []gh.FileDiff{{Filename: "a.go", Status: "modified", Additions: 1, Patch: "@@ -1 +1 @@\n+x := 1"}}
+	m = driveDetail(m,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")}, // open full conversation
+	)
+	view := m.View()
+	// The anchor, its citation, and the reply all show; the reply carries the ↳ guide.
+	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "↳"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("threaded conversation missing %q", w)
+		}
+	}
+	// The reply must appear AFTER the anchor body (threaded beneath, not before).
+	if strings.Index(view, "renamed in fixup") < strings.Index(view, "rename this var") {
+		t.Error("reply should render beneath the anchor, not above it")
+	}
+}
+
+func TestRenderDiffWrapsLongLinesAndMapsRows(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	longAdd := "+" + strings.Repeat("x", 200) // one very long added line
+	f := gh.FileDiff{Filename: "x.txt", Patch: "@@ -1,1 +1,2 @@\n ctx\n" + longAdd}
+	content, rowAt := renderDiff(th, f, 40, 0, -1, nil)
+
+	// 3 patch lines (header, ctx, long add); the long add must span many rows.
+	if len(rowAt) != 3 {
+		t.Fatalf("expected rowAt for 3 patch lines, got %d", len(rowAt))
+	}
+	rows := strings.Count(content, "\n") + 1
+	if rows <= 3 {
+		t.Fatalf("long line should wrap to extra rows; got only %d visual rows", rows)
+	}
+	// rowAt is monotonic and the last line starts well past its patch index.
+	if !(rowAt[0] == 0 && rowAt[1] == 1 && rowAt[2] >= 2) {
+		t.Errorf("rowAt mapping wrong: %v", rowAt)
+	}
+	// No visual row exceeds the pane width (no terminal-level wrapping).
+	for _, line := range strings.Split(content, "\n") {
+		if lipgloss.Width(line) > 40 {
+			t.Errorf("row exceeds width 40 (=%d): %q", lipgloss.Width(line), line)
 		}
 	}
 }

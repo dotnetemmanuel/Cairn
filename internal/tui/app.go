@@ -24,14 +24,16 @@ const searchLimit = 50
 
 // section is one board tab — either a search filter or the notifications feed.
 type section struct {
-	title   string
-	typ     string
-	filter  string
-	list    list.Model
-	loading bool
-	loaded  bool
-	err     error
-	total   int
+	title       string
+	typ         string
+	filter      string
+	showClosed  bool // include the recently-closed tail for this section
+	closedLimit int  // cap for that tail
+	list        list.Model
+	loading     bool
+	loaded      bool
+	err         error
+	total       int
 }
 
 // appMode selects which screen is active.
@@ -40,6 +42,7 @@ type appMode int
 const (
 	modeDashboard appMode = iota
 	modeDetail
+	modeStack
 )
 
 // Model is the root Bubble Tea model.
@@ -50,8 +53,9 @@ type Model struct {
 	width  int
 	height int
 
-	mode   appMode
-	detail detailModel
+	mode      appMode
+	detail    detailModel
+	stackMode stackModel
 
 	sections []section
 	active   int
@@ -62,6 +66,7 @@ type Model struct {
 	localStack *stack.Tree
 	localRepo  string // owner/name of the cwd repo, "" if none
 	showStack  bool
+	showHelp   bool
 
 	spinner spinner.Model
 
@@ -109,12 +114,27 @@ func New(cfg config.Config) Model {
 		// The list's built-in quit binding maps to both q and esc; disable it so
 		// only our app-level q / ctrl+c quit (esc must not exit the dashboard).
 		l.DisableQuitKeybindings()
+		// Resolve the closed-tail settings: per-section overrides the global, which
+		// falls back to the built-in cap.
+		showClosed := cfg.ShowClosed
+		if s.ShowClosed != nil {
+			showClosed = *s.ShowClosed
+		}
+		limit := s.ClosedLimit
+		if limit == 0 {
+			limit = cfg.ClosedLimit
+		}
+		if limit == 0 {
+			limit = closedLimit
+		}
 		m.sections = append(m.sections, section{
-			title:   s.Title,
-			typ:     s.Type,
-			filter:  s.Filter,
-			list:    l,
-			loading: true,
+			title:       s.Title,
+			typ:         s.Type,
+			filter:      s.Filter,
+			showClosed:  showClosed,
+			closedLimit: limit,
+			list:        l,
+			loading:     true,
 		})
 	}
 	return m
@@ -128,10 +148,11 @@ type viewerMsg struct {
 }
 
 type sectionLoadedMsg struct {
-	idx   int
-	items []gh.Item
-	total int
-	err   error
+	idx    int
+	items  []gh.Item
+	closed []gh.Item // recently closed/merged matches, shown under a divider
+	total  int
+	err    error
 }
 
 func fetchViewer() tea.Msg {
@@ -139,19 +160,128 @@ func fetchViewer() tea.Msg {
 	return viewerMsg{v: v, err: err}
 }
 
-func loadSection(idx int, typ, filter string) tea.Cmd {
+// closedLimit is the built-in fallback cap for the recently-closed tail when
+// neither the section nor the global config specifies one.
+const closedLimit = 15
+
+func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cmd {
 	return func() tea.Msg {
-		var (
-			items []gh.Item
-			total int
-			err   error
-		)
 		if typ == config.SectionNotifications {
-			items, total, err = gh.FetchNotifications(searchLimit)
-		} else {
-			items, total, err = gh.SearchItems(filter, searchLimit)
+			items, total, err := gh.FetchNotifications(searchLimit)
+			return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
 		}
-		return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
+		items, total, err := gh.SearchItems(filter, searchLimit)
+		if err != nil {
+			return sectionLoadedMsg{idx: idx, err: err}
+		}
+		// A best-effort recent-closed tail (when enabled): failures here don't
+		// fail the section — the open list is what matters.
+		var closed []gh.Item
+		if showClosed && limit > 0 {
+			closed, _, _ = gh.SearchItems(closedFilter(filter), limit)
+		}
+		return sectionLoadedMsg{idx: idx, items: items, closed: closed, total: total}
+	}
+}
+
+// closedFilter turns a section's (open) search into its closed counterpart:
+// flip is:open to is:closed (or append it), and pin a recency sort so the
+// freshest closed items surface.
+func closedFilter(filter string) string {
+	fields := strings.Fields(filter)
+	flipped, hasSort := false, false
+	for i, t := range fields {
+		switch {
+		case strings.EqualFold(t, "is:open"):
+			fields[i] = "is:closed"
+			flipped = true
+		case strings.HasPrefix(strings.ToLower(t), "sort:"):
+			hasSort = true
+		}
+	}
+	if !flipped {
+		fields = append(fields, "is:closed")
+	}
+	if !hasSort {
+		fields = append(fields, "sort:updated-desc")
+	}
+	return strings.Join(fields, " ")
+}
+
+// sectionRows assembles a section's list rows: open items, then any recently
+// closed/merged items beneath a divider. The "OPEN"/"CLOSED" labels appear
+// only when both groups are present — a lone group needs no header.
+func sectionRows(open, closed []gh.Item) []list.Item {
+	rows := make([]list.Item, 0, len(open)+len(closed)+3)
+	both := len(open) > 0 && len(closed) > 0
+	if both {
+		rows = append(rows, sectionHeader{"OPEN"})
+	}
+	for _, it := range open {
+		rows = append(rows, prItem{it})
+	}
+	if both {
+		// A blank spacer sets the closed group apart from the open list.
+		rows = append(rows, sectionHeader{""}, sectionHeader{"CLOSED"})
+	}
+	for _, it := range closed {
+		rows = append(rows, prItem{it})
+	}
+	return rows
+}
+
+// ensureSelectable nudges the cursor off a divider row onto the nearest
+// selectable item (searching forward, then wrapping). No-op when already on a
+// real item or when the list holds none.
+func ensureSelectable(lst *list.Model) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	if _, ok := items[lst.Index()].(prItem); ok {
+		return
+	}
+	for i := 1; i <= n; i++ {
+		idx := (lst.Index() + i) % n
+		if _, ok := items[idx].(prItem); ok {
+			lst.Select(idx)
+			return
+		}
+	}
+}
+
+// selectablePos reports the 1-based rank of the selected item among the
+// selectable (non-divider) rows, and the total selectable count — so the
+// position counter ignores divider headers.
+func selectablePos(lst *list.Model) (pos, total int) {
+	for i, li := range lst.Items() {
+		if _, ok := li.(prItem); !ok {
+			continue
+		}
+		total++
+		if i <= lst.Index() {
+			pos = total
+		}
+	}
+	return pos, total
+}
+
+// selectAdjacent moves the cursor to the next selectable item in direction dir
+// (+1 down, -1 up), skipping divider rows and wrapping at the ends.
+func selectAdjacent(lst *list.Model, dir int) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	cur := lst.Index()
+	for i := 0; i < n; i++ {
+		cur = (cur + dir + n) % n
+		if _, ok := items[cur].(prItem); ok {
+			lst.Select(cur)
+			return
+		}
 	}
 }
 
@@ -160,7 +290,7 @@ func loadSection(idx int, typ, filter string) tea.Cmd {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{fetchViewer, m.spinner.Tick}
 	for i, s := range m.sections {
-		cmds = append(cmds, loadSection(i, s.typ, s.filter))
+		cmds = append(cmds, loadSection(i, s.typ, s.filter, s.showClosed, s.closedLimit))
 	}
 	return tea.Batch(cmds...)
 }
@@ -177,6 +307,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail, cmd = m.detail.Update(msg) // keep the detail screen sized
 			return m, cmd
 		}
+		if m.mode == modeStack {
+			var cmd tea.Cmd
+			m.stackMode, cmd = m.stackMode.Update(msg)
+			return m, cmd
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -187,12 +322,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailExitMsg:
 		m.mode = modeDashboard
 		return m, nil
+
+	case stackExitMsg:
+		m.mode = modeDashboard
+		return m, nil
+
+	case tea.KeyMsg:
+		// The help overlay is global and captures keys while open.
+		if m.showHelp {
+			switch msg.String() {
+			case "?", "esc", "q":
+				m.showHelp = false
+			}
+			return m, nil
+		}
+		// Open help on ? — unless a text field is capturing input, where ? is a
+		// literal character.
+		capturing := (m.mode == modeDetail && m.detail.composing()) ||
+			(m.mode == modeStack && m.stackMode.capturing())
+		if msg.String() == "?" && !capturing {
+			m.showHelp = true
+			return m, nil
+		}
 	}
 
 	// In detail mode, everything else routes to the detail screen.
 	if m.mode == modeDetail {
 		var cmd tea.Cmd
 		m.detail, cmd = m.detail.Update(msg)
+		return m, cmd
+	}
+
+	// In stack mode, everything else routes to the stack screen.
+	if m.mode == modeStack {
+		var cmd tea.Cmd
+		m.stackMode, cmd = m.stackMode.Update(msg)
 		return m, cmd
 	}
 
@@ -219,11 +383,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.err = msg.err
 		s.total = msg.total
 		if msg.err == nil {
-			items := make([]list.Item, len(msg.items))
-			for i, it := range msg.items {
-				items[i] = prItem{it}
-			}
-			s.list.SetItems(items)
+			s.list.SetItems(sectionRows(msg.items, msg.closed))
+			ensureSelectable(&s.list)
 			m.rebuildStacks()
 			m.resizeLists() // sidebar visibility may have changed
 		}
@@ -245,35 +406,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showStack = !m.showStack
 			m.resizeLists()
 			return m, nil
+		case "S":
+			// Enter the dedicated, local-context stack authoring mode.
+			m.stackMode = newStackModel(m.th, m.localRepo)
+			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+			m.mode = modeStack
+			return m, nil
 		case "r":
 			cmds := []tea.Cmd{fetchViewer}
 			s := &m.sections[m.active]
 			s.loading = true
 			s.err = nil
-			cmds = append(cmds, loadSection(m.active, s.typ, s.filter))
+			cmds = append(cmds, loadSection(m.active, s.typ, s.filter, s.showClosed, s.closedLimit))
 			m.headerLoading = true
 			return m, tea.Batch(cmds...)
 		}
-		// Forward navigation to the active section's list, wrapping the cursor
-		// around the ends (down on the last row → first, up on the first → last).
+		// Forward navigation to the active section's list. j/k/arrows move to the
+		// next selectable row, skipping divider headers and wrapping at the ends.
 		if len(m.sections) > 0 {
 			lst := &m.sections[m.active].list
-			if n := len(lst.Items()); n > 0 && lst.FilterState() != list.Filtering {
+			if len(lst.Items()) > 0 && lst.FilterState() != list.Filtering {
 				switch msg.String() {
 				case "down", "j":
-					if lst.Index() == n-1 {
-						lst.Select(0)
-						return m, nil
-					}
+					selectAdjacent(lst, +1)
+					return m, nil
 				case "up", "k":
-					if lst.Index() == 0 {
-						lst.Select(n - 1)
-						return m, nil
-					}
+					selectAdjacent(lst, -1)
+					return m, nil
 				}
 			}
 			var cmd tea.Cmd
 			m.sections[m.active].list, cmd = m.sections[m.active].list.Update(msg)
+			ensureSelectable(&m.sections[m.active].list)
 			return m, cmd
 		}
 	}
@@ -299,12 +463,17 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 }
 
 // chrome heights, used for both layout and list sizing. The tab strip is three
-// rows: the active tab's top border, the labels, and the body's top line.
+// rows: the active tab's top border, the labels, and the body's top line. The
+// header is two rows: the brand line and the session/status line.
 const (
-	headerH = 1
+	headerH = 2
 	tabsH   = 3
 	footerH = 1
 )
+
+// logoGlyph is Cairn's mark in the header brand line. Pulled out so it's a
+// one-line swap; ⟁ (a small triangle within a triangle) reads as a cairn/peak.
+const logoGlyph = "⟁"
 
 func (m *Model) resizeLists() {
 	bodyH := m.height - headerH - tabsH - footerH
@@ -379,8 +548,14 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
 	}
+	if m.showHelp {
+		return m.renderHelp()
+	}
 	if m.mode == modeDetail {
 		return m.detail.View()
+	}
+	if m.mode == modeStack {
+		return m.stackMode.View(m.spinner.View())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.viewHeader(),
@@ -391,8 +566,16 @@ func (m Model) View() string {
 }
 
 func (m Model) viewHeader() string {
-	title := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("⟁ Cairn")
+	row := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).
+		Foreground(m.th.Text).Padding(0, 1)
 
+	// Row 1 — brand. The mark + name get their own line so they read as a
+	// masthead rather than competing with the status text.
+	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
+	brandRow := row.Render(brand + tagline)
+
+	// Row 2 — session/status.
 	var status string
 	switch {
 	case m.headerLoading:
@@ -406,14 +589,9 @@ func (m Model) viewHeader() string {
 		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
 			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
 	}
+	statusRow := row.Render(status)
 
-	inner := lipgloss.JoinHorizontal(lipgloss.Center, title, "   ", status)
-	return lipgloss.NewStyle().
-		Width(m.width).
-		Background(m.th.Surface).
-		Foreground(m.th.Text).
-		Padding(0, 1).
-		Render(inner)
+	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
 
 func (m Model) viewTabs() string {
@@ -492,8 +670,8 @@ func (m Model) viewBody() string {
 	// The list is the focused pane: a blue title (with a position counter so
 	// it's obvious you're moving the PR list, not the stack) over a blue rule.
 	label := s.title
-	if n := len(s.list.Items()); n > 0 {
-		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, s.list.Index()+1, n)
+	if pos, n := selectablePos(&s.list); n > 0 {
+		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
 	}
 	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
 	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
@@ -611,7 +789,23 @@ func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w
 }
 
 func (m Model) viewFooter() string {
-	help := "↑/↓ move · ←/→ or tab section · enter open · s stack · r refresh · q quit"
-	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).
-		Padding(0, 1).Render(help)
+	dim := lipgloss.NewStyle().Foreground(m.th.Muted)
+	sep := dim.Render(" · ")
+
+	// Stack mode is Cairn's headline feature — render its hint in the Primary
+	// accent (bold) so it pops out of the otherwise-muted utility keys.
+	stackHint := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("S stack mode")
+
+	parts := []string{
+		dim.Render("↑/↓ move"),
+		dim.Render("←/→ section"),
+		dim.Render("enter open"),
+		dim.Render("s sidebar"),
+		stackHint,
+		dim.Render("r refresh"),
+		dim.Render("? help"),
+		dim.Render("q quit"),
+	}
+	return lipgloss.NewStyle().Width(m.width).Padding(0, 1).
+		Render(strings.Join(parts, sep))
 }

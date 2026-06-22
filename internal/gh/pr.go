@@ -30,6 +30,7 @@ type Comment struct {
 
 // Review is a submitted PR review.
 type Review struct {
+	ID        string // GraphQL node id, so inline comments can group under it
 	Author    string
 	State     string // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
 	Body      string
@@ -46,12 +47,17 @@ type Check struct {
 
 // ReviewComment is an inline comment left on a specific code line.
 type ReviewComment struct {
-	Author    string
-	Body      string
-	Path      string
-	Line      int
-	Side      string // RIGHT (new) or LEFT (old); GitHub's diffSide
-	CreatedAt time.Time
+	Author       string
+	Body         string
+	Path         string
+	Line         int
+	OriginalLine int    // line at the comment's original commit (matches DiffHunk)
+	Side         string // RIGHT (new) or LEFT (old); GitHub's diffSide
+	DiffHunk     string // the cited code context GitHub anchors the comment to
+	ReviewID     string // the review this inline comment belongs to ("" if none)
+	ThreadID     int    // review-thread group (1-based); comments sharing it are one thread, first = anchor. 0 = ungrouped.
+	DatabaseID   int    // REST comment id; reply to a thread via any member's id
+	CreatedAt    time.Time
 }
 
 // ReviewRequest is a pending (not-yet-submitted) review request on a PR.
@@ -93,43 +99,129 @@ const (
 	KindInline
 )
 
-// TimelineEntry is one item in the unified, chronological conversation.
+// TimelineEntry is one item in the unified, chronological conversation. A
+// KindReview entry may carry Children: the thread anchors left as part of that
+// review, rendered indented beneath it. A KindInline entry is a review-thread
+// anchor: it carries DiffHunk (the cited code context) and may carry Replies —
+// the later comments in its thread, rendered indented beneath the anchor.
 type TimelineEntry struct {
-	Kind      TimelineKind
-	Author    string
-	Body      string
-	State     string // review state, for KindReview
-	Path      string // for KindInline
-	Line      int    // for KindInline
-	CreatedAt time.Time
+	Kind       TimelineKind
+	Author     string
+	Body       string
+	State      string          // review state, for KindReview
+	Path       string          // for KindInline
+	Line       int             // for KindInline
+	Side       string          // for KindInline: RIGHT (new) or LEFT (old)
+	DiffHunk   string          // for KindInline: the cited code context
+	DatabaseID int             // for KindInline: REST comment id, for threaded replies
+	Children   []TimelineEntry // for KindReview: its thread anchors
+	Replies    []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
+	CreatedAt  time.Time
 }
 
 // Timeline merges the PR description, conversation comments, review summaries,
 // and inline code comments into a single list ordered by creation time. The
-// description always leads.
+// description always leads. Inline comments that belong to a review are nested as
+// Children of that review's entry (so a reviewer's batch of suggestions/comments
+// renders indented under their one review), rather than scattered chronologically.
 func (d PRDetail) Timeline() []TimelineEntry {
-	var rest []TimelineEntry
-	for _, c := range d.Comments {
-		rest = append(rest, TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
-	}
+	var top []*TimelineEntry
+	byReview := map[string]*TimelineEntry{} // review id -> its entry, for nesting
+
 	for _, r := range d.Reviews {
-		// Skip bare COMMENTED reviews with no body (their substance is the
-		// inline comments, surfaced separately).
-		if r.State == "COMMENTED" && strings.TrimSpace(r.Body) == "" {
+		e := &TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, CreatedAt: r.CreatedAt}
+		if r.ID != "" {
+			byReview[r.ID] = e
+		}
+		top = append(top, e)
+	}
+	for _, c := range d.Comments {
+		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
+	}
+	// Group inline comments into their review threads. A thread's FIRST comment is
+	// the anchor (it carries the citation); later comments are Replies rendered
+	// beneath it. The whole thread nests under the review the ANCHOR belongs to —
+	// so a reply submitted as its own event threads under the suggestion instead
+	// of scattering. Comments with ThreadID 0 are ungrouped (each its own anchor).
+	type anchorRef struct {
+		e        *TimelineEntry
+		reviewID string
+	}
+	var anchors []anchorRef
+	threadAnchor := map[int]*TimelineEntry{} // 1-based thread id -> its anchor entry
+	for _, rc := range d.ReviewComments {
+		// The diff hunk (and so the citation gutter) is anchored at the comment's
+		// original line; show that in the header too, so they agree even when the
+		// PR moved on. ReviewComment.Line stays the current line for diff badges.
+		line := rc.Line
+		if rc.OriginalLine > 0 {
+			line = rc.OriginalLine
+		}
+		entry := TimelineEntry{
+			Kind: KindInline, Author: rc.Author, Body: rc.Body,
+			Path: rc.Path, Line: line, Side: rc.Side, DiffHunk: rc.DiffHunk,
+			DatabaseID: rc.DatabaseID, CreatedAt: rc.CreatedAt,
+		}
+		// A reply (a later comment in an already-seen thread) folds under its anchor.
+		if rc.ThreadID != 0 {
+			if a := threadAnchor[rc.ThreadID]; a != nil {
+				a.Replies = append(a.Replies, entry)
+				continue
+			}
+		}
+		a := entry
+		if rc.ThreadID != 0 {
+			threadAnchor[rc.ThreadID] = &a
+		}
+		anchors = append(anchors, anchorRef{e: &a, reviewID: rc.ReviewID})
+	}
+	// Place each completed thread (anchor + its replies) under its review, or at
+	// the top level when the anchor belongs to no surfaced review.
+	for _, ar := range anchors {
+		if parent := byReview[ar.reviewID]; ar.reviewID != "" && parent != nil {
+			parent.Children = append(parent.Children, *ar.e)
+		} else {
+			top = append(top, ar.e)
+		}
+	}
+
+	// Drop bare COMMENTED reviews that carry neither a body nor any inline
+	// comments (their substance lived elsewhere); keep ones with nested comments.
+	kept := top[:0]
+	for _, e := range top {
+		if e.Kind == KindReview && e.State == "COMMENTED" &&
+			strings.TrimSpace(e.Body) == "" && len(e.Children) == 0 {
 			continue
 		}
-		rest = append(rest, TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, CreatedAt: r.CreatedAt})
+		kept = append(kept, e)
 	}
-	for _, rc := range d.ReviewComments {
-		rest = append(rest, TimelineEntry{Kind: KindInline, Author: rc.Author, Body: rc.Body, Path: rc.Path, Line: rc.Line, CreatedAt: rc.CreatedAt})
-	}
-	sort.SliceStable(rest, func(i, j int) bool {
-		return rest[i].CreatedAt.Before(rest[j].CreatedAt)
-	})
+	top = kept
 
-	out := make([]TimelineEntry, 0, len(rest)+1)
+	sort.SliceStable(top, func(i, j int) bool { return top[i].CreatedAt.Before(top[j].CreatedAt) })
+	// Order a review's thread anchors, and each anchor's replies, by time. Anchors
+	// are already first-in-thread by construction; this orders sibling anchors and
+	// the reply chain beneath each one.
+	sortReplies := func(e *TimelineEntry) {
+		sort.SliceStable(e.Replies, func(i, j int) bool {
+			return e.Replies[i].CreatedAt.Before(e.Replies[j].CreatedAt)
+		})
+	}
+	for _, e := range top {
+		sort.SliceStable(e.Children, func(i, j int) bool {
+			return e.Children[i].CreatedAt.Before(e.Children[j].CreatedAt)
+		})
+		for i := range e.Children {
+			sortReplies(&e.Children[i])
+		}
+		sortReplies(e)
+	}
+
+	out := make([]TimelineEntry, 0, len(top)+1)
 	out = append(out, TimelineEntry{Kind: KindDescription, Author: d.Author, Body: d.Body, CreatedAt: d.CreatedAt})
-	return append(out, rest...)
+	for _, e := range top {
+		out = append(out, *e)
+	}
+	return out
 }
 
 const prDetailQuery = `
@@ -143,8 +235,8 @@ query($owner:String!,$repo:String!,$number:Int!){
       author{login}
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
       comments(first:50){nodes{author{login} body createdAt}}
-      reviews(first:50){nodes{author{login} state body createdAt}}
-      reviewThreads(first:50){nodes{path line diffSide comments(first:20){nodes{author{login} body createdAt}}}}
+      reviews(first:50){nodes{id author{login} state body createdAt}}
+      reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{databaseId author{login} body createdAt diffHunk pullRequestReview{id}}}}}
       commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
@@ -165,19 +257,19 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		Viewer     struct{ Login string }
 		Repository struct {
 			PullRequest struct {
-				Number       int
-				Title        string
-				Body         string
-				State        string
-				URL          string
-				CreatedAt    time.Time
-				Additions    int
-				Deletions    int
-				ChangedFiles int
-				BaseRefName  string
-				HeadRefName  string
-				HeadRefOid   string
-				Author       struct{ Login string }
+				Number         int
+				Title          string
+				Body           string
+				State          string
+				URL            string
+				CreatedAt      time.Time
+				Additions      int
+				Deletions      int
+				ChangedFiles   int
+				BaseRefName    string
+				HeadRefName    string
+				HeadRefOid     string
+				Author         struct{ Login string }
 				ReviewRequests struct {
 					Nodes []struct {
 						RequestedReviewer struct {
@@ -187,7 +279,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 						}
 					}
 				}
-				Comments     struct {
+				Comments struct {
 					Nodes []struct {
 						Author    struct{ Login string }
 						Body      string
@@ -196,6 +288,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				}
 				Reviews struct {
 					Nodes []struct {
+						ID        string
 						Author    struct{ Login string }
 						State     string
 						Body      string
@@ -204,14 +297,18 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				}
 				ReviewThreads struct {
 					Nodes []struct {
-						Path     string
-						Line     int
-						DiffSide string
-						Comments struct {
+						Path         string
+						Line         int
+						OriginalLine int
+						DiffSide     string
+						Comments     struct {
 							Nodes []struct {
-								Author    struct{ Login string }
-								Body      string
-								CreatedAt time.Time
+								DatabaseID        int `json:"databaseId"`
+								Author            struct{ Login string }
+								Body              string
+								CreatedAt         time.Time
+								DiffHunk          string
+								PullRequestReview struct{ ID string }
 							}
 						}
 					}
@@ -229,8 +326,8 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 										Conclusion string
 										DetailsURL string `json:"detailsUrl"`
 										// StatusContext
-										Context  string
-										State    string
+										Context   string
+										State     string
 										TargetURL string `json:"targetUrl"`
 									}
 								}
@@ -277,14 +374,20 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 	for _, c := range pr.Comments.Nodes {
 		d.Comments = append(d.Comments, Comment{Author: c.Author.Login, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
-	for _, th := range pr.ReviewThreads.Nodes {
+	for ti, th := range pr.ReviewThreads.Nodes {
 		side := th.DiffSide
 		if side == "" {
 			side = "RIGHT"
 		}
+		// 1-based so 0 stays the "ungrouped" sentinel. Every comment in this thread
+		// shares the id; the first is the anchor, the rest are replies.
+		threadID := ti + 1
 		for _, c := range th.Comments.Nodes {
 			d.ReviewComments = append(d.ReviewComments, ReviewComment{
-				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line, Side: side, CreatedAt: c.CreatedAt,
+				Author: c.Author.Login, Body: c.Body, Path: th.Path, Line: th.Line,
+				OriginalLine: th.OriginalLine, Side: side,
+				DiffHunk: c.DiffHunk, ReviewID: c.PullRequestReview.ID, ThreadID: threadID,
+				DatabaseID: c.DatabaseID, CreatedAt: c.CreatedAt,
 			})
 		}
 	}
@@ -293,7 +396,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		if r.State == "" || r.State == "PENDING" {
 			continue
 		}
-		d.Reviews = append(d.Reviews, Review{Author: r.Author.Login, State: r.State, Body: r.Body, CreatedAt: r.CreatedAt})
+		d.Reviews = append(d.Reviews, Review{ID: r.ID, Author: r.Author.Login, State: r.State, Body: r.Body, CreatedAt: r.CreatedAt})
 	}
 	if len(pr.Commits.Nodes) > 0 {
 		if roll := pr.Commits.Nodes[0].Commit.StatusCheckRollup; roll != nil {
@@ -385,6 +488,112 @@ func AddReviewComment(owner, repo string, number int, commitID, path string, lin
 	})
 	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments", owner, repo, number)
 	return client.Post(endpoint, bytes.NewReader(payload), nil)
+}
+
+// ReplyToReviewComment posts a reply that threads under an existing inline review
+// comment (GitHub's "Reply" on a review thread). commentID is the REST id of any
+// comment in the target thread; the reply joins that thread. Allowed on your own
+// PR, like AddReviewComment.
+func ReplyToReviewComment(owner, repo string, number, commentID int, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%d/replies", owner, repo, number, commentID)
+	return client.Post(endpoint, bytes.NewReader(payload), nil)
+}
+
+// FindPROpenForBranch returns the number of the open PR whose head is branch in
+// owner/repo, or 0 when there is none. Used to ship a stack's bottom branch:
+// stack mode knows the branch locally but needs its PR number to merge.
+func FindPROpenForBranch(owner, repo, branch string) (int, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return 0, err
+	}
+	var prs []struct{ Number int }
+	path := fmt.Sprintf("repos/%s/%s/pulls?head=%s:%s&state=open", owner, repo, owner, branch)
+	if err := client.Get(path, &prs); err != nil {
+		return 0, err
+	}
+	if len(prs) == 0 {
+		return 0, nil
+	}
+	return prs[0].Number, nil
+}
+
+// MergePR merges a pull request on GitHub (REST PUT). method is "squash",
+// "merge", or "rebase" (defaults to squash). This is how a stack's bottom branch
+// lands on the trunk; the rest of the stack is re-parented afterwards by sync.
+func MergePR(owner, repo string, number int, method string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	if method == "" {
+		method = "squash"
+	}
+	payload, _ := json.Marshal(map[string]string{"merge_method": method})
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d/merge", owner, repo, number)
+	return client.Put(path, bytes.NewReader(payload), nil)
+}
+
+// PRsWithBase returns the numbers of open PRs that target base in owner/repo.
+// When a stack's bottom branch is shipped, the PRs that targeted it must be
+// retargeted to the trunk before its branch is deleted — otherwise deleting the
+// branch closes them.
+func PRsWithBase(owner, repo, base string) ([]int, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, err
+	}
+	var prs []struct{ Number int }
+	path := fmt.Sprintf("repos/%s/%s/pulls?base=%s&state=open", owner, repo, base)
+	if err := client.Get(path, &prs); err != nil {
+		return nil, err
+	}
+	out := make([]int, 0, len(prs))
+	for _, p := range prs {
+		out = append(out, p.Number)
+	}
+	return out, nil
+}
+
+// RetargetPR changes a PR's base branch (REST PATCH). Used to point a stacked
+// PR at the trunk once the branch below it has been merged.
+func RetargetPR(owner, repo string, number int, newBase string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"base": newBase})
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	return client.Patch(path, bytes.NewReader(payload), nil)
+}
+
+// DeleteRemoteBranch deletes a branch on the remote (best-effort: an
+// already-deleted branch is not an error). After squash/rebase-merging a stack's
+// bottom PR, its branch must be GONE for git town sync to detect the ship —
+// deleting the branch and rebasing the children with --onto (dropping the now
+// squashed commits) — instead of rebasing the merged branch live (which conflicts
+// because the squash commit isn't an ancestor).
+func DeleteRemoteBranch(owner, repo, branch string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("repos/%s/%s/git/refs/heads/%s", owner, repo, branch)
+	if err := client.Delete(path, nil); err != nil {
+		// 404/422 == already gone (e.g. the repo auto-deletes on merge).
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "not found") || strings.Contains(err.Error(), "404") ||
+			strings.Contains(err.Error(), "422") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // SplitRepo splits an "owner/name" string into its parts.

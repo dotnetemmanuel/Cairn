@@ -335,6 +335,56 @@ func currentBranch(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// DetectTrunk makes a best-effort guess at the repo's trunk branch, for
+// pre-filling the git-town init prompt. Order: the remote's default branch
+// (origin/HEAD), then a local main, then master, then the current branch. Returns
+// "" only when none of those exist. The user can still override the guess.
+func DetectTrunk(dir string) string {
+	if b := trunkFromSymbolicRef(gitOutput(dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")); b != "" {
+		return b
+	}
+	for _, cand := range []string{"main", "master"} {
+		if localBranchExists(dir, cand) {
+			return cand
+		}
+	}
+	return currentBranch(dir)
+}
+
+// trunkFromSymbolicRef turns "origin/main" (the short form of origin/HEAD) into
+// "main". Pure, so the stripping is table-testable.
+func trunkFromSymbolicRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	if i := strings.IndexByte(ref, '/'); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
+}
+
+func localBranchExists(dir, branch string) bool {
+	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	return cmd.Run() == nil
+}
+
+// gitOutput runs a git command and returns trimmed stdout, or "" on error.
+func gitOutput(dir string, args ...string) string {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // driftedFromParent reports whether branch has drifted off its recorded parent:
 // true when the parent's tip is NOT an ancestor of the branch (so the branch is
 // no longer stacked on top of it and needs a restack). Uses git plumbing only —

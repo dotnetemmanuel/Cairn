@@ -70,6 +70,86 @@ func TestDashboardRendersHeaderTabsAndRows(t *testing.T) {
 	}
 }
 
+func TestClosedFilter(t *testing.T) {
+	cases := map[string]string{
+		"is:open is:pr author:@me":       "is:closed is:pr author:@me sort:updated-desc",
+		"is:pr review-requested:@me":     "is:pr review-requested:@me is:closed sort:updated-desc",
+		"is:open is:pr sort:created-asc": "is:closed is:pr sort:created-asc",
+	}
+	for in, want := range cases {
+		if got := closedFilter(in); got != want {
+			t.Errorf("closedFilter(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSectionRowsDividers(t *testing.T) {
+	open := []gh.Item{{IsPR: true, Number: 1, State: "OPEN"}}
+	closed := []gh.Item{{IsPR: true, Number: 2, State: "MERGED"}}
+
+	// Both groups present → OPEN header, items, a blank spacer, CLOSED header.
+	rows := sectionRows(open, closed)
+	if len(rows) != 5 {
+		t.Fatalf("want 5 rows (OPEN + item + spacer + CLOSED + item), got %d", len(rows))
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "OPEN" {
+		t.Errorf("row 0 should be the OPEN header, got %#v", rows[0])
+	}
+	if h, ok := rows[2].(sectionHeader); !ok || h.label != "" {
+		t.Errorf("row 2 should be the blank spacer, got %#v", rows[2])
+	}
+	if h, ok := rows[3].(sectionHeader); !ok || h.label != "CLOSED" {
+		t.Errorf("row 3 should be the CLOSED header, got %#v", rows[3])
+	}
+
+	// A lone group needs no header.
+	if rows := sectionRows(open, nil); len(rows) != 1 {
+		t.Fatalf("open-only should be a flat list of 1, got %d", len(rows))
+	} else if _, ok := rows[0].(prItem); !ok {
+		t.Errorf("open-only row should be a prItem, got %#v", rows[0])
+	}
+}
+
+func TestNavSkipsDividers(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "x"}}}
+	m := New(cfg)
+	open := []gh.Item{
+		{IsPR: true, Repo: "o/r", Number: 1, Title: "open A", State: "OPEN"},
+		{IsPR: true, Repo: "o/r", Number: 2, Title: "open B", State: "OPEN"},
+	}
+	closed := []gh.Item{
+		{IsPR: true, Repo: "o/r", Number: 3, Title: "closed C", State: "CLOSED"},
+	}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		sectionLoadedMsg{idx: 0, items: open, closed: closed, total: 2},
+	)
+	lst := &m.sections[0].list
+
+	// Initial selection must land on the first real item, not the OPEN header.
+	if _, ok := lst.Items()[lst.Index()].(prItem); !ok {
+		t.Fatalf("cursor started on a divider (index %d)", lst.Index())
+	}
+
+	// Walking the whole list with j must never rest on a divider, and must
+	// cross the CLOSED divider to reach the closed item.
+	sawClosed := false
+	for i := 0; i < len(lst.Items())*2; i++ {
+		m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+		lst = &m.sections[0].list
+		it, ok := lst.Items()[lst.Index()].(prItem)
+		if !ok {
+			t.Fatalf("cursor landed on a divider at index %d", lst.Index())
+		}
+		if it.Number == 3 {
+			sawClosed = true
+		}
+	}
+	if !sawClosed {
+		t.Error("navigation never reached the closed item across the divider")
+	}
+}
+
 func TestTabCyclingWraps(t *testing.T) {
 	cfg := config.Config{Sections: []config.Section{
 		{Title: "A"}, {Title: "B"}, {Title: "C"},
@@ -139,5 +219,34 @@ func TestDashboardEscDoesNotQuitButQDoes(t *testing.T) {
 	}
 	if _, ok := qcmd().(tea.QuitMsg); !ok {
 		t.Fatal("q should quit the dashboard")
+	}
+}
+
+func TestEnterStackModeFromDashboard(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "is:open is:pr"}}}
+	m := New(cfg)
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")},
+	)
+	if m.mode != modeStack {
+		t.Fatalf("S should switch to stack mode, got mode %d", m.mode)
+	}
+	view := m.View()
+	// The local-stack pane title is present in stack mode regardless of whether
+	// the cwd repo has git-town configured (the action list vs the init CTA
+	// depends on that, but this pane always renders).
+	if !strings.Contains(view, "Local stack (cwd)") {
+		t.Errorf("stack mode view should render the local stack pane:\n%s", view)
+	}
+	// Esc emits a stackExitMsg command; run it and feed the result back.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("esc in stack mode should return an exit command")
+	}
+	m = drive(m, cmd())
+	if m.mode != modeDashboard {
+		t.Errorf("esc should return to the dashboard, got mode %d", m.mode)
 	}
 }

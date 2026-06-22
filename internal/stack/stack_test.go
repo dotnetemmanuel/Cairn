@@ -2,6 +2,23 @@ package stack
 
 import "testing"
 
+func TestTrunkFromSymbolicRef(t *testing.T) {
+	cases := map[string]string{
+		"origin/main":            "main",
+		"origin/master":          "master",
+		"upstream/develop":       "develop",
+		"origin/feature/with/sl": "feature/with/sl", // only the remote prefix is stripped
+		"main":                   "main",            // already short
+		"":                       "",
+		"  origin/main\n":        "main", // trimmed
+	}
+	for in, want := range cases {
+		if got := trunkFromSymbolicRef(in); got != want {
+			t.Errorf("trunkFromSymbolicRef(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestParseLineage(t *testing.T) {
 	dump := `git-town.main-branch main
 git-town.offline true
