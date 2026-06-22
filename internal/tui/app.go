@@ -24,14 +24,16 @@ const searchLimit = 50
 
 // section is one board tab — either a search filter or the notifications feed.
 type section struct {
-	title   string
-	typ     string
-	filter  string
-	list    list.Model
-	loading bool
-	loaded  bool
-	err     error
-	total   int
+	title       string
+	typ         string
+	filter      string
+	showClosed  bool // include the recently-closed tail for this section
+	closedLimit int  // cap for that tail
+	list        list.Model
+	loading     bool
+	loaded      bool
+	err         error
+	total       int
 }
 
 // appMode selects which screen is active.
@@ -112,12 +114,27 @@ func New(cfg config.Config) Model {
 		// The list's built-in quit binding maps to both q and esc; disable it so
 		// only our app-level q / ctrl+c quit (esc must not exit the dashboard).
 		l.DisableQuitKeybindings()
+		// Resolve the closed-tail settings: per-section overrides the global, which
+		// falls back to the built-in cap.
+		showClosed := cfg.ShowClosed
+		if s.ShowClosed != nil {
+			showClosed = *s.ShowClosed
+		}
+		limit := s.ClosedLimit
+		if limit == 0 {
+			limit = cfg.ClosedLimit
+		}
+		if limit == 0 {
+			limit = closedLimit
+		}
 		m.sections = append(m.sections, section{
-			title:   s.Title,
-			typ:     s.Type,
-			filter:  s.Filter,
-			list:    l,
-			loading: true,
+			title:       s.Title,
+			typ:         s.Type,
+			filter:      s.Filter,
+			showClosed:  showClosed,
+			closedLimit: limit,
+			list:        l,
+			loading:     true,
 		})
 	}
 	return m
@@ -143,11 +160,11 @@ func fetchViewer() tea.Msg {
 	return viewerMsg{v: v, err: err}
 }
 
-// closedLimit caps the recently-closed tail shown under a section's open
-// items — enough for recency context without burying the open list.
+// closedLimit is the built-in fallback cap for the recently-closed tail when
+// neither the section nor the global config specifies one.
 const closedLimit = 15
 
-func loadSection(idx int, typ, filter string) tea.Cmd {
+func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cmd {
 	return func() tea.Msg {
 		if typ == config.SectionNotifications {
 			items, total, err := gh.FetchNotifications(searchLimit)
@@ -157,9 +174,12 @@ func loadSection(idx int, typ, filter string) tea.Cmd {
 		if err != nil {
 			return sectionLoadedMsg{idx: idx, err: err}
 		}
-		// A best-effort recent-closed tail: failures here don't fail the
-		// section — the open list is what matters.
-		closed, _, _ := gh.SearchItems(closedFilter(filter), closedLimit)
+		// A best-effort recent-closed tail (when enabled): failures here don't
+		// fail the section — the open list is what matters.
+		var closed []gh.Item
+		if showClosed && limit > 0 {
+			closed, _, _ = gh.SearchItems(closedFilter(filter), limit)
+		}
 		return sectionLoadedMsg{idx: idx, items: items, closed: closed, total: total}
 	}
 }
@@ -269,7 +289,7 @@ func selectAdjacent(lst *list.Model, dir int) {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{fetchViewer, m.spinner.Tick}
 	for i, s := range m.sections {
-		cmds = append(cmds, loadSection(i, s.typ, s.filter))
+		cmds = append(cmds, loadSection(i, s.typ, s.filter, s.showClosed, s.closedLimit))
 	}
 	return tea.Batch(cmds...)
 }
@@ -396,7 +416,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s := &m.sections[m.active]
 			s.loading = true
 			s.err = nil
-			cmds = append(cmds, loadSection(m.active, s.typ, s.filter))
+			cmds = append(cmds, loadSection(m.active, s.typ, s.filter, s.showClosed, s.closedLimit))
 			m.headerLoading = true
 			return m, tea.Batch(cmds...)
 		}

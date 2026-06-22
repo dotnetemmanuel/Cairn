@@ -26,6 +26,10 @@ type Section struct {
 	Title  string `yaml:"title"`
 	Type   string `yaml:"type"` // "" defaults to search
 	Filter string `yaml:"filter"`
+	// ShowClosed overrides the global ShowClosed for this section (nil = inherit).
+	ShowClosed *bool `yaml:"showClosed,omitempty"`
+	// ClosedLimit overrides the global cap for this section (0 = inherit).
+	ClosedLimit int `yaml:"closedLimit,omitempty"`
 }
 
 // Config is the full user configuration. Fields beyond Phase 0 (sections,
@@ -36,6 +40,11 @@ type Config struct {
 	DefaultTrunk string            `yaml:"defaultTrunk"`
 	RepoPaths    map[string]string `yaml:"repoPaths"`
 	Sections     []Section         `yaml:"sections"`
+	// ShowClosed toggles the recently-closed/merged tail shown under each PR
+	// section's open list. Per-section ShowClosed overrides this.
+	ShowClosed bool `yaml:"showClosed"`
+	// ClosedLimit caps that tail (per-section ClosedLimit overrides it).
+	ClosedLimit int `yaml:"closedLimit"`
 }
 
 // Default returns the built-in configuration used when no file exists.
@@ -44,6 +53,8 @@ func Default() Config {
 		Theme:        theme.DefaultPalette(),
 		DefaultTrunk: "main",
 		RepoPaths:    map[string]string{},
+		ShowClosed:   true, // recently-closed tail on by default; configurable
+		ClosedLimit:  15,
 		Sections: []Section{
 			{Title: "My PRs", Filter: "is:open is:pr author:@me"},
 			{Title: "Needs Review", Filter: "is:open is:pr review-requested:@me"},
