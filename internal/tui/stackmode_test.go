@@ -86,6 +86,44 @@ func TestMaintainVerbsGatedOnTrackedBranch(t *testing.T) {
 	}
 }
 
+func TestShipGatedToBottomBranch(t *testing.T) {
+	s := fixtureModel() // current = feat-mid (parent feat-base) — not the bottom
+	ship := townie.Command{Verb: "ship"}
+	if s.actionEnabled(ship) {
+		t.Error("ship must be disabled on a middle branch")
+	}
+	s.status.Branch = "feat-base" // direct child of trunk = bottom
+	if !s.actionEnabled(ship) {
+		t.Error("ship should be enabled on the bottom branch")
+	}
+	s.status.Branch = "main" // the trunk itself
+	if s.actionEnabled(ship) {
+		t.Error("ship must be disabled on the trunk")
+	}
+	s.status.Branch = "feat-base"
+	s.status.Detached = true
+	if s.actionEnabled(ship) {
+		t.Error("ship must be disabled when detached")
+	}
+}
+
+func TestShipConfirmNamesMergeAndReParent(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-base" // bottom
+	got := s.affectedBranches(townie.Command{Verb: "ship"}, "")
+	if strings.Join(got, ",") != "feat-mid,feat-top" {
+		t.Errorf("ship affected = %v, want [feat-mid feat-top]", got)
+	}
+	s.pending = townie.Command{Verb: "ship", Title: "merge"}
+	s.affected = got
+	view := s.renderConfirm(80)
+	for _, w := range []string{"Merges feat-base's PR", "gh: merge PR (squash)"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("ship confirm missing %q\n%s", w, view)
+		}
+	}
+}
+
 func TestStackAffectedBranches(t *testing.T) {
 	s := fixtureModel()
 	// amend on feat-mid rebases feat-top (its only descendant).

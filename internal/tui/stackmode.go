@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/stack"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 	"github.com/dotnetemmanuel/cairn/internal/townie"
@@ -161,6 +162,17 @@ func (s stackModel) onTrackedBranch() bool {
 	return s.tree != nil && s.tree.NodeByName(s.status.Branch) != nil
 }
 
+// isBottomBranch reports whether the current branch is the bottom of its stack —
+// a direct child of the trunk. Only the bottom can be shipped (merged): its PR
+// targets the trunk, while higher branches target the branch below them.
+func (s stackModel) isBottomBranch() bool {
+	if s.tree == nil || s.tree.Root == nil {
+		return false
+	}
+	n := s.tree.NodeByName(s.status.Branch)
+	return n != nil && !n.IsTrunk && n.Parent == s.tree.Root.Name
+}
+
 // actionEnabled reports whether a specific command is currently actionable.
 func (s stackModel) actionEnabled(c townie.Command) bool {
 	if !s.enabled() {
@@ -174,6 +186,10 @@ func (s stackModel) actionEnabled(c townie.Command) bool {
 		// Maintain an existing stack — only meaningful on a branch git-town
 		// tracks; otherwise it'd act on a stack it doesn't know.
 		return s.onTrackedBranch()
+	case "ship":
+		// Only the bottom of the stack can be merged: a stacked PR targets the
+		// branch below it, so lower branches must land first.
+		return s.isBottomBranch()
 	default:
 		// new / insert can start or extend a stack from any branch.
 		return true
@@ -373,6 +389,89 @@ func readStream(ch <-chan townie.StreamEvent) stackStreamMsg {
 	return stackStreamMsg{ch: ch, ev: ev}
 }
 
+// runShip merges branch's PR (via gh) then syncs the stack (via git-town),
+// streaming progress through the same machinery as runOp. ship is not a git-town
+// verb — merging a PR is a remote action (gh), re-parenting the stack is local
+// (git town sync) — so it's orchestrated here rather than in townie.
+func (s stackModel) runShip(branch string) (stackModel, tea.Cmd) {
+	s.phase = stackRunning
+	s.pending = townie.Command{Verb: "ship", Title: "merge"}
+	s.opName = branch
+	s.output = ""
+	owner, repo, _ := gh.SplitRepo(s.repo)
+	trunk := ""
+	if s.tree != nil && s.tree.Root != nil {
+		trunk = s.tree.Root.Name
+	}
+	ops := s.ops
+	return s, func() tea.Msg {
+		return readStream(shipStream(owner, repo, branch, trunk, ops))
+	}
+}
+
+// shipStream lands a stack's bottom branch: merge its PR, retarget the child PRs
+// to the trunk, delete the branch, then git town sync to re-parent locally —
+// forwarding output. Stops (with the error) if the lookup or merge fails, so a
+// failed merge never proceeds.
+func shipStream(owner, repo, branch, trunk string, ops townie.Ops) <-chan townie.StreamEvent {
+	ch := make(chan townie.StreamEvent, 64)
+	go func() {
+		defer close(ch)
+		if owner == "" || repo == "" {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("can't ship: unknown repo")}
+			return
+		}
+		ch <- townie.StreamEvent{Line: "Looking up the open PR for " + branch + "…"}
+		num, err := gh.FindPROpenForBranch(owner, repo, branch)
+		if err != nil {
+			ch <- townie.StreamEvent{Done: true, Err: err}
+			return
+		}
+		if num == 0 {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("no open PR found for %s", branch)}
+			return
+		}
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("Merging PR #%d (%s) on GitHub…", num, branch)}
+		if err := gh.MergePR(owner, repo, num, "squash"); err != nil {
+			ch <- townie.StreamEvent{Done: true, Err: err}
+			return
+		}
+		// Retarget the PRs that pointed at this branch onto the trunk BEFORE
+		// deleting it — otherwise deleting the branch closes those child PRs
+		// instead of letting them follow the stack down.
+		if trunk != "" {
+			if kids, err := gh.PRsWithBase(owner, repo, branch); err == nil {
+				for _, kid := range kids {
+					ch <- townie.StreamEvent{Line: fmt.Sprintf("Retargeting PR #%d onto %s…", kid, trunk)}
+					if err := gh.RetargetPR(owner, repo, kid, trunk); err != nil {
+						ch <- townie.StreamEvent{Line: "  (could not retarget #" + fmt.Sprint(kid) + ": " + err.Error() + ")"}
+					}
+				}
+			}
+		}
+		// Delete the merged branch's remote so sync treats it as shipped (delete +
+		// re-parent children) rather than rebasing the squashed commits — which
+		// would conflict. Best-effort: if the repo already auto-deleted it, fine.
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("Merged PR #%d. Removing the merged branch…", num)}
+		if err := gh.DeleteRemoteBranch(owner, repo, branch); err != nil {
+			ch <- townie.StreamEvent{Line: "  (could not delete remote branch: " + err.Error() + ")"}
+		}
+		ch <- townie.StreamEvent{Line: "Syncing the stack…"}
+		for ev := range ops.Stream("sync", "") {
+			if ev.Done {
+				if ev.Err != nil {
+					ch <- townie.StreamEvent{Done: true, Err: ev.Err}
+					return
+				}
+				break
+			}
+			ch <- ev
+		}
+		ch <- townie.StreamEvent{Done: true}
+	}()
+	return ch
+}
+
 func (s stackModel) updateNaming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -399,6 +498,11 @@ func (s stackModel) updateConfirming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		s.phase = stackBrowsing
 		return s, nil
 	case "enter":
+		// ship isn't a git-town verb: merge the PR via gh, then sync. It always
+		// acts on the current (bottom) branch.
+		if s.pending.Verb == "ship" {
+			return s.runShip(s.status.Branch)
+		}
 		return s.runOp(s.pending.Verb, strings.TrimSpace(s.name.Value()), s.pending.Title)
 	}
 	return s, nil
@@ -428,6 +532,9 @@ func (s stackModel) affectedBranches(c townie.Command, name string) []string {
 			}
 		}
 		return all
+	case "ship":
+		// Merging cur re-parents the branches above it onto the trunk.
+		return s.descendants(cur)
 	default: // new — creates a leaf, rebases nothing
 		return nil
 	}
@@ -647,6 +754,12 @@ func (s stackModel) renderConfirm(w int) string {
 			effect = "Rebases the stack (" + humanList(s.affected) + ") onto the updated trunk — each branch onto its parent — then pushes."
 		} else {
 			effect = "Pulls the trunk and pushes; no other stack branches to move."
+		}
+	case "ship":
+		if len(desc) > 0 {
+			effect = fmt.Sprintf("Merges %s's PR into the trunk on GitHub and deletes it, then re-parents %s onto the trunk.", cur, humanList(desc))
+		} else {
+			effect = fmt.Sprintf("Merges %s's PR into the trunk on GitHub and deletes it.", cur)
 		}
 	case "init":
 		effect = fmt.Sprintf("Marks %s as the trunk and sets rebase syncing — writes local .git/config only, nothing committed or pushed.", val(name))

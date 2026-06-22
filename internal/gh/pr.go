@@ -504,6 +504,98 @@ func ReplyToReviewComment(owner, repo string, number, commentID int, body string
 	return client.Post(endpoint, bytes.NewReader(payload), nil)
 }
 
+// FindPROpenForBranch returns the number of the open PR whose head is branch in
+// owner/repo, or 0 when there is none. Used to ship a stack's bottom branch:
+// stack mode knows the branch locally but needs its PR number to merge.
+func FindPROpenForBranch(owner, repo, branch string) (int, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return 0, err
+	}
+	var prs []struct{ Number int }
+	path := fmt.Sprintf("repos/%s/%s/pulls?head=%s:%s&state=open", owner, repo, owner, branch)
+	if err := client.Get(path, &prs); err != nil {
+		return 0, err
+	}
+	if len(prs) == 0 {
+		return 0, nil
+	}
+	return prs[0].Number, nil
+}
+
+// MergePR merges a pull request on GitHub (REST PUT). method is "squash",
+// "merge", or "rebase" (defaults to squash). This is how a stack's bottom branch
+// lands on the trunk; the rest of the stack is re-parented afterwards by sync.
+func MergePR(owner, repo string, number int, method string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	if method == "" {
+		method = "squash"
+	}
+	payload, _ := json.Marshal(map[string]string{"merge_method": method})
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d/merge", owner, repo, number)
+	return client.Put(path, bytes.NewReader(payload), nil)
+}
+
+// PRsWithBase returns the numbers of open PRs that target base in owner/repo.
+// When a stack's bottom branch is shipped, the PRs that targeted it must be
+// retargeted to the trunk before its branch is deleted — otherwise deleting the
+// branch closes them.
+func PRsWithBase(owner, repo, base string) ([]int, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, err
+	}
+	var prs []struct{ Number int }
+	path := fmt.Sprintf("repos/%s/%s/pulls?base=%s&state=open", owner, repo, base)
+	if err := client.Get(path, &prs); err != nil {
+		return nil, err
+	}
+	out := make([]int, 0, len(prs))
+	for _, p := range prs {
+		out = append(out, p.Number)
+	}
+	return out, nil
+}
+
+// RetargetPR changes a PR's base branch (REST PATCH). Used to point a stacked
+// PR at the trunk once the branch below it has been merged.
+func RetargetPR(owner, repo string, number int, newBase string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"base": newBase})
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	return client.Patch(path, bytes.NewReader(payload), nil)
+}
+
+// DeleteRemoteBranch deletes a branch on the remote (best-effort: an
+// already-deleted branch is not an error). After squash/rebase-merging a stack's
+// bottom PR, its branch must be GONE for git town sync to detect the ship —
+// deleting the branch and rebasing the children with --onto (dropping the now
+// squashed commits) — instead of rebasing the merged branch live (which conflicts
+// because the squash commit isn't an ancestor).
+func DeleteRemoteBranch(owner, repo, branch string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("repos/%s/%s/git/refs/heads/%s", owner, repo, branch)
+	if err := client.Delete(path, nil); err != nil {
+		// 404/422 == already gone (e.g. the repo auto-deletes on merge).
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "not found") || strings.Contains(err.Error(), "404") ||
+			strings.Contains(err.Error(), "422") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // SplitRepo splits an "owner/name" string into its parts.
 func SplitRepo(nameWithOwner string) (owner, repo string, ok bool) {
 	i := strings.IndexByte(nameWithOwner, '/')

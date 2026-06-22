@@ -236,6 +236,10 @@ type Command struct {
 // CommandHint shows the underlying git-town invocation for a command, e.g.
 // "git-town append <name>" — handy in the help overlay.
 func (c Command) Hint() string {
+	if c.Verb == "ship" {
+		// ship isn't a single git-town call: Cairn merges the PR via gh, then syncs.
+		return "gh: merge PR (squash)  →  git-town sync --stack"
+	}
 	a := argv(c.Verb, "<name>")
 	if a == nil {
 		return ""
@@ -287,6 +291,14 @@ func Catalog() []Command {
 			Long: "Folds your currently-staged changes into the current branch's LATEST " +
 				"commit (git commit --amend), then restacks the branches above so they sit " +
 				"on the updated commit. Use it to revise a change already in the stack.",
+		},
+		{
+			Key: "M", Verb: "ship", Title: "merge", Mutates: true,
+			Short: "merge this branch's PR, then re-stack",
+			Long: "Merges this branch's pull request into the trunk on GitHub (squash), " +
+				"deletes the branch, then syncs so the branches above re-parent onto the " +
+				"trunk. Only the BOTTOM of the stack can be merged: a stacked PR targets " +
+				"the branch below it, so lower branches must land first.",
 		},
 	}
 }
