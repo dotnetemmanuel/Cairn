@@ -1191,7 +1191,7 @@ func (m detailModel) renderInfo() string {
 			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
 			b.WriteString(wrap(c.Body, m.infoVP.Width) + "\n\n")
 		}
-		b.WriteString(mutedStyle(m.th).Render("c reply · v full conversation") + "\n")
+		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
 	}
