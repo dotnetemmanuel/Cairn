@@ -322,6 +322,41 @@ func TestReplyTargetsLineThread(t *testing.T) {
 	}
 }
 
+func TestConversationThreadReply(t *testing.T) {
+	m := inlineDetail(t, 140, true) // one inline thread, DatabaseID 999
+	// Open the full conversation; the thread index should be built.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if m.page != pageConversation {
+		t.Fatalf("expected conversation page")
+	}
+	if len(m.convThreads) != 1 || m.convThreads[0].id != 999 {
+		t.Fatalf("expected 1 conv thread with id 999, got %+v", m.convThreads)
+	}
+	// n keeps the cursor on the (only) thread; r replies to it.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
+	)
+	if m.state != stateReply {
+		t.Fatalf("expected stateReply from conversation, got %d", m.state)
+	}
+	if m.replyTo != 999 {
+		t.Errorf("replyTo = %d, want 999", m.replyTo)
+	}
+	// The footer advertises the thread nav.
+	if f := m.viewFooter(); m.state == stateReply {
+		_ = f // composer is open now; footer check happens before reply below
+	}
+}
+
+func TestConversationThreadNavFooter(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if !strings.Contains(m.viewFooter(), "n/N thread") {
+		t.Errorf("conversation footer should advertise thread nav; got %q", m.viewFooter())
+	}
+}
+
 func TestReplyNoopWithoutThread(t *testing.T) {
 	m := inlineDetail(t, 140, false) // no comments anywhere
 	m.focus = focusDiff

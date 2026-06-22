@@ -105,17 +105,18 @@ const (
 // anchor: it carries DiffHunk (the cited code context) and may carry Replies —
 // the later comments in its thread, rendered indented beneath the anchor.
 type TimelineEntry struct {
-	Kind      TimelineKind
-	Author    string
-	Body      string
-	State     string          // review state, for KindReview
-	Path      string          // for KindInline
-	Line      int             // for KindInline
-	Side      string          // for KindInline: RIGHT (new) or LEFT (old)
-	DiffHunk  string          // for KindInline: the cited code context
-	Children  []TimelineEntry // for KindReview: its thread anchors
-	Replies   []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
-	CreatedAt time.Time
+	Kind       TimelineKind
+	Author     string
+	Body       string
+	State      string          // review state, for KindReview
+	Path       string          // for KindInline
+	Line       int             // for KindInline
+	Side       string          // for KindInline: RIGHT (new) or LEFT (old)
+	DiffHunk   string          // for KindInline: the cited code context
+	DatabaseID int             // for KindInline: REST comment id, for threaded replies
+	Children   []TimelineEntry // for KindReview: its thread anchors
+	Replies    []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
+	CreatedAt  time.Time
 }
 
 // Timeline merges the PR description, conversation comments, review summaries,
@@ -158,7 +159,8 @@ func (d PRDetail) Timeline() []TimelineEntry {
 		}
 		entry := TimelineEntry{
 			Kind: KindInline, Author: rc.Author, Body: rc.Body,
-			Path: rc.Path, Line: line, Side: rc.Side, DiffHunk: rc.DiffHunk, CreatedAt: rc.CreatedAt,
+			Path: rc.Path, Line: line, Side: rc.Side, DiffHunk: rc.DiffHunk,
+			DatabaseID: rc.DatabaseID, CreatedAt: rc.CreatedAt,
 		}
 		// A reply (a later comment in an already-seen thread) folds under its anchor.
 		if rc.ThreadID != 0 {

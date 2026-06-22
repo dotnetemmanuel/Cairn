@@ -93,6 +93,20 @@ type detailModel struct {
 	// Target review-comment id for an in-progress reply (stateReply).
 	replyTo     int
 	replyAuthor string // whose comment we're replying to (for the composer title)
+
+	// Conversation-page thread cursor: repliable inline threads in render order,
+	// and the selected one (-1 = none). Lets you n/N to any thread and reply.
+	convThreads []convThread
+	convCursor  int
+}
+
+// convThread is a repliable inline-comment thread located in the rendered
+// conversation: its starting visual row (for scrolling) and the anchor comment's
+// REST id + author (for the reply).
+type convThread struct {
+	row    int
+	id     int
+	author string
 }
 
 func newDetail(th theme.Theme, it gh.Item) detailModel {
@@ -363,7 +377,11 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			return m.startLineComment("suggest")
 		}
 	case "r":
-		// Reply to the inline-comment thread on the cursor's diff line.
+		// Reply to a thread: the selected one in the conversation view, or the
+		// thread on the cursor's diff line.
+		if m.page == pageConversation {
+			return m.startConvReply()
+		}
 		if m.page == pageDiff && m.focus == focusDiff {
 			return m.startReply()
 		}
@@ -386,9 +404,17 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		m.selectFile(m.selected + 1)
 		return m, nil
 	case "n":
+		if m.page == pageConversation {
+			m.moveConvThread(1)
+			return m, nil
+		}
 		m.gotoHunk(1)
 		return m, nil
 	case "N":
+		if m.page == pageConversation {
+			m.moveConvThread(-1)
+			return m, nil
+		}
 		m.gotoHunk(-1)
 		return m, nil
 	}
@@ -618,6 +644,23 @@ func (m detailModel) startReply() (detailModel, tea.Cmd) {
 	return m, textarea.Blink
 }
 
+// startConvReply opens the composer to reply to the conversation thread under the
+// thread cursor (full-conversation view). No-op when nothing is selected.
+func (m detailModel) startConvReply() (detailModel, tea.Cmd) {
+	if m.convCursor < 0 || m.convCursor >= len(m.convThreads) {
+		m.status = mutedStyle(m.th).Render("no thread selected — press n/N to pick one")
+		return m, nil
+	}
+	t := m.convThreads[m.convCursor]
+	m.replyTo = t.id
+	m.replyAuthor = t.author
+	m.state = stateReply
+	m.composer.Reset()
+	m.composer.Placeholder = "Reply to " + t.author + " (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
+}
+
 // startLineComment opens the composer anchored to the cursor's diff line. mode
 // "suggest" pre-fills a GitHub ```suggestion block seeded with the line's text.
 func (m detailModel) startLineComment(mode string) (detailModel, tea.Cmd) {
@@ -741,9 +784,54 @@ func (m *detailModel) refreshInfo() {
 	m.infoVP.SetContent(m.renderInfo())
 }
 
+// refreshConv re-renders the conversation, places the thread cursor on the first
+// repliable thread (if any), and scrolls to the top — a full reload.
 func (m *detailModel) refreshConv() {
-	m.convVP.SetContent(m.renderConversation())
+	_, threads := m.renderConversation()
+	switch {
+	case len(threads) == 0:
+		m.convCursor = -1
+	case m.convCursor < 0 || m.convCursor >= len(threads):
+		m.convCursor = 0
+	}
+	m.renderConvContent()
 	m.convVP.GotoTop()
+}
+
+// renderConvContent rebuilds the conversation viewport content + thread index for
+// the current cursor, leaving scroll position untouched.
+func (m *detailModel) renderConvContent() {
+	content, threads := m.renderConversation()
+	m.convThreads = threads
+	m.convVP.SetContent(content)
+}
+
+// moveConvThread steps the conversation thread cursor (dir +1/-1), re-renders to
+// move the highlight, and scrolls the selected thread into view.
+func (m *detailModel) moveConvThread(dir int) {
+	n := len(m.convThreads)
+	if n == 0 {
+		m.status = mutedStyle(m.th).Render("no inline threads to navigate")
+		return
+	}
+	if m.convCursor < 0 {
+		m.convCursor = 0
+	} else {
+		m.convCursor = (m.convCursor + dir + n) % n
+	}
+	m.renderConvContent()
+	// Only scroll when the selected thread's header is outside the viewport —
+	// staying put when it's already visible (no jolt on a short hop).
+	row := m.convThreads[m.convCursor].row
+	top := m.convVP.YOffset
+	bottom := top + m.convVP.Height - 1
+	if row < top || row > bottom {
+		target := row - 2 // a little lead-in above the header
+		if target < 0 {
+			target = 0
+		}
+		m.convVP.SetYOffset(target)
+	}
 }
 
 // ---- view ----
@@ -786,7 +874,7 @@ func (m detailModel) viewConversation() string {
 // renderConversation builds the full-width thread. Reviews lead with their
 // summary; the inline comments left as part of that review are rendered indented
 // beneath it, each with the cited code shown above the comment.
-func (m detailModel) renderConversation() string {
+func (m detailModel) renderConversation() (string, []convThread) {
 	w := m.convVP.Width
 	if w < 8 {
 		w = 8
@@ -800,27 +888,42 @@ func (m detailModel) renderConversation() string {
 
 	entries := m.detail.Timeline()
 	var b strings.Builder
+	var threads []convThread
+	row := 0
+	write := func(s string) { b.WriteString(s); row += strings.Count(s, "\n") }
+	// anchor records a repliable inline thread at the current row and reports
+	// whether it is the selected one (so its header gets the cursor bar).
+	anchor := func(e gh.TimelineEntry, startRow int) bool {
+		if e.DatabaseID == 0 {
+			return false
+		}
+		sel := len(threads) == m.convCursor
+		threads = append(threads, convThread{row: startRow, id: e.DatabaseID, author: e.Author})
+		return sel
+	}
+
 	for i, e := range entries {
 		if i > 0 {
-			b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n")
+			write(mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n")
 		}
 
 		// A standalone inline comment (not surfaced under a review) renders its own
 		// header + cited code + body.
 		if e.Kind == gh.KindInline {
-			b.WriteString(m.renderInlineComment(e, tw) + "\n")
+			sel := anchor(e, row)
+			write(m.renderInlineComment(e, tw, sel) + "\n")
 			continue
 		}
 
-		b.WriteString(m.conversationHeader(e) + "\n")
+		write(m.conversationHeader(e) + "\n")
 		body := strings.TrimSpace(e.Body)
 		switch {
 		case body != "":
-			b.WriteString(wrap(body, tw) + "\n")
+			write(wrap(body, tw) + "\n")
 		case len(e.Children) > 0:
-			b.WriteString(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
+			write(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
 		default:
-			b.WriteString(mutedStyle(m.th).Render("(no message)") + "\n")
+			write(mutedStyle(m.th).Render("(no message)") + "\n")
 		}
 
 		// A review's inline comments, indented under it with a dotted guide and a
@@ -831,27 +934,35 @@ func (m detailModel) renderConversation() string {
 			if childW < 8 {
 				childW = 8
 			}
-			b.WriteString(prefix + "\n")
+			write(prefix + "\n")
 			for j, ch := range e.Children {
 				if j > 0 {
-					b.WriteString(prefix + "\n")
+					write(prefix + "\n")
 				}
-				b.WriteString(indentBlock(m.renderInlineComment(ch, childW), prefix) + "\n")
+				sel := anchor(ch, row)
+				write(indentBlock(m.renderInlineComment(ch, childW, sel), prefix) + "\n")
 			}
 		}
 	}
 	if len(entries) <= 1 && strings.TrimSpace(m.detail.Body) == "" {
-		return mutedStyle(m.th).Render("No conversation yet. Press c to comment.")
+		return mutedStyle(m.th).Render("No conversation yet. Press c to comment."), nil
 	}
-	return b.String()
+	return b.String(), threads
 }
 
 // renderInlineComment renders one inline code comment: a "who · where" header,
 // the cited code context, a blank line, then the comment body.
-func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int) string {
+func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected bool) string {
 	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
 	loc := infoStyle(m.th).Render(fmt.Sprintf("%s:%d", shortRepo(e.Path), e.Line))
 	header := who + " " + mutedStyle(m.th).Render("on ") + loc + mutedStyle(m.th).Render(" · "+relTime(e.CreatedAt))
+	if selected {
+		// Conversation thread cursor: a full-width primary-on-surface bar makes the
+		// selected thread unmistakable (a lone ▌ read too faint).
+		plain := fmt.Sprintf("▌ @%s on %s:%d · %s", e.Author, shortRepo(e.Path), e.Line, relTime(e.CreatedAt))
+		header = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+			Bold(true).Width(w).Render(plain)
+	}
 
 	var b strings.Builder
 	b.WriteString(header + "\n")
@@ -1270,7 +1381,11 @@ func (m detailModel) viewFooter() string {
 	var help string
 	switch {
 	case m.page == pageConversation:
-		help = "↑/↓ scroll · c comment · a approve · x request-changes · o open · v/d/esc close"
+		thread := ""
+		if len(m.convThreads) > 0 {
+			thread = " · n/N thread · r reply"
+		}
+		help = "↑/↓ scroll" + thread + " · c comment · a approve · x request-changes · o open · v/d/esc close"
 	case m.focus == focusDiff:
 		// On the diff, c/s act on the cursor line; r replies when it has a thread.
 		reply := ""
