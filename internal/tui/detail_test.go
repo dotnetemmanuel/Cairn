@@ -462,8 +462,8 @@ func TestConversationThreadsReplyUnderAnchor(t *testing.T) {
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")}, // open full conversation
 	)
 	view := m.View()
-	// The anchor, its citation, and the reply all show; the reply carries the ↳ guide.
-	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "↳"} {
+	// The anchor, its citation, and the reply all show; the reply carries the ╰→ guide.
+	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "╰→"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("threaded conversation missing %q", w)
 		}

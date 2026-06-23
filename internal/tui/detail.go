@@ -904,7 +904,9 @@ func (m detailModel) renderConversation() (string, []convThread) {
 
 	for i, e := range entries {
 		if i > 0 {
-			write(mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n")
+			// Blank lines above and below the rule so each comment reads as its own
+			// block — flush against content the divider looked glued on.
+			write("\n" + mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n\n")
 		}
 
 		// A standalone inline comment (not surfaced under a review) renders its own
@@ -919,26 +921,26 @@ func (m detailModel) renderConversation() (string, []convThread) {
 		body := strings.TrimSpace(e.Body)
 		switch {
 		case body != "":
-			write(wrap(body, tw) + "\n")
+			write(renderMarkdown(body, tw, m.th) + "\n")
 		case len(e.Children) > 0:
 			write(mutedStyle(m.th).Render(reviewInlineNote(len(e.Children))) + "\n")
 		default:
 			write(mutedStyle(m.th).Render("(no message)") + "\n")
 		}
 
-		// A review's inline comments, indented under it with a dotted guide and a
-		// blank guide line between them for separation.
+		// A review's inline comments, indented under it with a dotted guide. Each is
+		// fenced by the same horizontal rule as top-level comments — including before
+		// the first one, which separates the review summary from its inline notes — so
+		// every comment reads as its own block.
 		if len(e.Children) > 0 {
 			prefix := mutedStyle(m.th).Render("  ┊ ")
 			childW := tw - 4
 			if childW < 8 {
 				childW = 8
 			}
-			write(prefix + "\n")
-			for j, ch := range e.Children {
-				if j > 0 {
-					write(prefix + "\n")
-				}
+			rule := mutedStyle(m.th).Render(strings.Repeat("─", tw))
+			for _, ch := range e.Children {
+				write("\n" + rule + "\n\n")
 				sel := anchor(ch, row)
 				write(indentBlock(m.renderInlineComment(ch, childW, sel), prefix) + "\n")
 			}
@@ -973,7 +975,7 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 	if body == "" {
 		b.WriteString(mutedStyle(m.th).Render("(no message)"))
 	} else {
-		b.WriteString(wrap(body, w))
+		b.WriteString(renderMarkdown(body, w, m.th))
 	}
 
 	// Threaded replies render beneath the anchor with a deeper guide and no
@@ -981,9 +983,14 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 	if len(e.Replies) > 0 {
 		// The ↳ marks the author line once; the body aligns beneath it (6 cols:
 		// 4 indent + "↳ "), so multi-line replies don't repeat the arrow.
-		marker := mutedStyle(m.th).Render("    ↳ ")
-		cont := "      "
-		replyW := w - 6
+		// Box-drawing corner so the guide pipe lands exactly on it: │ and ╰ are both
+		// centered in their cell, where an arrow glyph's stem sits left-of-centre and
+		// never quite lines up. The guide sits one row above each reply, threading it
+		// to the comment instead of leaving it glued to the line before.
+		marker := mutedStyle(m.th).Render("    ╰→ ")
+		guide := mutedStyle(m.th).Render("    │")
+		cont := "       "
+		replyW := w - 7
 		if replyW < 8 {
 			replyW = 8
 		}
@@ -994,8 +1001,9 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 			if rbody == "" {
 				rbody = mutedStyle(m.th).Render("(no message)")
 			} else {
-				rbody = wrap(rbody, replyW)
+				rbody = renderMarkdown(rbody, replyW, m.th)
 			}
+			b.WriteString("\n" + guide)
 			b.WriteString("\n" + indentBlock(header, marker))
 			b.WriteString("\n" + indentBlock(rbody, cont))
 		}
@@ -1315,7 +1323,7 @@ func (m detailModel) renderInfo() string {
 		b.WriteString(h(fmt.Sprintf("💬 Comments on %s:%d", shortRepo(m.files[m.selected].Filename), meta.line)) + "\n")
 		for _, c := range lc {
 			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
-			b.WriteString(wrap(c.Body, m.infoVP.Width) + "\n\n")
+			b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n\n")
 		}
 		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
@@ -1324,7 +1332,7 @@ func (m detailModel) renderInfo() string {
 
 	if strings.TrimSpace(m.detail.Body) != "" {
 		b.WriteString(h("Description") + "\n")
-		b.WriteString(wrap(m.detail.Body, m.infoVP.Width) + "\n\n")
+		b.WriteString(renderMarkdown(m.detail.Body, m.infoVP.Width, m.th) + "\n\n")
 	}
 
 	b.WriteString(h(fmt.Sprintf("Checks (%d)", len(m.detail.Checks))) + "\n")
@@ -1358,7 +1366,7 @@ func (m detailModel) renderInfo() string {
 	for _, r := range m.detail.Reviews {
 		b.WriteString(reviewBadge(m.th, r.State) + " @" + r.Author + "\n")
 		if strings.TrimSpace(r.Body) != "" {
-			b.WriteString(mutedStyle(m.th).Render(wrap(r.Body, m.infoVP.Width)) + "\n")
+			b.WriteString(renderMarkdown(r.Body, m.infoVP.Width, m.th) + "\n")
 		}
 	}
 	b.WriteString("\n")
@@ -1366,7 +1374,7 @@ func (m detailModel) renderInfo() string {
 	b.WriteString(h(fmt.Sprintf("Comments (%d)", len(m.detail.Comments))) + "\n")
 	for _, c := range m.detail.Comments {
 		b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
-		b.WriteString(wrap(c.Body, m.infoVP.Width) + "\n\n")
+		b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n\n")
 	}
 	return b.String()
 }
