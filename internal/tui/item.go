@@ -82,7 +82,14 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		refText = fmt.Sprintf("%s#%d", refText, it.Number)
 	}
 	ref := pad(truncate(refText, refW), refW)
-	title := pad(truncate(it.Title, titleW), titleW)
+	// Draft PRs stay listed under OPEN but carry a muted "draft" tag so the eye
+	// can tell ready-for-review work from parked work. The tag lives in the
+	// title cell (ASCII prefix) so column alignment is preserved.
+	draftTag := ""
+	if it.IsPR && it.IsDraft && !isClosed(it.Item) {
+		draftTag = "DRAFT "
+	}
+	title := pad(truncate(draftTag+it.Title, titleW), titleW)
 	author := pad(truncate(it.Author, authorW), authorW)
 	upd := pad(relTime(it.UpdatedAt), updW)
 
@@ -94,7 +101,16 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			Foreground(d.th.Primary).
 			Background(d.th.Surface).
 			Width(d.width)
-		plain := strings.Join([]string{ref, rev, title, author, upd}, " ")
+		// The draft tag keeps its peach color on the bar (same nesting trick as
+		// the CI dot): style it explicitly over the surface so it survives the
+		// uniform row style instead of turning primary like the rest.
+		titleCell := title
+		if draftTag != "" {
+			tag := lipgloss.NewStyle().Foreground(d.th.Warning).Background(d.th.Surface).
+				Bold(true).Render(title[:len(draftTag)])
+			titleCell = tag + title[len(draftTag):]
+		}
+		plain := strings.Join([]string{ref, rev, titleCell, author, upd}, " ")
 		fmt.Fprint(w, rowStyle.Render(ci+" "+plain))
 		return
 	}
@@ -114,12 +130,27 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	}
 
 	refStyled := lipgloss.NewStyle().Foreground(d.th.Info).Render(ref)
-	titleStyled := lipgloss.NewStyle().Foreground(d.th.Text).Render(title)
+	titleStyled := styleTitle(d.th, title, draftTag)
 	authorStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(author)
 	updStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(upd)
 
 	row := strings.Join([]string{ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
 	fmt.Fprint(w, row)
+}
+
+// styleTitle colors the unfocused-row title cell. The title recedes to muted —
+// like the author/time columns — so the bright selected row stands out; any
+// leading draft tag keeps its peach color to read as a flag. draftTag is the
+// exact ASCII prefix baked into the padded title (empty when not a draft).
+func styleTitle(th theme.Theme, padded, draftTag string) string {
+	textStyle := lipgloss.NewStyle().Foreground(th.Muted)
+	if draftTag == "" || len(padded) < len(draftTag) {
+		return textStyle.Render(padded)
+	}
+	// Peach (the "not ready / parked" cue) so the tag stands apart from the
+	// muted title/author/time columns instead of blending into them.
+	tag := lipgloss.NewStyle().Foreground(th.Warning).Bold(true).Render(padded[:len(draftTag)])
+	return tag + textStyle.Render(padded[len(draftTag):])
 }
 
 // ciGlyph maps a check rollup state to a colored dot.

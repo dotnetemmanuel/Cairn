@@ -82,6 +82,7 @@ type PRDetail struct {
 	Additions      int
 	Deletions      int
 	ChangedFiles   int
+	IsDraft        bool
 	Comments       []Comment
 	Reviews        []Review
 	ReviewComments []ReviewComment
@@ -229,7 +230,7 @@ query($owner:String!,$repo:String!,$number:Int!){
   viewer{login}
   repository(owner:$owner,name:$repo){
     pullRequest(number:$number){
-      number title body state url createdAt
+      number title body state url createdAt isDraft
       additions deletions changedFiles
       baseRefName headRefName headRefOid
       author{login}
@@ -263,6 +264,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				State          string
 				URL            string
 				CreatedAt      time.Time
+				IsDraft        bool
 				Additions      int
 				Deletions      int
 				ChangedFiles   int
@@ -359,6 +361,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		Additions:    pr.Additions,
 		Deletions:    pr.Deletions,
 		ChangedFiles: pr.ChangedFiles,
+		IsDraft:      pr.IsDraft,
 	}
 	for _, rr := range pr.ReviewRequests.Nodes {
 		r := rr.RequestedReviewer

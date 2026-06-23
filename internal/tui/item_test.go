@@ -42,3 +42,31 @@ func TestReviewGlyphDistinguishesRequestTarget(t *testing.T) {
 		t.Error("approved should render ✓")
 	}
 }
+
+func TestStyleTitleTagsDrafts(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	strip := func(s string) string {
+		var b strings.Builder
+		in := false
+		for _, r := range s {
+			switch {
+			case r == '\x1b':
+				in = true
+			case in && r == 'm':
+				in = false
+			case !in:
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+
+	if got := strip(styleTitle(th, "Add widget", "")); got != "Add widget" {
+		t.Errorf("non-draft title = %q, want unchanged", got)
+	}
+	// The padded title carries the ASCII "draft " prefix; styleTitle must keep
+	// it visible while coloring it apart from the title text.
+	if got := strip(styleTitle(th, "DRAFT Add widget", "DRAFT ")); got != "DRAFT Add widget" {
+		t.Errorf("draft title content = %q, want the tag preserved", got)
+	}
+}

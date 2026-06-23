@@ -1164,6 +1164,9 @@ func (m detailModel) viewHeader() string {
 	title := lipgloss.NewStyle().Foreground(m.th.Text).Bold(true).
 		Render(truncate(m.title, max(10, m.width-20)))
 	state := stateBadge(m.th, m.detail.State)
+	if m.detail.IsDraft {
+		state += "  " + draftBadge(m.th)
+	}
 	line1 := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).Padding(0, 1).
 		Render(fmt.Sprintf("%s %s  %s", num, title, state))
 
@@ -1202,6 +1205,14 @@ func (m detailModel) viewBody() string {
 		infoTitle := "Conversation · Checks"
 		if len(m.lineComments()) > 0 {
 			infoTitle = "💬 Line thread"
+		} else {
+			// Mirror the header's status here in the pane title — the PR state
+			// (OPEN/CLOSED/MERGED), plus a DRAFT flag since drafts stay under
+			// OPEN — so it's visible without scrolling up.
+			infoTitle += "   " + stateBadge(m.th, m.detail.State)
+			if m.detail.IsDraft {
+				infoTitle += "  " + draftBadge(m.th)
+			}
 		}
 		infoPane := m.paneBox(infoTitle, m.infoVP.View(), infoW, bodyH, m.focus == focusInfo)
 		panes = append(panes, infoPane)
@@ -1418,6 +1429,13 @@ func stateBadge(t theme.Theme, state string) string {
 		c = t.Primary
 	}
 	return lipgloss.NewStyle().Foreground(c).Bold(true).Render(state)
+}
+
+// draftBadge marks a not-yet-ready PR. Drafts stay listed under OPEN, so the
+// badge is what distinguishes them — muted to read as "parked, not active".
+func draftBadge(t theme.Theme) string {
+	return lipgloss.NewStyle().Foreground(t.Warning).Bold(true).
+		Render("✎ DRAFT")
 }
 
 func reviewBadge(t theme.Theme, state string) string {
