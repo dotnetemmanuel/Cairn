@@ -171,20 +171,47 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 	if s.CodeBlock.Chroma != nil {
 		c := *s.CodeBlock.Chroma
 		bg := string(th.Overlay)
-		// Tinting Text alone covers whitespace/indentation and any token the formatter
-		// falls back to; the rest keep their syntax colors over the same backdrop.
-		for _, p := range []*ansi.StylePrimitive{
-			&c.Text, &c.Error, &c.Comment, &c.CommentPreproc, &c.Keyword,
-			&c.KeywordReserved, &c.KeywordNamespace, &c.KeywordType, &c.Operator,
-			&c.Punctuation, &c.Name, &c.NameBuiltin, &c.NameTag, &c.NameAttribute,
-			&c.NameClass, &c.NameConstant, &c.NameDecorator, &c.NameException,
-			&c.NameFunction, &c.NameOther, &c.Literal, &c.LiteralNumber,
-			&c.LiteralDate, &c.LiteralString, &c.LiteralStringEscape,
-			&c.GenericDeleted, &c.GenericEmph, &c.GenericInserted, &c.GenericStrong,
-			&c.GenericSubheading,
-		} {
+		// Recolor chroma's syntax tokens onto Cairn's semantic palette so code blocks
+		// match the rest of the TUI instead of glamour's built-in dark theme. Each token
+		// gets the Overlay backdrop plus a themed foreground; other attributes (bold,
+		// italic) carry over from the copied default. Tinting Text also covers
+		// whitespace/indentation and any token the formatter falls back to.
+		set := func(p *ansi.StylePrimitive, fg lipgloss.Color) {
+			v := string(fg)
+			p.Color = &v
 			p.BackgroundColor = &bg
 		}
+		set(&c.Text, th.Text)
+		set(&c.Error, th.Danger)
+		set(&c.Comment, th.Muted)
+		set(&c.CommentPreproc, th.Muted)
+		set(&c.Keyword, th.Primary)
+		set(&c.KeywordReserved, th.Primary)
+		set(&c.KeywordNamespace, th.Primary)
+		set(&c.KeywordType, th.Focus)
+		set(&c.Operator, th.Focus)
+		set(&c.Punctuation, th.Muted)
+		set(&c.Name, th.Text)
+		set(&c.NameBuiltin, th.Focus)
+		set(&c.NameTag, th.Info)
+		set(&c.NameAttribute, th.Info)
+		set(&c.NameClass, th.Focus)
+		set(&c.NameConstant, th.Accent2)
+		set(&c.NameDecorator, th.Info)
+		set(&c.NameException, th.Danger)
+		set(&c.NameFunction, th.Focus)
+		set(&c.NameOther, th.Text)
+		set(&c.Literal, th.Accent2)
+		set(&c.LiteralNumber, th.Accent2)
+		set(&c.LiteralDate, th.Accent2)
+		set(&c.LiteralString, th.Success)
+		set(&c.LiteralStringEscape, th.Warning)
+		set(&c.GenericDeleted, th.Danger)
+		set(&c.GenericEmph, th.Text)
+		set(&c.GenericInserted, th.Success)
+		set(&c.GenericStrong, th.Text)
+		set(&c.GenericSubheading, th.Text)
+		set(&c.Background, th.Text)
 		s.CodeBlock.Chroma = &c
 	}
 	// And the fallback (no-language / non-color) path renders via this primitive.
