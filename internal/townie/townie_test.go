@@ -172,6 +172,21 @@ func TestCatalogDrivesHelpAndDispatch(t *testing.T) {
 	}
 }
 
+func TestContinueAndUndoArgv(t *testing.T) {
+	if got := strings.Join(argv("continue", ""), " "); got != "git-town continue" {
+		t.Errorf("continue argv = %q, want git-town continue", got)
+	}
+	if got := strings.Join(argv("undo", ""), " "); got != "git-town undo" {
+		t.Errorf("undo argv = %q, want git-town undo", got)
+	}
+	// Neither is a stack-authoring verb, so they stay out of Catalog().
+	for _, c := range Catalog() {
+		if c.Verb == "continue" || c.Verb == "undo" {
+			t.Fatalf("%s must stay out of Catalog()", c.Verb)
+		}
+	}
+}
+
 func TestCheckoutArgvNotInCatalog(t *testing.T) {
 	// checkout runs via Run but must NOT appear as a stack command in Catalog().
 	for _, c := range Catalog() {
