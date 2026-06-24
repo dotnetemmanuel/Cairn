@@ -852,12 +852,17 @@ func isCommandEcho(line string) bool {
 }
 
 func (s stackModel) viewFooter(spinnerFrame string) string {
+	base := lipgloss.NewStyle().Width(s.width).Padding(0, 1)
+	// A pending conflict is the one thing worth shouting about — render the count in
+	// danger red, the rest of the hint muted.
+	if s.phase == stackBrowsing && s.status.Conflicts > 0 {
+		red := errStyle(s.th).Bold(true).Render(fmt.Sprintf("%d conflict(s) — R resolve", s.status.Conflicts))
+		return base.Render(red + mutedStyle(s.th).Render(" · r refresh · esc dashboard"))
+	}
 	var help string
 	switch s.phase {
 	case stackBrowsing:
 		switch {
-		case s.status.Conflicts > 0:
-			help = fmt.Sprintf("%d conflict(s) — R resolve · r refresh · esc dashboard", s.status.Conflicts)
 		case s.needsInit():
 			help = "enter set up git-town · r refresh · esc dashboard"
 		case s.focus == focusTree:
@@ -874,7 +879,7 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	case stackDone:
 		help = "any key to return to actions"
 	}
-	return lipgloss.NewStyle().Width(s.width).Foreground(s.th.Muted).Padding(0, 1).Render(help)
+	return base.Foreground(s.th.Muted).Render(help)
 }
 
 // --- small text helpers ---
