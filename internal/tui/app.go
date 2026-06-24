@@ -341,6 +341,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // nothing to resolve after all
 		}
 		m.conflict = newConflictModel(m.th, msg.dir, st, diskLoader(msg.dir))
+		m.conflict.gitTown = msg.gitTown
 		m.conflict, _ = m.conflict.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 		m.mode = modeConflict
 		return m, nil

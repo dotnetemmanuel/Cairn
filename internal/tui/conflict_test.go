@@ -83,14 +83,18 @@ func TestStepCrossesFiles(t *testing.T) {
 	}
 }
 
-func TestPickAdvancesToNextUnresolved(t *testing.T) {
+func TestPickStaysInPlaceThenNavigate(t *testing.T) {
 	m := newTestConflict(t, 200, []string{"a.go"}, map[string]string{"a.go": twoConflicts()})
 	m, _ = m.Update(ckey("a")) // take incoming on hunk 0
 	if m.files[0].res[0].Choice != conflict.ChoiceIncoming {
 		t.Fatal("hunk 0 not set to incoming")
 	}
+	if m.hunkIdx != 0 {
+		t.Fatalf("pick should stay on hunk 0 (showing the result), got %d", m.hunkIdx)
+	}
+	m, _ = m.Update(ckey("n")) // user moves to hunk 1
 	if m.hunkIdx != 1 {
-		t.Fatalf("did not advance to hunk 1 (at %d)", m.hunkIdx)
+		t.Fatalf("n did not move to hunk 1 (at %d)", m.hunkIdx)
 	}
 	m, _ = m.Update(ckey("d")) // take yours on hunk 1
 	if m.files[0].res[1].Choice != conflict.ChoiceYours {

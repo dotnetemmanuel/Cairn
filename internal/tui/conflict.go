@@ -80,6 +80,7 @@ type conflictModel struct {
 	editing  bool
 	editor   textarea.Model
 	confirm  bool
+	gitTown  bool // entered from a git-town op → continue via `git town continue`
 
 	width, height int
 	status        string
@@ -181,29 +182,6 @@ func (m conflictModel) flatten() []flatConflict {
 	return out
 }
 
-// advance moves to the next unresolved conflict (wrapping across files); if none
-// remain it leaves the cursor put.
-func (m *conflictModel) advance() {
-	flat := m.flatten()
-	if len(flat) == 0 {
-		return
-	}
-	start := 0
-	for i, fc := range flat {
-		if fc.file == m.fileIdx && fc.hunk == m.hunkIdx {
-			start = i
-			break
-		}
-	}
-	for off := 1; off <= len(flat); off++ {
-		fc := flat[(start+off)%len(flat)]
-		if m.files[fc.file].res[fc.hunk].Choice == conflict.ChoiceUnresolved {
-			m.fileIdx, m.hunkIdx = fc.file, fc.hunk
-			return
-		}
-	}
-}
-
 // nextFile / prevFile move to the first conflict of the adjacent file with any.
 func (m *conflictModel) jumpFile(dir int) {
 	n := len(m.files)
@@ -280,7 +258,8 @@ func (m *conflictModel) pick(c conflict.Choice) {
 	if r := m.activeRes(); r != nil {
 		r.Choice = c
 		r.Custom = ""
-		m.advance()
+		// Stay on this hunk so the resolution pane shows the result immediately;
+		// n/N moves on when the user is ready.
 	}
 }
 
@@ -308,7 +287,6 @@ func (m conflictModel) updateEditing(msg tea.KeyMsg) (conflictModel, tea.Cmd) {
 		}
 		m.editing = false
 		m.editor.Blur()
-		m.advance()
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -342,23 +320,31 @@ type conflictContinueMsg struct {
 }
 
 func (m conflictModel) continueCmd() tea.Cmd {
-	dir, files, op := m.dir, m.files, m.st.Op
+	dir, files, op, viaGitTown := m.dir, m.files, m.st.Op, m.gitTown
 	return func() tea.Msg {
 		for _, f := range files {
 			content := conflict.Apply(f.spans, f.res)
 			if err := conflict.WriteResolved(dir, f.path, content); err != nil {
-				return conflictContinueMsg{err: err}
+				return conflictContinueMsg{err: err, out: err.Error()}
 			}
 		}
-		// Prefer git-town (it resumes the whole sync); fall back to the plain git
-		// continue when the conflict wasn't a git-town op (e.g. a bare rebase).
-		out, err := townie.New(dir).Run("continue", "")
-		if err != nil {
-			if pout, perr := conflict.ContinuePlain(dir, op); perr == nil {
-				out, err = pout, nil
-			} else {
-				out = out + "\n" + pout
+		var out string
+		var err error
+		if viaGitTown {
+			// git-town resumes the whole sync (rebase + remaining stack steps + push)
+			// from its runstate; fall back to plain git if that runstate is gone.
+			out, err = townie.New(dir).Run("continue", "")
+			if err != nil {
+				if pout, perr := conflict.ContinuePlain(dir, op); perr == nil {
+					out, err = pout, nil
+				} else {
+					out = out + "\n" + pout
+				}
 			}
+		} else {
+			// A bare rebase/merge has no git-town runstate — `git town continue`
+			// would no-op (or resume something stale), so finish it directly.
+			out, err = conflict.ContinuePlain(dir, op)
 		}
 		st, _ := conflict.Detect(dir)
 		return conflictContinueMsg{state: st, out: out, err: err}
@@ -377,22 +363,49 @@ func (m conflictModel) handleContinue(msg conflictContinueMsg) (conflictModel, t
 	if msg.undo {
 		return m, func() tea.Msg { return conflictExitMsg{aborted: true, output: msg.out} }
 	}
+	st := msg.state
 	// A fresh round of conflicts → reload and keep resolving.
-	if msg.state.Op != conflict.OpNone && len(msg.state.Files) > 0 {
-		next := newConflictModel(m.th, m.dir, msg.state, diskLoader(m.dir))
-		next.width, next.height, next.sized, next.railOpen = m.width, m.height, true, m.railOpen
+	if st.Op != conflict.OpNone && len(st.Files) > 0 {
+		next := newConflictModel(m.th, m.dir, st, diskLoader(m.dir))
+		next.width, next.height, next.sized, next.railOpen, next.gitTown =
+			m.width, m.height, true, m.railOpen, m.gitTown
 		next.editor.SetWidth(m.editor.Width())
-		next.status = "Next round: more conflicts to resolve."
+		next.status = "More conflicts to resolve."
 		return next, nil
 	}
-	// Clean → the operation finished.
+	// Still mid-operation with nothing unmerged means continue didn't finish (it
+	// errored). Surface that and stay, rather than pretending we're done — the
+	// done check is Op==None, not "no unmerged files" (staging clears those while
+	// the rebase is still open).
+	if st.Op != conflict.OpNone {
+		m.confirm = false
+		m.status = "Continue failed: " + firstLine(msg.out)
+		return m, nil
+	}
+	// Operation finished.
 	m.done = true
 	return m, func() tea.Msg { return conflictExitMsg{output: msg.out} }
 }
 
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	if s == "" {
+		return "unknown error"
+	}
+	return s
+}
+
 // enterConflictMsg asks the app to open the resolver for the repo at dir (emitted
-// when a delegated op fails leaving unmerged paths).
-type enterConflictMsg struct{ dir string }
+// when a delegated op fails leaving unmerged paths). gitTown is true when the
+// conflict came from a git-town op, so continue resumes via `git town continue`
+// (which has the runstate); a bare rebase/merge continues with plain git.
+type enterConflictMsg struct {
+	dir     string
+	gitTown bool
+}
 
 // detectConflict is the seam the app uses to inspect a conflicted repo; a package
 // var so tests can stub it without a real git state.
@@ -490,7 +503,8 @@ func (m conflictModel) headerBar() string {
 	}
 	left := infoStyle(m.th).Bold(true).Render(fmt.Sprintf("CONFLICT %d/%d", min(done+1, total), total))
 	mid := mutedStyle(m.th).Render(" · " + file + hunks)
-	right := fmt.Sprintf("  %s ← %s", infoStyle(m.th).Render(m.st.Yours), infoStyle(m.th).Render(m.st.Incoming))
+	right := mutedStyle(m.th).Render("   incoming ") + infoStyle(m.th).Render(m.st.Incoming) +
+		mutedStyle(m.th).Render(" into yours ") + infoStyle(m.th).Render(m.st.Yours)
 	bar := left + mid + right
 	return lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).Padding(0, 1).Render(bar)
 }

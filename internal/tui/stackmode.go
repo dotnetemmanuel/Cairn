@@ -214,7 +214,7 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 			// A failed op that left unmerged paths is a conflict — hand off to the
 			// full-screen resolver instead of just showing the error.
 			if s.runErr != nil && s.status.Conflicts > 0 {
-				return s, func() tea.Msg { return enterConflictMsg{dir: ""} }
+				return s, func() tea.Msg { return enterConflictMsg{dir: "", gitTown: true} }
 			}
 			return s, nil
 		}
