@@ -255,6 +255,14 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		// checkout/commit in another terminal) show without leaving stack mode.
 		s.reload()
 		return s, nil
+	case "R":
+		// Open the conflict resolver when the tree is already mid-conflict (a sync
+		// that stopped, or a rebase/merge started outside Cairn).
+		if s.status.Conflicts > 0 {
+			dir := s.repo
+			return s, func() tea.Msg { return enterConflictMsg{dir: dir} }
+		}
+		return s, nil
 	case "tab", "shift+tab", "h", "l", "left", "right":
 		// Toggle focus between the action list and the branch tree (only when
 		// there's a tree to check out from).
@@ -850,6 +858,8 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	switch s.phase {
 	case stackBrowsing:
 		switch {
+		case s.status.Conflicts > 0:
+			help = fmt.Sprintf("%d conflict(s) — R resolve · r refresh · esc dashboard", s.status.Conflicts)
 		case s.needsInit():
 			help = "enter set up git-town · r refresh · esc dashboard"
 		case s.focus == focusTree:
