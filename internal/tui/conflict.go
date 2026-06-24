@@ -151,7 +151,8 @@ func (m conflictModel) activeRegion() *conflict.Region {
 }
 
 // step moves the (file, hunk) cursor by dir (±1) through every conflict in the
-// tree, clamping at the ends. Files with zero conflicts are skipped.
+// tree, wrapping at the ends so n/N (and the arrows) cycle. Files with zero
+// conflicts are skipped.
 func (m *conflictModel) step(dir int) {
 	flat := m.flatten()
 	if len(flat) == 0 {
@@ -164,13 +165,7 @@ func (m *conflictModel) step(dir int) {
 			break
 		}
 	}
-	next := cur + dir
-	if next < 0 {
-		next = 0
-	}
-	if next >= len(flat) {
-		next = len(flat) - 1
-	}
+	next := (cur + dir + len(flat)) % len(flat)
 	m.fileIdx, m.hunkIdx = flat[next].file, flat[next].hunk
 }
 
@@ -426,20 +421,36 @@ func layoutFor(width int) layoutKind {
 }
 
 // paneWidths splits the body width into rail / incoming / resolution / yours,
-// honoring the rail toggle and the layout. A pane is 0 when not shown.
+// honoring the rail toggle and the layout. A pane is 0 when not shown. The two
+// inter-pane separators (and the rail's own right border) each cost one column.
 func (m conflictModel) paneWidths() (rail, incoming, resolution, yours int) {
+	used := 0
 	if m.railOpen {
 		rail = railWidth
+		used = railWidth + 1 // + the rail's right border
 	}
-	body := max(8, m.width-rail)
+	body := max(8, m.width-used)
 	if layoutFor(m.width) == layoutTri {
-		// Favor the resolution column slightly.
-		side := max(8, (body-2)*5/16)
-		resolution = max(8, body-2*side-2)
+		avail := max(8, body-2) // two 1-col separators between the three panes
+		side := max(8, avail*5/16)
+		resolution = max(8, avail-2*side)
 		return rail, side, resolution, side
 	}
 	// Hero: resolution owns the body; sides render in the reference strip.
 	return rail, 0, body, 0
+}
+
+// bodyHeight is the row count between the header and footer — the height panes
+// and the vertical separators stretch to.
+func (m conflictModel) bodyHeight() int { return max(1, m.height-2) }
+
+// vsep is a full-height vertical separator column h rows tall.
+func (m conflictModel) vsep(h int) string {
+	rows := make([]string, max(1, h))
+	for i := range rows {
+		rows[i] = "│"
+	}
+	return lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Join(rows, "\n"))
 }
 
 // ---- view ----
@@ -506,7 +517,7 @@ func (m conflictModel) renderRail(w int) string {
 		b.WriteString(row + "\n")
 	}
 	rail := b.String()
-	return lipgloss.NewStyle().Width(w).Height(max(1, m.height-4)).
+	return lipgloss.NewStyle().Width(w).Height(m.bodyHeight()).
 		BorderRight(true).Border(lipgloss.Border{Right: "│"}, false, true, false, false).
 		BorderForeground(m.th.Overlay).Render(rail)
 }
@@ -524,10 +535,13 @@ func (m conflictModel) renderActive(wIn, wRes, wYours int) string {
 	res := m.files[m.fileIdx].res[m.hunkIdx]
 
 	if layoutFor(m.width) == layoutTri {
-		inc := m.sidePane(m.st.Incoming, reg.Incoming, f.hl, wIn, m.th.Info)
-		you := m.sidePane(m.st.Yours, reg.Yours, f.hl, wYours, m.th.Warning)
-		mid := m.resolutionPane(reg, res, f.hl, wRes)
-		return lipgloss.JoinHorizontal(lipgloss.Top, inc, sep(m.th), mid, sep(m.th), you)
+		bodyH := m.bodyHeight()
+		fill := lipgloss.NewStyle().Height(bodyH)
+		inc := fill.Render(m.sidePane(m.st.Incoming, reg.Incoming, f.hl, wIn, m.th.Info))
+		mid := fill.Render(m.resolutionPane(reg, res, f.hl, wRes))
+		you := fill.Render(m.sidePane(m.st.Yours, reg.Yours, f.hl, wYours, m.th.Warning))
+		v := m.vsep(bodyH)
+		return lipgloss.JoinHorizontal(lipgloss.Top, inc, v, mid, v, you)
 	}
 	// Hero: a compact 2-up reference strip above the resolution.
 	strip := m.referenceStrip(reg, f.hl, wRes)
@@ -557,21 +571,24 @@ func (m conflictModel) resolutionPane(reg *conflict.Region, res conflict.Resolut
 	case conflict.ChoiceCustom:
 		lines, bg = strings.Split(res.Custom, "\n"), blendRGB(m.th.Base, m.th.Success, 0.16)
 	default:
-		// Unresolved: show both sides faint so the choice is obvious.
-		body := m.tintedCode(reg.Incoming, hl, w, blendRGB(m.th.Base, m.th.Info, 0.10)) + "\n" +
-			mutedStyle(m.th).Render(strings.Repeat("╌", max(1, w))) + "\n" +
-			m.tintedCode(reg.Yours, hl, w, blendRGB(m.th.Base, m.th.Warning, 0.10))
-		hint := mutedStyle(m.th).Render("\n  a incoming · d yours · b both · e edit")
-		return lipgloss.NewStyle().Width(w).Render(head + "\n" + body + hint)
+		// Unresolved: the incoming/yours panes already show the two sides, so the
+		// resolution pane just offers the choice — no need to repeat the code here.
+		menu := mutedStyle(m.th).Render("Not resolved — choose:") + "\n\n" +
+			infoStyle(m.th).Render("  a") + mutedStyle(m.th).Render("  take incoming · "+m.st.Incoming) + "\n" +
+			warnStyle(m.th).Render("  d") + mutedStyle(m.th).Render("  take yours · "+m.st.Yours) + "\n" +
+			okStyle(m.th).Render("  b") + mutedStyle(m.th).Render("  take both") + "\n" +
+			mutedStyle(m.th).Render("  e  edit by hand")
+		return lipgloss.NewStyle().Width(w).Render(head + "\n\n" + menu)
 	}
 	return lipgloss.NewStyle().Width(w).Render(head + "\n" + m.tintedCode(lines, hl, w, bg))
 }
 
 func (m conflictModel) referenceStrip(reg *conflict.Region, hl highlighter, w int) string {
-	half := max(6, (w-3)/2)
+	half := max(6, (w-1)/2)
 	inc := m.sidePane(m.st.Incoming, reg.Incoming, hl, half, m.th.Info)
 	you := m.sidePane(m.st.Yours, reg.Yours, hl, half, m.th.Warning)
-	return lipgloss.JoinHorizontal(lipgloss.Top, inc, sep(m.th), you)
+	h := 1 + max(len(reg.Incoming), len(reg.Yours))
+	return lipgloss.JoinHorizontal(lipgloss.Top, inc, m.vsep(h), you)
 }
 
 // tintedCode highlights each line and lays it on a faint background to the pane
@@ -615,10 +632,6 @@ func (m conflictModel) footer() string {
 	}
 	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
 		Render(truncate(help, max(10, m.width-2)))
-}
-
-func sep(th theme.Theme) string {
-	return lipgloss.NewStyle().Foreground(th.Overlay).Render(" │ ")
 }
 
 func opWord(op conflict.Op) string {
