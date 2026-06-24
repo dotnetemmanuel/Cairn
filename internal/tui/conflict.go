@@ -170,6 +170,17 @@ func (m *conflictModel) step(dir int) {
 	m.fileIdx, m.hunkIdx = flat[next].file, flat[next].hunk
 }
 
+// flatPos is the 0-based position of the cursor among all conflicts (for the
+// "CONFLICT n/total" header).
+func (m conflictModel) flatPos() int {
+	for i, fc := range m.flatten() {
+		if fc.file == m.fileIdx && fc.hunk == m.hunkIdx {
+			return i
+		}
+	}
+	return 0
+}
+
 type flatConflict struct{ file, hunk int }
 
 func (m conflictModel) flatten() []flatConflict {
@@ -491,7 +502,7 @@ func (m conflictModel) View() string {
 }
 
 func (m conflictModel) headerBar() string {
-	done, total := m.progress()
+	_, total := m.progress()
 	file := ""
 	hunks := ""
 	if m.fileIdx < len(m.files) {
@@ -501,7 +512,7 @@ func (m conflictModel) headerBar() string {
 			hunks = fmt.Sprintf(" (hunk %d/%d)", m.hunkIdx+1, f.conflicts())
 		}
 	}
-	left := infoStyle(m.th).Bold(true).Render(fmt.Sprintf("CONFLICT %d/%d", min(done+1, total), total))
+	left := infoStyle(m.th).Bold(true).Render(fmt.Sprintf("CONFLICT %d/%d", m.flatPos()+1, total))
 	mid := mutedStyle(m.th).Render(" · " + file + hunks)
 	right := mutedStyle(m.th).Render("   incoming ") + infoStyle(m.th).Render(m.st.Incoming) +
 		mutedStyle(m.th).Render(" into yours ") + infoStyle(m.th).Render(m.st.Yours)
