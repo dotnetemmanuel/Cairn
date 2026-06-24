@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -533,7 +534,7 @@ func (m *detailModel) commentCounts() map[int]int {
 			continue
 		}
 		for i, meta := range m.lineMeta {
-			if meta.side == c.Side && meta.line == c.Line {
+			if meta.side == c.Side && meta.line == c.AnchorLine() {
 				counts[i]++
 			}
 		}
@@ -553,7 +554,7 @@ func (m *detailModel) lineComments() []gh.ReviewComment {
 	path := m.files[m.selected].Filename
 	var out []gh.ReviewComment
 	for _, c := range m.detail.ReviewComments {
-		if c.Path == path && c.Side == meta.side && c.Line == meta.line {
+		if c.Path == path && c.Side == meta.side && c.AnchorLine() == meta.line {
 			out = append(out, c)
 		}
 	}
@@ -980,35 +981,38 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 
 	// Threaded replies render beneath the anchor with a deeper guide and no
 	// citation — they share the anchor's code location, so re-citing it is noise.
-	if len(e.Replies) > 0 {
-		// The ↳ marks the author line once; the body aligns beneath it (6 cols:
-		// 4 indent + "↳ "), so multi-line replies don't repeat the arrow.
-		// Box-drawing corner so the guide pipe lands exactly on it: │ and ╰ are both
-		// centered in their cell, where an arrow glyph's stem sits left-of-centre and
-		// never quite lines up. The guide sits one row above each reply, threading it
-		// to the comment instead of leaving it glued to the line before.
-		marker := mutedStyle(m.th).Render("    ╰→ ")
-		guide := mutedStyle(m.th).Render("    │")
-		cont := "       "
-		replyW := w - 7
-		if replyW < 8 {
-			replyW = 8
-		}
-		for _, r := range e.Replies {
-			who := infoStyle(m.th).Bold(true).Render("@" + r.Author)
-			header := who + mutedStyle(m.th).Render(" · "+relTime(r.CreatedAt))
-			rbody := strings.TrimSpace(r.Body)
-			if rbody == "" {
-				rbody = mutedStyle(m.th).Render("(no message)")
-			} else {
-				rbody = renderMarkdown(rbody, replyW, m.th)
-			}
-			b.WriteString("\n" + guide)
-			b.WriteString("\n" + indentBlock(header, marker))
-			b.WriteString("\n" + indentBlock(rbody, cont))
-		}
+	for _, r := range e.Replies {
+		b.WriteString("\n" + m.renderThreadReply(r.Author, r.Body, r.CreatedAt, w))
 	}
 	return b.String()
+}
+
+// renderThreadReply renders one threaded reply — a │ guide, a ╰→ author line, and
+// the body indented to align beneath it — the vocabulary shared by the full
+// conversation thread and the contextual line-thread pane. The returned block has
+// no leading newline; callers separate replies with one.
+//
+// The ╰→ marks the author line once; the body aligns beneath it (7 cols: 4 indent
+// + "╰→ "), so multi-line replies don't repeat the arrow. Box-drawing corner so the
+// guide pipe lands exactly on it (│ and ╰ are both centered in their cell, where an
+// arrow glyph's stem sits left-of-centre and never quite lines up). The guide sits
+// one row above each reply, threading it to the comment above.
+func (m detailModel) renderThreadReply(author, body string, when time.Time, w int) string {
+	marker := mutedStyle(m.th).Render("    ╰→ ")
+	guide := mutedStyle(m.th).Render("    │")
+	cont := "       "
+	replyW := w - 7
+	if replyW < 8 {
+		replyW = 8
+	}
+	header := infoStyle(m.th).Bold(true).Render("@"+author) + mutedStyle(m.th).Render(" · "+relTime(when))
+	rbody := strings.TrimSpace(body)
+	if rbody == "" {
+		rbody = mutedStyle(m.th).Render("(no message)")
+	} else {
+		rbody = renderMarkdown(rbody, replyW, m.th)
+	}
+	return guide + "\n" + indentBlock(header, marker) + "\n" + indentBlock(rbody, cont)
 }
 
 // citeLine is one line of a code citation: its file line number on the comment's
@@ -1321,10 +1325,17 @@ func (m detailModel) renderInfo() string {
 	if lc := m.lineComments(); len(lc) > 0 {
 		meta := m.lineMeta[m.diffCursor]
 		b.WriteString(h(fmt.Sprintf("💬 Comments on %s:%d", shortRepo(m.files[m.selected].Filename), meta.line)) + "\n")
-		for _, c := range lc {
-			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render("· "+relTime(c.CreatedAt)) + "\n")
-			b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n\n")
+		// The first comment is the thread anchor; later ones are replies, threaded
+		// under it with the same ╰→ guide as the full conversation view.
+		for i, c := range lc {
+			if i == 0 {
+				b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render("· "+relTime(c.CreatedAt)) + "\n")
+				b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n")
+				continue
+			}
+			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width) + "\n")
 		}
+		b.WriteString("\n")
 		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")

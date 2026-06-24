@@ -60,6 +60,18 @@ type ReviewComment struct {
 	CreatedAt    time.Time
 }
 
+// AnchorLine is the diff line a comment attaches to. GitHub leaves Line null
+// (0 here) for an outdated thread — one it can no longer map onto the head diff —
+// keeping only OriginalLine, the position in the commit the comment was made
+// against. Prefer the live line, fall back to the original so the comment still
+// anchors (and its 💬 badge still shows) instead of vanishing.
+func (c ReviewComment) AnchorLine() int {
+	if c.Line > 0 {
+		return c.Line
+	}
+	return c.OriginalLine
+}
+
 // ReviewRequest is a pending (not-yet-submitted) review request on a PR.
 type ReviewRequest struct {
 	Name   string // user login or team slug

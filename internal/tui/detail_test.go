@@ -259,6 +259,38 @@ func TestLineCommentAnchorsToCursor(t *testing.T) {
 	}
 }
 
+// An outdated thread comes back with Line null (0) and only OriginalLine set;
+// the badge and line thread must still anchor via OriginalLine instead of
+// vanishing from the diff.
+func TestOutdatedCommentStillBadges(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 7})
+	detail := gh.PRDetail{Number: 7, State: "OPEN", HeadSHA: "deadbeef",
+		ReviewComments: []gh.ReviewComment{
+			{Author: "octocat", Body: "tweak this", Path: "big.py",
+				Line: 0, OriginalLine: 2, Side: "RIGHT", DatabaseID: 999, CreatedAt: time.Now()},
+		}}
+	files := []gh.FileDiff{{
+		Filename: "big.py", Status: "modified", Additions: 2, Deletions: 1,
+		Patch: "@@ -1,2 +1,3 @@\n ctx\n-removed\n+added1\n+added2",
+	}}
+	m = driveDetail(m,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+	)
+	if cc := m.commentCounts(); cc[3] != 1 {
+		t.Errorf("outdated comment should badge rendered line 3 via OriginalLine, got %v", cc)
+	}
+	m.focus = focusDiff
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	if lc := m.lineComments(); len(lc) != 1 {
+		t.Fatalf("expected 1 line comment at cursor via OriginalLine, got %d", len(lc))
+	}
+}
+
 func TestSuggestPrefillsBlock(t *testing.T) {
 	m := inlineDetail(t, 140, false)
 	m.focus = focusDiff

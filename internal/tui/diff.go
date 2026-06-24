@@ -139,7 +139,6 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 	delMarker := lipgloss.NewStyle().Foreground(th.Danger)
 	ctxMarker := lipgloss.NewStyle().Foreground(th.Muted)
 	hunkStyle := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
-	activeStyle := lipgloss.NewStyle().Foreground(th.Base).Background(th.Focus).Bold(true)
 	metaStyle := lipgloss.NewStyle().Foreground(th.Muted)
 	cursorStyle := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
 	badgeStyle := lipgloss.NewStyle().Foreground(th.Info)
@@ -174,14 +173,28 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 		var rendered, gutter, bg string
 		switch {
 		case strings.HasPrefix(raw, "@@"):
+			// A blank separator above each hunk header (but not the first) so the jump
+			// to a new region reads as a break rather than running on from the line
+			// before. It maps to no patch line, so rowAt stays aligned with the loop
+			// index — only the visual rows shift, which len(out) already accounts for.
+			if len(out) > 0 {
+				out = append(out, "")
+			}
 			oldLine, newLine = parseHunkStarts(raw)
 			gutter = blankGutter
 			hunkIdx++
 			if hunkIdx == activeHunk {
-				rendered = activeStyle.Render("▶ " + raw)
-			} else {
-				rendered = hunkStyle.Render("  " + raw)
+				// Full-width pink-on-surface bar, matching the selected thread header in
+				// the conversation view, so the focused hunk is unmistakable. Emitted
+				// directly (not through the gutter/wrap path) so the background spans the
+				// whole pane; rowAt still gets this line's entry to stay aligned.
+				bar := lipgloss.NewStyle().Foreground(th.Primary).Background(th.Surface).
+					Bold(true).Width(width).Render("▶ " + raw)
+				rowAt = append(rowAt, len(out))
+				out = append(out, bar)
+				continue
 			}
+			rendered = hunkStyle.Render("  " + raw)
 		case strings.HasPrefix(raw, "+"):
 			gutter = gnum(0, newLine)
 			bg = addBG
