@@ -144,6 +144,40 @@ func TestLayoutFor(t *testing.T) {
 	}
 }
 
+func TestEnterAndExitConflictMode(t *testing.T) {
+	orig := detectConflict
+	defer func() { detectConflict = orig }()
+	detectConflict = func(dir string) (conflict.State, error) {
+		return conflict.State{Op: conflict.OpRebase, Incoming: "main", Yours: "feat", Files: []string{"missing.go"}}, nil
+	}
+	m := Model{th: theme.New(theme.DefaultPalette()), width: 200, height: 50, mode: modeStack}
+
+	got, _ := m.Update(enterConflictMsg{dir: ""})
+	m = got.(Model)
+	if m.mode != modeConflict {
+		t.Fatalf("expected modeConflict after enter, got %d", m.mode)
+	}
+
+	got, _ = m.Update(conflictExitMsg{})
+	m = got.(Model)
+	if m.mode != modeStack {
+		t.Fatalf("expected modeStack after exit, got %d", m.mode)
+	}
+}
+
+func TestEnterConflictNoopWhenClean(t *testing.T) {
+	orig := detectConflict
+	defer func() { detectConflict = orig }()
+	detectConflict = func(dir string) (conflict.State, error) {
+		return conflict.State{Op: conflict.OpNone}, nil
+	}
+	m := Model{th: theme.New(theme.DefaultPalette()), width: 200, height: 50, mode: modeStack}
+	got, _ := m.Update(enterConflictMsg{dir: ""})
+	if got.(Model).mode != modeStack {
+		t.Fatal("clean detect must not switch into conflict mode")
+	}
+}
+
 func TestViewRendersGlyphsAndProgress(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.Ascii) // plain text for assertions
 	m := newTestConflict(t, 200,

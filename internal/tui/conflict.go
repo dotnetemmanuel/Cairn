@@ -391,6 +391,14 @@ func (m conflictModel) handleContinue(msg conflictContinueMsg) (conflictModel, t
 	return m, func() tea.Msg { return conflictExitMsg{output: msg.out} }
 }
 
+// enterConflictMsg asks the app to open the resolver for the repo at dir (emitted
+// when a delegated op fails leaving unmerged paths).
+type enterConflictMsg struct{ dir string }
+
+// detectConflict is the seam the app uses to inspect a conflicted repo; a package
+// var so tests can stub it without a real git state.
+var detectConflict = conflict.Detect
+
 // conflictExitMsg leaves conflict mode; aborted marks an undo, done a finish.
 type conflictExitMsg struct {
 	aborted bool

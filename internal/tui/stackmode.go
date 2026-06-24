@@ -211,6 +211,12 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 			s.runErr = msg.ev.Err
 			s.phase = stackDone
 			s.reload() // tree + status now reflect what git-town did
+			// A failed op that left unmerged paths is a conflict — hand off to the
+			// full-screen resolver instead of just showing the error.
+			if s.runErr != nil && s.status.Conflicts > 0 {
+				dir := s.repo
+				return s, func() tea.Msg { return enterConflictMsg{dir: dir} }
+			}
 			return s, nil
 		}
 		// Append the line as it streams in; keep reading the next.
