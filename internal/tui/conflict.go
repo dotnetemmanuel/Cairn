@@ -218,6 +218,7 @@ func (m conflictModel) Update(msg tea.Msg) (conflictModel, tea.Cmd) {
 			m.sized = true
 		}
 		m.editor.SetWidth(max(20, msg.Width-8))
+		m.editor.SetHeight(max(3, msg.Height-6))
 		return m, nil
 
 	case conflictContinueMsg:
@@ -480,25 +481,40 @@ func (m conflictModel) vsep(h int) string {
 // ---- view ----
 
 func (m conflictModel) View() string {
-	if m.width == 0 {
+	if m.width == 0 || m.height == 0 {
 		return ""
 	}
-	rail, wIn, wRes, wYours := m.paneWidths()
+	bodyH := m.bodyHeight()
+	var body string
+	switch {
+	case m.editing:
+		body = m.editBox()
+	case m.confirm:
+		body = m.confirmBox()
+	default:
+		rail, wIn, wRes, wYours := m.paneWidths()
+		body = m.renderActive(wIn, wRes, wYours)
+		if m.railOpen {
+			body = lipgloss.JoinHorizontal(lipgloss.Top, m.renderRail(rail), body)
+		}
+	}
+	// Emit exactly m.height rows (1 header + bodyH + 1 footer) so a resize can't
+	// leave ghost lines from a taller previous frame.
+	body = padToHeight(body, bodyH)
+	return lipgloss.JoinVertical(lipgloss.Left, m.headerBar(), body, m.footer())
+}
 
-	body := m.renderActive(wIn, wRes, wYours)
-	if m.railOpen {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, m.renderRail(rail), body)
+// padToHeight forces a block to exactly h rows (truncating or padding with blank
+// lines), so every frame is the same height regardless of content.
+func padToHeight(s string, h int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > h {
+		lines = lines[:h]
 	}
-
-	parts := []string{m.headerBar(), body, m.footer()}
-	view := lipgloss.JoinVertical(lipgloss.Left, parts...)
-	if m.confirm {
-		return lipgloss.JoinVertical(lipgloss.Left, view, m.confirmBox())
+	for len(lines) < h {
+		lines = append(lines, "")
 	}
-	if m.editing {
-		return lipgloss.JoinVertical(lipgloss.Left, view, m.editBox())
-	}
-	return view
+	return strings.Join(lines, "\n")
 }
 
 func (m conflictModel) headerBar() string {
@@ -517,7 +533,7 @@ func (m conflictModel) headerBar() string {
 	right := mutedStyle(m.th).Render("   incoming ") + infoStyle(m.th).Render(m.st.Incoming) +
 		mutedStyle(m.th).Render(" into yours ") + infoStyle(m.th).Render(m.st.Yours)
 	bar := left + mid + right
-	return lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).Padding(0, 1).Render(bar)
+	return lipgloss.NewStyle().Width(m.width).MaxHeight(1).Background(m.th.Surface).Padding(0, 1).Render(bar)
 }
 
 func (m conflictModel) renderRail(w int) string {
@@ -648,15 +664,16 @@ func (m conflictModel) editBox() string {
 }
 
 func (m conflictModel) footer() string {
-	help := "n/N conflict · [ ] file · a incoming · d yours · b both · e edit · f rail · esc back"
-	if m.allResolved() {
-		help = "all resolved · c continue · " + help
-	}
+	base := lipgloss.NewStyle().Width(m.width).Padding(0, 1).MaxHeight(1)
 	if m.status != "" {
-		help = m.status
+		return base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2)))
 	}
-	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
-		Render(truncate(help, max(10, m.width-2)))
+	nav := "n/N conflict · [ ] file · a incoming · d yours · b both · e edit · f rail · esc back"
+	if m.allResolved() {
+		lead := okStyle(m.th).Bold(true).Render("all resolved · c continue")
+		return base.Render(lead + mutedStyle(m.th).Render(" · "+nav))
+	}
+	return base.Foreground(m.th.Muted).Render(truncate(nav, max(10, m.width-2)))
 }
 
 func opWord(op conflict.Op) string {

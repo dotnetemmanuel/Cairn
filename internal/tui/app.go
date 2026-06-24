@@ -344,14 +344,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.conflict.gitTown = msg.gitTown
 		m.conflict, _ = m.conflict.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 		m.mode = modeConflict
-		return m, nil
+		// Clear the screen so the failed-op output behind us doesn't ghost through.
+		return m, tea.ClearScreen
 
 	case conflictExitMsg:
-		// Back to the stack screen, which reloads to reflect the resolved (or
-		// undone) tree.
+		// Back to the stack screen. Drop the now-stale failed-op output/error from
+		// the op that triggered the conflict, then reload to reflect the resolved
+		// (or undone) tree.
+		m.stackMode.clearOp()
 		m.stackMode.reload()
 		m.mode = modeStack
-		return m, nil
+		return m, tea.ClearScreen
 
 	case tea.KeyMsg:
 		// The help overlay is global and captures keys while open.

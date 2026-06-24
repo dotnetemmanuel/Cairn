@@ -148,6 +148,19 @@ func TestLayoutFor(t *testing.T) {
 	}
 }
 
+func TestViewHeightIsExactlyTerminalHeight(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.Ascii)
+	files := map[string]string{"a.go": twoConflicts(), "b.go": oneConflict("X", "Y")}
+	for _, dim := range [][2]int{{200, 40}, {100, 20}, {80, 12}, {160, 50}} {
+		m := newTestConflict(t, dim[0], []string{"a.go", "b.go"}, files)
+		m, _ = m.Update(tea.WindowSizeMsg{Width: dim[0], Height: dim[1]})
+		rows := strings.Count(m.View(), "\n") + 1
+		if rows != dim[1] {
+			t.Errorf("at %dx%d, View() has %d rows, want %d (ghosting risk on resize)", dim[0], dim[1], rows, dim[1])
+		}
+	}
+}
+
 func TestEnterAndExitConflictMode(t *testing.T) {
 	orig := detectConflict
 	defer func() { detectConflict = orig }()

@@ -104,6 +104,16 @@ func newStackModel(th theme.Theme, repo string) stackModel {
 	return s
 }
 
+// clearOp drops the output/error of the last run op and returns to the browsing
+// phase. Used when leaving the conflict resolver so a since-resolved sync failure
+// doesn't linger on the stack screen.
+func (s *stackModel) clearOp() {
+	s.phase = stackBrowsing
+	s.output = ""
+	s.runErr = nil
+	s.opName = ""
+}
+
 // reload re-reads the local lineage and working-tree status. Called on entry and
 // after every mutation so the tree and statusline reflect git-town's new reality.
 func (s *stackModel) reload() {
