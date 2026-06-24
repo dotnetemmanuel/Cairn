@@ -1322,7 +1322,7 @@ func (m detailModel) renderInfo() string {
 		meta := m.lineMeta[m.diffCursor]
 		b.WriteString(h(fmt.Sprintf("💬 Comments on %s:%d", shortRepo(m.files[m.selected].Filename), meta.line)) + "\n")
 		for _, c := range lc {
-			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
+			b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render("· "+relTime(c.CreatedAt)) + "\n")
 			b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n\n")
 		}
 		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
@@ -1362,9 +1362,24 @@ func (m detailModel) renderInfo() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(h(fmt.Sprintf("Reviews (%d)", len(m.detail.Reviews))) + "\n")
+	// A bodyless COMMENTED review is just the wrapper GitHub creates when someone
+	// replies to an inline thread — its substance shows in the diff and conversation
+	// views, not in this summary. Mirror Timeline()'s filter so the list shows only
+	// reviews that carry their own verdict or prose.
+	var reviews []gh.Review
 	for _, r := range m.detail.Reviews {
-		b.WriteString(reviewBadge(m.th, r.State) + " @" + r.Author + "\n")
+		if r.State == "COMMENTED" && strings.TrimSpace(r.Body) == "" {
+			continue
+		}
+		reviews = append(reviews, r)
+	}
+	b.WriteString(h(fmt.Sprintf("Reviews (%d)", len(reviews))) + "\n")
+	if len(reviews) == 0 {
+		b.WriteString(mutedStyle(m.th).Render("  none") + "\n")
+	}
+	for _, r := range reviews {
+		b.WriteString(reviewBadge(m.th, r.State) + " " + mutedStyle(m.th).Render("by") + " " +
+			infoStyle(m.th).Render("@"+r.Author) + " " + mutedStyle(m.th).Render("· "+relTime(r.CreatedAt)) + "\n")
 		if strings.TrimSpace(r.Body) != "" {
 			b.WriteString(renderMarkdown(r.Body, m.infoVP.Width, m.th) + "\n")
 		}
@@ -1373,7 +1388,7 @@ func (m detailModel) renderInfo() string {
 
 	b.WriteString(h(fmt.Sprintf("Comments (%d)", len(m.detail.Comments))) + "\n")
 	for _, c := range m.detail.Comments {
-		b.WriteString(infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render(relTime(c.CreatedAt)) + "\n")
+		b.WriteString(mutedStyle(m.th).Render("• ") + infoStyle(m.th).Render("@"+c.Author) + " " + mutedStyle(m.th).Render("· "+relTime(c.CreatedAt)) + "\n")
 		b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n\n")
 	}
 	return b.String()
@@ -1451,7 +1466,7 @@ func reviewBadge(t theme.Theme, state string) string {
 	case "APPROVED":
 		return okStyle(t).Render("✓ approved")
 	case "CHANGES_REQUESTED":
-		return errStyle(t).Render("✗ changes")
+		return errStyle(t).Render("✗ requested changes")
 	case "COMMENTED":
 		return mutedStyle(t).Render("• commented")
 	default:
