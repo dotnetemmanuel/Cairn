@@ -127,6 +127,77 @@ const (
 	ChoiceCustom // use Custom text
 )
 
+// Resolution records how one Region is resolved: a Choice, plus the Custom
+// replacement text used only when Choice is ChoiceCustom.
+type Resolution struct {
+	Choice Choice
+	Custom string
+}
+
+// Conflicts counts the conflict spans (Regions) in spans.
+func Conflicts(spans []Span) int {
+	n := 0
+	for _, s := range spans {
+		if s.Conflict != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// Apply reassembles the final file content from parsed spans and a per-Region
+// resolution list. Context spans are emitted verbatim; the Nth conflict span is
+// resolved by res[N]. A missing resolution (N out of range) is treated as
+// ChoiceUnresolved, which re-emits canonical (bare, unlabeled) conflict markers
+// so a partially-resolved file round-trips and can be re-parsed.
+func Apply(spans []Span, res []Resolution) string {
+	var b strings.Builder
+	conflictIdx := 0
+	emit := func(lines []string) {
+		for _, l := range lines {
+			b.WriteString(l)
+			b.WriteString("\n")
+		}
+	}
+	for _, s := range spans {
+		if s.Conflict == nil {
+			b.WriteString(s.Text)
+			continue
+		}
+		r := s.Conflict
+		choice := ChoiceUnresolved
+		var custom string
+		if conflictIdx < len(res) {
+			choice = res[conflictIdx].Choice
+			custom = res[conflictIdx].Custom
+		}
+		conflictIdx++
+		switch choice {
+		case ChoiceIncoming:
+			emit(r.Incoming)
+		case ChoiceYours:
+			emit(r.Yours)
+		case ChoiceBoth:
+			emit(r.Incoming)
+			emit(r.Yours)
+		case ChoiceCustom:
+			b.WriteString(strings.TrimSuffix(custom, "\n"))
+			b.WriteString("\n")
+		default: // ChoiceUnresolved: reproduce canonical bare markers.
+			b.WriteString("<<<<<<<\n")
+			emit(r.Incoming)
+			if r.Base != nil {
+				b.WriteString("|||||||\n")
+				emit(r.Base)
+			}
+			b.WriteString("=======\n")
+			emit(r.Yours)
+			b.WriteString(">>>>>>>\n")
+		}
+	}
+	return b.String()
+}
+
 // State is the whole conflicted tree at one moment. Incoming and Yours are the
 // branch-name labels shown for each side.
 type State struct {

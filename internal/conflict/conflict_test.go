@@ -80,6 +80,53 @@ func TestParseEmptyInput(t *testing.T) {
 	}
 }
 
+func TestApplyChoices(t *testing.T) {
+	in := "a\n<<<<<<< HEAD\nINC\n=======\nYOURS\n>>>>>>> feat\nb\n"
+	spans, _ := conflict.Parse(in)
+	cases := []struct {
+		c      conflict.Choice
+		custom string
+		want   string
+	}{
+		{conflict.ChoiceIncoming, "", "a\nINC\nb\n"},
+		{conflict.ChoiceYours, "", "a\nYOURS\nb\n"},
+		{conflict.ChoiceBoth, "", "a\nINC\nYOURS\nb\n"},
+		{conflict.ChoiceCustom, "X\nY", "a\nX\nY\nb\n"},
+	}
+	for _, tc := range cases {
+		out := conflict.Apply(spans, []conflict.Resolution{{Choice: tc.c, Custom: tc.custom}})
+		if out != tc.want {
+			t.Errorf("choice %v: got %q want %q", tc.c, out, tc.want)
+		}
+	}
+}
+
+// TestApplyUnresolvedRoundTrips uses BARE markers (no branch labels) so that
+// ChoiceUnresolved's canonical marker reconstruction reproduces the input
+// byte-for-byte; this lets a partially-resolved file be re-parsed.
+func TestApplyUnresolvedRoundTrips(t *testing.T) {
+	in := "a\n<<<<<<<\nINC\n=======\nYOURS\n>>>>>>>\nb\n"
+	spans, _ := conflict.Parse(in)
+	if out := conflict.Apply(spans, []conflict.Resolution{{Choice: conflict.ChoiceUnresolved}}); out != in {
+		t.Errorf("explicit unresolved: got %q want %q", out, in)
+	}
+	if out := conflict.Apply(spans, nil); out != in {
+		t.Errorf("empty resolutions: got %q want %q", out, in)
+	}
+}
+
+func TestConflictsCount(t *testing.T) {
+	in := "a\n<<<<<<< HEAD\nINC\n=======\nYOURS\n>>>>>>> feat\nb\n<<<<<<< HEAD\nI2\n=======\nY2\n>>>>>>> feat\nc\n"
+	spans, _ := conflict.Parse(in)
+	if n := conflict.Conflicts(spans); n != 2 {
+		t.Errorf("Conflicts = %d, want 2", n)
+	}
+	plain, _ := conflict.Parse("no conflicts here\n")
+	if n := conflict.Conflicts(plain); n != 0 {
+		t.Errorf("Conflicts = %d, want 0", n)
+	}
+}
+
 // TestParseRoundTrip checks that context text retains exact newlines so a later
 // Apply can reassemble the file losslessly.
 func TestParseRoundTrip(t *testing.T) {
