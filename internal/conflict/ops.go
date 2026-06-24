@@ -28,3 +28,27 @@ func stage(dir, path string) error {
 	}
 	return cmd.Run()
 }
+
+// ContinuePlain resumes the underlying git operation directly. It's the fallback
+// for when the conflict wasn't started by git-town (a bare `git rebase`/`git
+// merge`, or a rebase begun outside Cairn), so `git town continue` has no
+// runstate to resume. The editor is forced non-interactive so it never blocks.
+func ContinuePlain(dir string, op Op) (string, error) {
+	var args []string
+	switch op {
+	case OpRebase:
+		args = []string{"rebase", "--continue"}
+	case OpMerge:
+		args = []string{"commit", "--no-edit"}
+	default:
+		return "", nil
+	}
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = append(os.Environ(),
+		"GIT_EDITOR=true", "GIT_SEQUENCE_EDITOR=true", "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}

@@ -347,7 +347,7 @@ type conflictContinueMsg struct {
 }
 
 func (m conflictModel) continueCmd() tea.Cmd {
-	dir, files := m.dir, m.files
+	dir, files, op := m.dir, m.files, m.st.Op
 	return func() tea.Msg {
 		for _, f := range files {
 			content := conflict.Apply(f.spans, f.res)
@@ -355,14 +355,18 @@ func (m conflictModel) continueCmd() tea.Cmd {
 				return conflictContinueMsg{err: err}
 			}
 		}
+		// Prefer git-town (it resumes the whole sync); fall back to the plain git
+		// continue when the conflict wasn't a git-town op (e.g. a bare rebase).
 		out, err := townie.New(dir).Run("continue", "")
 		if err != nil {
-			// Another round may have stopped on a fresh conflict; re-detect.
-			st, _ := conflict.Detect(dir)
-			return conflictContinueMsg{state: st, out: out, err: err}
+			if pout, perr := conflict.ContinuePlain(dir, op); perr == nil {
+				out, err = pout, nil
+			} else {
+				out = out + "\n" + pout
+			}
 		}
 		st, _ := conflict.Detect(dir)
-		return conflictContinueMsg{state: st, out: out}
+		return conflictContinueMsg{state: st, out: out, err: err}
 	}
 }
 
