@@ -5,6 +5,81 @@
 // logic stays directly testable.
 package conflict
 
+import (
+	"fmt"
+	"strings"
+)
+
+// Parse splits a conflicted file's contents into ordered spans: runs of
+// unconflicted Context text interleaved with Conflict Regions. Context spans
+// keep their exact trailing newlines so that concatenating every context span
+// with a chosen side per region round-trips the file losslessly.
+//
+// Parse is SIDE-AGNOSTIC about ours/theirs semantics. It fills Region fields
+// purely by marker position: the first section (after `<<<<<<<`, before
+// `|||||||`/`=======`) goes into Incoming, the base section (between `|||||||`
+// and `=======`, present only with diff3/zdiff3 conflictStyle) goes into Base,
+// and the second section (after `=======`, before `>>>>>>>`) goes into Yours. A
+// later task maps the human branch-name labels per rebase/merge; Parse never
+// interprets which raw side is which.
+//
+// An all-text file yields a single Context span. Empty input yields nil spans
+// and no error. A conflict that opens with `<<<<<<<` but never closes with
+// `>>>>>>>` returns an error.
+func Parse(content string) ([]Span, error) {
+	if content == "" {
+		return nil, nil
+	}
+
+	var spans []Span
+	var text strings.Builder // accumulated context text (with newlines)
+	var region *Region
+	// section points at the slice the current region is collecting into.
+	var section *[]string
+
+	flushText := func() {
+		if text.Len() > 0 {
+			spans = append(spans, Span{Text: text.String()})
+			text.Reset()
+		}
+	}
+
+	// SplitAfter keeps the trailing "\n" on each line, preserving exact text. A
+	// final line without a newline keeps no newline; a trailing newline yields a
+	// final empty element we skip.
+	lines := strings.SplitAfter(content, "\n")
+	for i, raw := range lines {
+		if i == len(lines)-1 && raw == "" {
+			break
+		}
+		line := strings.TrimSuffix(raw, "\n")
+		switch {
+		case strings.HasPrefix(line, "<<<<<<<"):
+			flushText()
+			region = &Region{}
+			section = &region.Incoming
+		case region != nil && strings.HasPrefix(line, "|||||||"):
+			section = &region.Base
+		case region != nil && strings.HasPrefix(line, "======="):
+			section = &region.Yours
+		case region != nil && strings.HasPrefix(line, ">>>>>>>"):
+			spans = append(spans, Span{Conflict: region})
+			region = nil
+			section = nil
+		case region != nil:
+			*section = append(*section, line)
+		default:
+			text.WriteString(raw)
+		}
+	}
+
+	if region != nil {
+		return nil, fmt.Errorf("conflict: unterminated conflict region (missing >>>>>>> marker)")
+	}
+	flushText()
+	return spans, nil
+}
+
 // Op is the in-progress git operation. It decides which merge stage maps to
 // incoming vs yours, because rebase inverts the raw ours/theirs sides relative
 // to a merge.
