@@ -214,8 +214,7 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 			// A failed op that left unmerged paths is a conflict — hand off to the
 			// full-screen resolver instead of just showing the error.
 			if s.runErr != nil && s.status.Conflicts > 0 {
-				dir := s.repo
-				return s, func() tea.Msg { return enterConflictMsg{dir: dir} }
+				return s, func() tea.Msg { return enterConflictMsg{dir: ""} }
 			}
 			return s, nil
 		}
@@ -247,6 +246,13 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 }
 
 func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
+	// Mid-conflict, R opens the resolver. This takes precedence over the restack
+	// accelerator (also R) — which is inert during a conflict — but only while
+	// conflicts exist, so restack keeps R the rest of the time. The working dir is
+	// cwd (""), the dir townie/stack operate in; s.repo is owner/name, not a path.
+	if msg.String() == "R" && s.status.Conflicts > 0 {
+		return s, func() tea.Msg { return enterConflictMsg{dir: ""} }
+	}
 	switch msg.String() {
 	case "esc", "q":
 		return s, func() tea.Msg { return stackExitMsg{} }
@@ -254,14 +260,6 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		// Re-read lineage + working-tree status, so external git changes (a
 		// checkout/commit in another terminal) show without leaving stack mode.
 		s.reload()
-		return s, nil
-	case "R":
-		// Open the conflict resolver when the tree is already mid-conflict (a sync
-		// that stopped, or a rebase/merge started outside Cairn).
-		if s.status.Conflicts > 0 {
-			dir := s.repo
-			return s, func() tea.Msg { return enterConflictMsg{dir: dir} }
-		}
 		return s, nil
 	case "tab", "shift+tab", "h", "l", "left", "right":
 		// Toggle focus between the action list and the branch tree (only when
