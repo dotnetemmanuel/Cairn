@@ -342,6 +342,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.conflict = newConflictModel(m.th, msg.dir, st, diskLoader(msg.dir))
 		m.conflict.gitTown = msg.gitTown
+		// Auto-opened from a git-town op (sync) → greet with a "conflicts detected"
+		// gate first, rather than dropping the user straight into the resolver. A
+		// manual R entry is already a deliberate choice, so it skips the gate.
+		m.conflict.intro = msg.gitTown
 		m.conflict, _ = m.conflict.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 		m.mode = modeConflict
 		// Clear the screen so the failed-op output behind us doesn't ghost through.

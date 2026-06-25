@@ -834,11 +834,17 @@ func (s stackModel) renderOutput(w int) string {
 // step, while the results below them stay plain text. Carriage returns are
 // sanitized and long lines hard-wrapped to the pane first.
 func (s stackModel) renderRunLog(out string, w int) string {
-	cmd := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true)
-	res := lipgloss.NewStyle().Foreground(s.th.Text)
-	// git-town colorizes its own output (e.g. bold command echoes wrapped in
-	// \x1b[1m…\x1b[0m). Strip that first so Cairn fully controls styling and the
-	// "[branch] …" command detection sees plain text, not an escape prefix.
+	return styleRunLog(s.th, out, w)
+}
+
+// styleRunLog is the shared run-log styler used by the stack run screen and the
+// conflict resolver's done screen. git-town colorizes its own output (e.g. bold
+// command echoes wrapped in \x1b[1m…\x1b[0m), so strip that first — then Cairn
+// fully controls styling and the "[branch] …" command detection sees plain text,
+// not an escape prefix.
+func styleRunLog(th theme.Theme, out string, w int) string {
+	cmd := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
+	res := lipgloss.NewStyle().Foreground(th.Text)
 	var b strings.Builder
 	for i, ln := range strings.Split(sanitizeCR(ansi.Strip(out)), "\n") {
 		if i > 0 {

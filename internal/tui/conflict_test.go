@@ -195,6 +195,81 @@ func TestEnterConflictNoopWhenClean(t *testing.T) {
 	}
 }
 
+func TestResolvingClearsStaleRoundStatus(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.Ascii)
+	m := newTestConflict(t, 200, []string{"a.go"}, map[string]string{"a.go": oneConflict("INC", "YOU")})
+	m.status = "More conflicts to resolve." // a fresh-round announcement
+	m, _ = m.updateBrowsing(ckey("a"))      // resolve the only conflict
+	if m.status != "" {
+		t.Errorf("status should clear after a resolution, got %q", m.status)
+	}
+	view := m.View()
+	if !strings.Contains(view, "all resolved") {
+		t.Errorf("footer should advance to 'all resolved', got:\n%s", view)
+	}
+	if strings.Contains(view, "More conflicts") {
+		t.Error("stale 'More conflicts' must not linger after resolving the last conflict")
+	}
+}
+
+func TestIntroGateProceedsOnKeyAndCancelsOnEsc(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.Ascii)
+	// A sync auto-opens with the gate up.
+	mk := func() conflictModel {
+		m := newTestConflict(t, 200, []string{"a.go"}, map[string]string{"a.go": oneConflict("INC", "YOU")})
+		m.intro = true
+		return m
+	}
+	// The gate announces the conflict, not the resolver panes.
+	if v := mk().View(); !strings.Contains(v, "conflicts to resolve") {
+		t.Errorf("intro view missing the heads-up, got:\n%s", v)
+	}
+	// Any key dismisses the gate into the resolver (no exit command).
+	m, cmd := mk().Update(ckey("x"))
+	if m.intro {
+		t.Error("any key should dismiss the gate")
+	}
+	if cmd != nil {
+		t.Error("dismissing the gate should not emit a command")
+	}
+	// Esc backs out to the stack.
+	_, cmd = mk().Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("esc on the gate should emit an exit command")
+	}
+	if _, ok := cmd().(conflictExitMsg); !ok {
+		t.Errorf("esc should emit conflictExitMsg, got %T", cmd())
+	}
+}
+
+func TestFinishedContinueShowsDoneScreenThenAnyKeyExits(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.Ascii)
+	m := newTestConflict(t, 200, []string{"a.go"}, map[string]string{"a.go": oneConflict("INC", "YOU")})
+	// A continue that finished the op (Op==None) should park on the done screen and
+	// surface the git-town output, not snap straight back to the stack.
+	m, cmd := m.Update(conflictContinueMsg{state: conflict.State{Op: conflict.OpNone}, out: "[feat] git rebase\nbranch is now in sync"})
+	if !m.done {
+		t.Fatal("expected done after a finished continue")
+	}
+	if cmd != nil {
+		t.Error("done screen should wait for a key, not emit a command")
+	}
+	view := m.View()
+	for _, want := range []string{"branch is now in sync", "any key to return"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("done view missing %q", want)
+		}
+	}
+	// Any key returns to the stack.
+	_, cmd = m.Update(ckey("x"))
+	if cmd == nil {
+		t.Fatal("expected an exit command from the done screen")
+	}
+	if _, ok := cmd().(conflictExitMsg); !ok {
+		t.Errorf("expected conflictExitMsg, got %T", cmd())
+	}
+}
+
 func TestViewRendersGlyphsAndProgress(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.Ascii) // plain text for assertions
 	m := newTestConflict(t, 200,
@@ -202,7 +277,8 @@ func TestViewRendersGlyphsAndProgress(t *testing.T) {
 		map[string]string{"a.go": oneConflict("INC", "YOU"), "b.go": oneConflict("P", "Q")})
 	m.files[0].res[0].Choice = conflict.ChoiceIncoming
 	view := m.View()
-	for _, want := range []string{"1 of 2 resolved", "RESOLUTION", "main", "feat"} {
+	// The active hunk is resolved, so its resolution pane header reads "✓ RESOLVED".
+	for _, want := range []string{"1 of 2 resolved", "RESOLVED", "main", "feat"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}

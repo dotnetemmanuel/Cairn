@@ -85,6 +85,8 @@ type conflictModel struct {
 	width, height int
 	status        string
 	done          bool
+	output        string // git-town/continue output, shown on the done screen
+	intro         bool   // auto-opened from a sync: show the "conflicts detected" gate first
 }
 
 func newConflictModel(th theme.Theme, dir string, st conflict.State, load spanLoader) conflictModel {
@@ -225,6 +227,19 @@ func (m conflictModel) Update(msg tea.Msg) (conflictModel, tea.Cmd) {
 		return m.handleContinue(msg)
 
 	case tea.KeyMsg:
+		if m.intro {
+			// The gate: esc backs out (the conflict stays pending — resume with R);
+			// any other key dismisses it into the resolver.
+			if msg.String() == "esc" {
+				return m, func() tea.Msg { return conflictExitMsg{} }
+			}
+			m.intro = false
+			return m, nil
+		}
+		if m.done {
+			// The done screen is a read-and-dismiss: any key returns to the stack.
+			return m, func() tea.Msg { return conflictExitMsg{output: m.output} }
+		}
 		if m.editing {
 			return m.updateEditing(msg)
 		}
@@ -270,6 +285,9 @@ func (m *conflictModel) pick(c conflict.Choice) {
 	if r := m.activeRes(); r != nil {
 		r.Choice = c
 		r.Custom = ""
+		// A stale round-entry announcement ("More conflicts…") shouldn't outlive a
+		// resolution — clear it so the footer can advance to "all resolved".
+		m.status = ""
 		// Stay on this hunk so the resolution pane shows the result immediately;
 		// n/N moves on when the user is ready.
 	}
@@ -296,6 +314,7 @@ func (m conflictModel) updateEditing(msg tea.KeyMsg) (conflictModel, tea.Cmd) {
 		if r := m.activeRes(); r != nil {
 			r.Choice = conflict.ChoiceCustom
 			r.Custom = m.editor.Value()
+			m.status = "" // see pick(): a resolution clears any stale round status
 		}
 		m.editing = false
 		m.editor.Blur()
@@ -382,7 +401,13 @@ func (m conflictModel) handleContinue(msg conflictContinueMsg) (conflictModel, t
 		next.width, next.height, next.sized, next.railOpen, next.gitTown =
 			m.width, m.height, true, m.railOpen, m.gitTown
 		next.editor.SetWidth(m.editor.Width())
-		next.status = "More conflicts to resolve."
+		// Each fresh round from a sync gets the same gate (a later branch in the
+		// stack just hit conflicts of its own). The gate already announces the new
+		// round, so only fall back to a footer note when there's no gate.
+		next.intro = m.gitTown
+		if !next.intro {
+			next.status = "More conflicts to resolve."
+		}
 		return next, nil
 	}
 	// Still mid-operation with nothing unmerged means continue didn't finish (it
@@ -394,9 +419,13 @@ func (m conflictModel) handleContinue(msg conflictContinueMsg) (conflictModel, t
 		m.status = "Continue failed: " + firstLine(msg.out)
 		return m, nil
 	}
-	// Operation finished.
+	// Operation finished. Don't snap straight back to the stack — hold a done
+	// screen showing the git-town flow (rebase + remaining stack steps + push) so
+	// the user can read what happened, then any key returns (handled in Update).
 	m.done = true
-	return m, func() tea.Msg { return conflictExitMsg{output: msg.out} }
+	m.output = msg.out
+	m.status = ""
+	return m, nil
 }
 
 func firstLine(s string) string {
@@ -487,6 +516,10 @@ func (m conflictModel) View() string {
 	bodyH := m.bodyHeight()
 	var body string
 	switch {
+	case m.intro:
+		body = m.introView()
+	case m.done:
+		body = m.doneView()
 	case m.editing:
 		body = m.editBox()
 	case m.confirm:
@@ -526,6 +559,9 @@ func (m conflictModel) headerBar() string {
 		file = shortRepo(f.path)
 		if f.conflicts() > 0 {
 			hunks = fmt.Sprintf(" (hunk %d/%d)", m.hunkIdx+1, f.conflicts())
+			if m.hunkIdx < len(f.res) && f.res[m.hunkIdx].Choice != conflict.ChoiceUnresolved {
+				hunks += " ✓"
+			}
 		}
 	}
 	left := infoStyle(m.th).Bold(true).Render(fmt.Sprintf("CONFLICT %d/%d", m.flatPos()+1, total))
@@ -598,8 +634,14 @@ func (m conflictModel) sidePane(label string, lines []string, hl highlighter, w 
 }
 
 func (m conflictModel) resolutionPane(reg *conflict.Region, res conflict.Resolution, hl highlighter, w int) string {
-	head := lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).Bold(true).
-		Width(w).Render("▸ RESOLUTION")
+	// The pane header doubles as the per-hunk status: a green "✓ RESOLVED" once this
+	// hunk has a choice (the file-rail glyph stays file-level), so the eye gets
+	// per-conflict feedback without waiting for the whole file to finish.
+	headStyle := lipgloss.NewStyle().Background(m.th.Surface).Bold(true).Width(w)
+	head := headStyle.Foreground(m.th.Primary).Render("▸ RESOLUTION")
+	if res.Choice != conflict.ChoiceUnresolved {
+		head = headStyle.Foreground(m.th.Success).Render("✓ RESOLVED")
+	}
 	var lines []string
 	var bg string
 	switch res.Choice {
@@ -647,15 +689,73 @@ func (m conflictModel) tintedCode(lines []string, hl highlighter, w int, bg stri
 	return strings.Join(out, "\n")
 }
 
-func (m conflictModel) confirmBox() string {
-	d, t := m.progress()
-	_ = d
-	msg := fmt.Sprintf("Stage %d file(s) & continue %s.\n[enter] continue   [u] undo all   [esc] back",
-		len(m.files), opWord(m.st.Op))
-	box := warnStyle(m.th).Bold(true).Render("Continue?") + "\n" + mutedStyle(m.th).Render(msg) +
-		mutedStyle(m.th).Render(fmt.Sprintf("\n%d conflicts resolved.", t))
+// doneView is the read-and-dismiss screen shown after a successful continue: the
+// git-town command flow that finished the op (rebase + remaining stack steps +
+// push), tailed to fit, with a prompt to return to the stack.
+func (m conflictModel) doneView() string {
+	w := max(8, m.width-2)
+	title := okStyle(m.th).Bold(true).Render("✓ Resolved — " + opWord(m.st.Op) + " continued")
+	rule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", w))
+	out := strings.TrimRight(m.output, "\n")
+	logBlock := mutedStyle(m.th).Render("(no output)")
+	if out != "" {
+		logBlock = styleRunLog(m.th, out, w)
+	}
+	// If the log is taller than the body, keep the tail — the push / "branch is now
+	// in sync" lines at the bottom are the ones worth seeing.
+	avail := max(1, m.bodyHeight()-4) // title, rule, blank, prompt
+	logBlock = lastLines(logBlock, avail)
+	prompt := mutedStyle(m.th).Render("any key to return to the stack")
+	return lipgloss.JoinVertical(lipgloss.Left, title, rule, logBlock, "", prompt)
+}
+
+// lastLines keeps the final n lines of s (all of it when it's already shorter).
+func lastLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// introView is the gate shown when a sync auto-opens the resolver: a calm,
+// professional heads-up with the conflict count and the affected files, before
+// the user commits to resolving. Any key proceeds; esc backs out (resume with R).
+func (m conflictModel) introView() string {
+	_, total := m.progress()
+	title := warnStyle(m.th).Bold(true).Render("Sync paused — conflicts to resolve")
+	lead := mutedStyle(m.th).Render(fmt.Sprintf(
+		"The same lines changed on both sides, so %s can't replay cleanly. %d conflict(s) across %d file(s) need a decision before the sync can finish.",
+		opWord(m.st.Op), total, len(m.files)))
+	var files strings.Builder
+	for _, f := range m.files {
+		files.WriteString("\n  " + infoStyle(m.th).Render("• "+shortRepo(f.path)) +
+			mutedStyle(m.th).Render(fmt.Sprintf("  %d conflict(s)", f.conflicts())))
+	}
+	keys := okStyle(m.th).Bold(true).Render("press any key") + mutedStyle(m.th).Render(" to resolve   ·   ") +
+		warnStyle(m.th).Render("esc") + mutedStyle(m.th).Render(" to cancel (resume anytime with R)")
+	box := title + "\n" + lead + "\n" + files.String() + "\n\n" + keys
 	return lipgloss.NewStyle().Width(m.width).Border(lipgloss.RoundedBorder()).
-		BorderForeground(m.th.Focus).Padding(0, 1).Render(box)
+		BorderForeground(m.th.Warning).Padding(0, 1).Render(box)
+}
+
+func (m conflictModel) confirmBox() string {
+	_, t := m.progress()
+	title := okStyle(m.th).Bold(true).Render("Continue?")
+	desc := lipgloss.NewStyle().Foreground(m.th.Text).Render(
+		fmt.Sprintf("Stage %d file(s) & continue %s.", len(m.files), opWord(m.st.Op)))
+	// Colour the keys by intent: green to proceed, red for the destructive undo,
+	// blue to back out — so the eye finds the action it wants at a glance.
+	key := func(style lipgloss.Style, k, label string) string {
+		return style.Bold(true).Render("["+k+"]") + mutedStyle(m.th).Render(" "+label)
+	}
+	keys := key(okStyle(m.th), "enter", "continue") + "   " +
+		key(errStyle(m.th), "u", "undo all") + "   " +
+		key(infoStyle(m.th), "esc", "back")
+	status := okStyle(m.th).Render(fmt.Sprintf("✓ %d conflict(s) resolved.", t))
+	box := title + "\n" + desc + "\n" + keys + "\n" + status
+	return lipgloss.NewStyle().Width(m.width).Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.th.Success).Padding(0, 1).Render(box)
 }
 
 func (m conflictModel) editBox() string {
@@ -665,6 +765,9 @@ func (m conflictModel) editBox() string {
 
 func (m conflictModel) footer() string {
 	base := lipgloss.NewStyle().Width(m.width).Padding(0, 1).MaxHeight(1)
+	if m.done || m.intro {
+		return base.Render("")
+	}
 	if m.status != "" {
 		return base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2)))
 	}
