@@ -57,7 +57,7 @@ func Default() Config {
 		ClosedLimit:  15,
 		Sections: []Section{
 			{Title: "My PRs", Filter: "is:open is:pr author:@me"},
-			{Title: "Needs Review", Filter: "is:open is:pr review-requested:@me"},
+			{Title: "Needs my review", Filter: "is:open is:pr review-requested:@me"},
 			{Title: "Involved", Filter: "is:open is:pr involves:@me"},
 			{Title: "Notifications", Type: SectionNotifications},
 		},

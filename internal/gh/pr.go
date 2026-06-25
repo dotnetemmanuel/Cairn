@@ -100,6 +100,8 @@ type PRDetail struct {
 	ReviewComments []ReviewComment
 	ReviewRequests []ReviewRequest
 	Checks         []Check
+	Commits        []Commit
+	Events         []Event
 }
 
 // TimelineKind classifies a conversation entry.
@@ -110,6 +112,8 @@ const (
 	KindComment
 	KindReview
 	KindInline
+	KindCommit // a pushed commit
+	KindEvent  // a lifecycle event (ready-for-review, review requested, merged, …)
 )
 
 // TimelineEntry is one item in the unified, chronological conversation. A
@@ -129,7 +133,28 @@ type TimelineEntry struct {
 	DatabaseID int             // for KindInline: REST comment id, for threaded replies
 	Children   []TimelineEntry // for KindReview: its thread anchors
 	Replies    []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
+	SHA        string          // for KindCommit: the commit sha
+	Event      string          // for KindEvent: the event type
+	Subject    string          // for KindEvent: e.g. the requested reviewer
 	CreatedAt  time.Time
+}
+
+// Commit is one commit pushed to the PR, shown inline in the conversation
+// timeline in chronological order.
+type Commit struct {
+	SHA       string
+	Message   string // headline (first line of the commit message)
+	Author    string
+	CreatedAt time.Time
+}
+
+// Event is a non-comment PR lifecycle event (ready-for-review, review requested,
+// merged, closed, reopened, converted to draft) shown in the timeline.
+type Event struct {
+	Type      string // READY_FOR_REVIEW | REVIEW_REQUESTED | MERGED | CLOSED | REOPENED | CONVERT_TO_DRAFT
+	Actor     string
+	Subject   string // for REVIEW_REQUESTED: the requested reviewer
+	CreatedAt time.Time
 }
 
 // Timeline merges the PR description, conversation comments, review summaries,
@@ -150,6 +175,12 @@ func (d PRDetail) Timeline() []TimelineEntry {
 	}
 	for _, c := range d.Comments {
 		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
+	}
+	for _, c := range d.Commits {
+		top = append(top, &TimelineEntry{Kind: KindCommit, Author: c.Author, Body: c.Message, SHA: c.SHA, CreatedAt: c.CreatedAt})
+	}
+	for _, ev := range d.Events {
+		top = append(top, &TimelineEntry{Kind: KindEvent, Author: ev.Actor, Event: ev.Type, Subject: ev.Subject, CreatedAt: ev.CreatedAt})
 	}
 	// Group inline comments into their review threads. A thread's FIRST comment is
 	// the anchor (it carries the citation); later comments are Replies rendered
@@ -250,11 +281,21 @@ query($owner:String!,$repo:String!,$number:Int!){
       comments(first:50){nodes{author{login} body createdAt}}
       reviews(first:50){nodes{id author{login} state body createdAt}}
       reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{databaseId author{login} body createdAt diffHunk pullRequestReview{id}}}}}
-      commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
+      commits(first:100){nodes{commit{oid messageHeadline committedDate author{user{login} name}}}}
+      statusCommit: commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
         __typename
         ... on CheckRun{name status conclusion detailsUrl}
         ... on StatusContext{context state targetUrl}
       }}}}}}
+      timelineItems(first:100,itemTypes:[READY_FOR_REVIEW_EVENT,REVIEW_REQUESTED_EVENT,MERGED_EVENT,CLOSED_EVENT,REOPENED_EVENT,CONVERT_TO_DRAFT_EVENT]){nodes{
+        __typename
+        ... on ReadyForReviewEvent{createdAt actor{login}}
+        ... on ReviewRequestedEvent{createdAt actor{login} requestedReviewer{__typename ... on User{login} ... on Team{slug}}}
+        ... on MergedEvent{createdAt actor{login}}
+        ... on ClosedEvent{createdAt actor{login}}
+        ... on ReopenedEvent{createdAt actor{login}}
+        ... on ConvertToDraftEvent{createdAt actor{login}}
+      }}
     }
   }
 }`
@@ -330,6 +371,19 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				Commits struct {
 					Nodes []struct {
 						Commit struct {
+							Oid             string
+							MessageHeadline string
+							CommittedDate   time.Time
+							Author          struct {
+								User struct{ Login string }
+								Name string
+							}
+						}
+					}
+				}
+				StatusCommit struct {
+					Nodes []struct {
+						Commit struct {
 							StatusCheckRollup *struct {
 								Contexts struct {
 									Nodes []struct {
@@ -346,6 +400,18 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 									}
 								}
 							}
+						}
+					}
+				} `json:"statusCommit"`
+				TimelineItems struct {
+					Nodes []struct {
+						Typename          string    `json:"__typename"`
+						CreatedAt         time.Time `json:"createdAt"`
+						Actor             struct{ Login string }
+						RequestedReviewer struct {
+							Typename string `json:"__typename"`
+							Login    string
+							Slug     string
 						}
 					}
 				}
@@ -413,16 +479,59 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		}
 		d.Reviews = append(d.Reviews, Review{ID: r.ID, Author: r.Author.Login, State: r.State, Body: r.Body, CreatedAt: r.CreatedAt})
 	}
-	if len(pr.Commits.Nodes) > 0 {
-		if roll := pr.Commits.Nodes[0].Commit.StatusCheckRollup; roll != nil {
-			for _, n := range roll.Contexts.Nodes {
-				if n.Typename == "CheckRun" {
-					d.Checks = append(d.Checks, Check{Name: n.Name, Status: n.Status, Conclusion: n.Conclusion, URL: n.DetailsURL})
+	for _, cn := range pr.Commits.Nodes {
+		c := cn.Commit
+		author := c.Author.User.Login
+		if author == "" {
+			author = c.Author.Name
+		}
+		d.Commits = append(d.Commits, Commit{SHA: c.Oid, Message: c.MessageHeadline, Author: author, CreatedAt: c.CommittedDate})
+	}
+	// The CI rollup belongs to the tip commit (fetched separately via last:1).
+	if len(pr.StatusCommit.Nodes) > 0 {
+		if roll := pr.StatusCommit.Nodes[0].Commit.StatusCheckRollup; roll != nil {
+			for _, ctx := range roll.Contexts.Nodes {
+				if ctx.Typename == "CheckRun" {
+					d.Checks = append(d.Checks, Check{Name: ctx.Name, Status: ctx.Status, Conclusion: ctx.Conclusion, URL: ctx.DetailsURL})
 				} else {
-					d.Checks = append(d.Checks, Check{Name: n.Context, Status: "COMPLETED", Conclusion: n.State, URL: n.TargetURL})
+					d.Checks = append(d.Checks, Check{Name: ctx.Context, Status: "COMPLETED", Conclusion: ctx.State, URL: ctx.TargetURL})
 				}
 			}
 		}
+	}
+	// Lifecycle events. A merge fires both a MergedEvent and a ClosedEvent; keep
+	// only the merge so the timeline doesn't say "merged" and "closed" together.
+	merged := false
+	for _, t := range pr.TimelineItems.Nodes {
+		if t.Typename == "MergedEvent" {
+			merged = true
+		}
+	}
+	for _, t := range pr.TimelineItems.Nodes {
+		ev := Event{Actor: t.Actor.Login, CreatedAt: t.CreatedAt}
+		switch t.Typename {
+		case "ReadyForReviewEvent":
+			ev.Type = "READY_FOR_REVIEW"
+		case "ReviewRequestedEvent":
+			ev.Type = "REVIEW_REQUESTED"
+			if ev.Subject = t.RequestedReviewer.Login; ev.Subject == "" {
+				ev.Subject = t.RequestedReviewer.Slug
+			}
+		case "MergedEvent":
+			ev.Type = "MERGED"
+		case "ClosedEvent":
+			if merged {
+				continue
+			}
+			ev.Type = "CLOSED"
+		case "ReopenedEvent":
+			ev.Type = "REOPENED"
+		case "ConvertToDraftEvent":
+			ev.Type = "CONVERT_TO_DRAFT"
+		default:
+			continue
+		}
+		d.Events = append(d.Events, ev)
 	}
 	return d, nil
 }

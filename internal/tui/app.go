@@ -507,9 +507,10 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 // rows: the active tab's top border, the labels, and the body's top line. The
 // header is two rows: the brand line and the session/status line.
 const (
-	headerH = 2
-	tabsH   = 3
-	footerH = 1
+	headerH    = 2
+	tabsH      = 3
+	footerH    = 3 // legend line + rule + keybinding line
+	colHeaderH = 1 // the PR-list column-label row above each section
 )
 
 // logoGlyph is Cairn's mark in the header brand line. Pulled out so it's a
@@ -522,16 +523,16 @@ func (m *Model) resizeLists() {
 		bodyH = 1
 	}
 	listW := m.width
-	listH := bodyH
+	listH := bodyH - colHeaderH // the column-label row sits above the list
 	if m.sidebarVisible() {
 		listW = m.width - stackPaneW - 1 // sidebar + vertical separator
 		if listW < 20 {
 			listW = 20
 		}
-		listH = bodyH - 2 // the list pane gains a focused title + rule
-		if listH < 1 {
-			listH = 1
-		}
+		listH = bodyH - 2 - colHeaderH // the list pane also gains a title + rule
+	}
+	if listH < 1 {
+		listH = 1
 	}
 	delegate := itemDelegate{th: m.th, width: listW}
 	for i := range m.sections {
@@ -593,7 +594,7 @@ func (m Model) View() string {
 		return m.renderHelp()
 	}
 	if m.mode == modeDetail {
-		return m.detail.View()
+		return m.detail.View(m.spinner.View())
 	}
 	if m.mode == modeStack {
 		return m.stackMode.View(m.spinner.View())
@@ -686,26 +687,30 @@ func (m Model) viewBody() string {
 	}
 
 	sidebar := m.sidebarVisible()
-	listW, listH := m.width, bodyH
+	listW, listH := m.width, bodyH-colHeaderH
 	if sidebar {
 		listW = m.width - stackPaneW - 1
-		listH = bodyH - 2
+		listH = bodyH - 2 - colHeaderH
 	}
 
 	s := m.sections[m.active]
+	// Column labels above the list. The author column reads "Opened by" — at the
+	// list level GitHub gives us the PR author, not who requested the review.
+	colHead := columnHeader(m.th, listW, "Opened by")
 	box := lipgloss.NewStyle().Width(listW).Height(listH)
-	var body string
+	var listBody string
 	switch {
 	case s.loading:
-		body = box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
+		listBody = box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
 	case s.err != nil:
-		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
+		listBody = box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
 			Render("  error: " + s.err.Error()))
 	case len(s.list.Items()) == 0:
-		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).Render("  nothing here"))
+		listBody = box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).Render("  nothing here"))
 	default:
-		body = s.list.View()
+		listBody = s.list.View()
 	}
+	body := lipgloss.JoinVertical(lipgloss.Left, colHead, listBody)
 
 	if !sidebar {
 		return body
@@ -850,6 +855,28 @@ func (m Model) viewFooter() string {
 		dim.Render("? help"),
 		dim.Render("q quit"),
 	}
-	return lipgloss.NewStyle().Width(m.width).Padding(0, 1).
-		Render(strings.Join(parts, sep))
+	keys := strings.Join(parts, sep)
+
+	// Second line: a legend for the row status glyphs, grouped by the column they
+	// come from — the leading dot (checks, or lifecycle once closed) and the review
+	// mark — so the colors read at a glance. Glyphs keep their row color; labels muted.
+	mark := func(c lipgloss.Color, glyph, label string) string {
+		return lipgloss.NewStyle().Foreground(c).Render(glyph) + dim.Render(" "+label)
+	}
+	diamond := lipgloss.NewStyle().Foreground(m.th.Focus).Bold(true).Render("◆") + dim.Render(" yours")
+	group := func(name string, items ...string) string {
+		label := lipgloss.NewStyle().Foreground(m.th.Muted).Bold(true).Render(name + " ")
+		return label + strings.Join(items, dim.Render(" · "))
+	}
+	groupSep := lipgloss.NewStyle().Foreground(m.th.Overlay).Render("   │   ")
+	legend := strings.Join([]string{
+		group("CHECKS", mark(m.th.Success, "●", "passing"), mark(m.th.Danger, "●", "failing"), mark(m.th.Muted, "○", "none")),
+		group("REVIEW", diamond, mark(m.th.Success, "✓", "approved"), mark(m.th.Danger, "✗", "changes"), mark(m.th.Muted, "◇", "others")),
+		group("STATE", mark(m.th.Primary, "●", "merged"), mark(m.th.Muted, "●", "closed")),
+	}, groupSep)
+
+	box := lipgloss.NewStyle().Width(m.width).Padding(0, 1)
+	// Legend on top, a rule, then keybindings.
+	rule := lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Repeat("─", m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, box.Render(legend), rule, box.Render(keys))
 }

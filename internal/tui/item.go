@@ -38,6 +38,49 @@ type itemDelegate struct {
 	width int
 }
 
+// focusGlyph is the single cursor marker for the focused/selected item, used the
+// same way across every view (PR rows, files, diff lines, stack tree,
+// conversation, conflict rail) so focus reads consistently. Semantic markers
+// (current branch, review diamonds, resolved state) are intentionally distinct.
+const focusGlyph = "❯"
+
+// Column widths for a PR row, shared by the row renderer and the column header
+// so they stay aligned. A leading focus cell (glyph + space) precedes the CI dot.
+const (
+	focusW     = 2 // focusGlyph + its trailing space
+	colRefW    = 26
+	colRevW    = 1
+	colAuthorW = 14
+	colUpdW    = 5
+	colGaps    = 6 // single spaces between the 6 visible fields
+)
+
+// titleColW is the flexible title column for a list of the given total width.
+func titleColW(total int) int {
+	w := total - (focusW + 2 + colRefW + colRevW + colAuthorW + colUpdW + colGaps)
+	if w < 8 {
+		w = 8
+	}
+	return w
+}
+
+// columnHeader renders the muted, aligned column-label row shown above a PR
+// section's list. authorLabel lets a section relabel the author column (e.g.
+// "Opened by" for the review queue).
+func columnHeader(th theme.Theme, total int, authorLabel string) string {
+	cells := []string{
+		" ", // focus-cursor column
+		" ", // CI dot
+		pad("PR", colRefW),
+		pad("", colRevW),
+		pad("Title", titleColW(total)),
+		pad(truncate(authorLabel, colAuthorW), colAuthorW),
+		pad("Upd", colUpdW),
+	}
+	return lipgloss.NewStyle().Foreground(th.Muted).Bold(true).
+		Render(strings.Join(cells, " "))
+}
+
 func (d itemDelegate) Height() int                         { return 1 }
 func (d itemDelegate) Spacing() int                        { return 0 }
 func (d itemDelegate) Update(tea.Msg, *list.Model) tea.Cmd { return nil }
@@ -62,17 +105,14 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	}
 	selected := index == m.Index()
 
-	const (
-		refW    = 26
-		revW    = 1
-		authorW = 14
-		updW    = 5
-		gaps    = 6 // single spaces between the 6 visible fields
-	)
-	titleW := d.width - (2 + refW + revW + authorW + updW + gaps)
-	if titleW < 8 {
-		titleW = 8
+	// Leading focus cursor: the unified ❯ when this row is selected, a blank cell
+	// otherwise so every row keeps the same left margin.
+	focusCell := " "
+	if selected {
+		focusCell = focusGlyph
 	}
+
+	titleW := titleColW(d.width)
 
 	ci := ciGlyph(d.th, it.Checks)
 	rev := reviewGlyph(d.th, it.Item)
@@ -81,7 +121,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	if it.Number > 0 {
 		refText = fmt.Sprintf("%s#%d", refText, it.Number)
 	}
-	ref := pad(truncate(refText, refW), refW)
+	ref := pad(truncate(refText, colRefW), colRefW)
 	// Draft PRs stay listed under OPEN but carry a muted "draft" tag so the eye
 	// can tell ready-for-review work from parked work. The tag lives in the
 	// title cell (ASCII prefix) so column alignment is preserved.
@@ -90,8 +130,8 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		draftTag = "DRAFT "
 	}
 	title := pad(truncate(draftTag+it.Title, titleW), titleW)
-	author := pad(truncate(it.Author, authorW), authorW)
-	upd := pad(relTime(it.UpdatedAt), updW)
+	author := pad(truncate(it.Author, colAuthorW), colAuthorW)
+	upd := pad(relTime(it.UpdatedAt), colUpdW)
 
 	if selected {
 		// On the selection bar, colors would clash — render the whole row in
@@ -111,7 +151,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			titleCell = tag + title[len(draftTag):]
 		}
 		plain := strings.Join([]string{ref, rev, titleCell, author, upd}, " ")
-		fmt.Fprint(w, rowStyle.Render(ci+" "+plain))
+		fmt.Fprint(w, rowStyle.Render(focusCell+" "+ci+" "+plain))
 		return
 	}
 
@@ -121,7 +161,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	if isClosed(it.Item) {
 		muted := lipgloss.NewStyle().Foreground(d.th.Muted)
 		row := strings.Join([]string{
-			stateDot(d.th, it.State),
+			focusCell, stateDot(d.th, it.State),
 			muted.Render(ref), muted.Render("–"),
 			muted.Render(title), muted.Render(author), muted.Render(upd),
 		}, " ")
@@ -134,7 +174,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	authorStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(author)
 	updStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(upd)
 
-	row := strings.Join([]string{ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
+	row := strings.Join([]string{focusCell, ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
 	fmt.Fprint(w, row)
 }
 

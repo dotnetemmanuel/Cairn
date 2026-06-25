@@ -47,7 +47,7 @@ func loadedDetail(t *testing.T) detailModel {
 
 func TestDetailRendersDiffConversationChecks(t *testing.T) {
 	m := loadedDetail(t)
-	view := m.View()
+	view := m.View("")
 
 	wants := []string{
 		"#327", "Add a DrinkModal", "OPEN",
@@ -73,7 +73,7 @@ func TestApproveConfirmFlow(t *testing.T) {
 	if m.state != stateConfirmApprove {
 		t.Fatalf("expected stateConfirmApprove, got %d", m.state)
 	}
-	if !strings.Contains(m.View(), "Approve PR #327") {
+	if !strings.Contains(m.View(""), "Approve PR #327") {
 		t.Errorf("expected approve confirmation in footer")
 	}
 
@@ -163,7 +163,7 @@ func TestHunkNavigationAdvancesAndCycles(t *testing.T) {
 	if m.curHunk != 1 {
 		t.Fatalf("expected hunk 1 after n, got %d", m.curHunk)
 	}
-	if !strings.Contains(m.View(), "hunk 2/3") {
+	if !strings.Contains(m.View(""), "hunk 2/3") {
 		t.Errorf("expected 'hunk 2/3' in view")
 	}
 
@@ -185,7 +185,7 @@ func TestStatusLineClearsOnNextKey(t *testing.T) {
 	m := multiHunkDetail(t)
 	// Simulate a lingering error from a failed action.
 	m.status = "✗ approve failed: boom"
-	if !strings.Contains(m.View(), "approve failed") {
+	if !strings.Contains(m.View(""), "approve failed") {
 		t.Fatalf("expected error to show before dismissal")
 	}
 	// Any browsing keystroke dismisses it.
@@ -322,7 +322,7 @@ func TestContextualPaneShowsLineThread(t *testing.T) {
 	if cc := m.commentCounts(); cc[3] != 1 {
 		t.Errorf("expected a comment badge on rendered line 3, got %v", cc)
 	}
-	view := m.View()
+	view := m.View("")
 	for _, w := range []string{"Line thread", "tweak this", "@octocat"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("contextual pane missing %q", w)
@@ -453,7 +453,7 @@ func TestConversationPageShowsComments(t *testing.T) {
 	if m.page != pageConversation {
 		t.Fatalf("expected conversation page")
 	}
-	view := m.View()
+	view := m.View("")
 	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c comment"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("conversation view missing %q", w)
@@ -493,7 +493,7 @@ func TestConversationThreadsReplyUnderAnchor(t *testing.T) {
 		prLoadedMsg{detail: detail, files: files},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")}, // open full conversation
 	)
-	view := m.View()
+	view := m.View("")
 	// The anchor, its citation, and the reply all show; the reply carries the ╰→ guide.
 	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "╰→"} {
 		if !strings.Contains(view, w) {

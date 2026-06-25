@@ -587,7 +587,7 @@ func (m conflictModel) renderRail(w int) string {
 		name := truncate(shortRepo(f.path), max(4, w-9))
 		row := fmt.Sprintf("%s %s %d/%d", glyph, name, f.resolved(), f.conflicts())
 		if i == m.fileIdx {
-			row = lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("▌" + row)
+			row = lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(focusGlyph + row)
 		} else {
 			row = " " + row
 		}
@@ -638,7 +638,7 @@ func (m conflictModel) resolutionPane(reg *conflict.Region, res conflict.Resolut
 	// hunk has a choice (the file-rail glyph stays file-level), so the eye gets
 	// per-conflict feedback without waiting for the whole file to finish.
 	headStyle := lipgloss.NewStyle().Background(m.th.Surface).Bold(true).Width(w)
-	head := headStyle.Foreground(m.th.Primary).Render("▸ RESOLUTION")
+	head := headStyle.Foreground(m.th.Primary).Render(focusGlyph + " RESOLUTION")
 	if res.Choice != conflict.ChoiceUnresolved {
 		head = headStyle.Foreground(m.th.Success).Render("✓ RESOLVED")
 	}

@@ -189,7 +189,7 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 				// directly (not through the gutter/wrap path) so the background spans the
 				// whole pane; rowAt still gets this line's entry to stay aligned.
 				bar := lipgloss.NewStyle().Foreground(th.Primary).Background(th.Surface).
-					Bold(true).Width(width).Render("▶ " + raw)
+					Bold(true).Width(width).Render(focusGlyph + " " + raw)
 				rowAt = append(rowAt, len(out))
 				out = append(out, bar)
 				continue
@@ -223,7 +223,7 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 		// then the line-number gutter (old │ new).
 		cur := " "
 		if i == cursor {
-			cur = cursorStyle.Render("▌")
+			cur = cursorStyle.Render(focusGlyph)
 		}
 		// A 💬N badge advertises inline comments; reserve its width on the first
 		// visual row so the badge always fits.

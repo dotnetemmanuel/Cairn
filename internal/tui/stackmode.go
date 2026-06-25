@@ -620,7 +620,7 @@ func (s stackModel) renderLocalTree(w int) string {
 		marker := "  "
 		switch {
 		case focused && i == s.treeCursor:
-			marker = lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render("▸ ")
+			marker = lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render(focusGlyph + " ")
 		case n.Name == s.status.Branch:
 			marker = lipgloss.NewStyle().Foreground(s.th.Primary).Render("▌ ")
 		}
@@ -702,7 +702,7 @@ func (s stackModel) renderActions(w int) string {
 		}
 		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), shortStyle.Render(c.Short))
 		if i == s.cursor && s.focus == focusActions {
-			line = lipgloss.NewStyle().Foreground(s.th.Primary).Render("▌ ") + line
+			line = lipgloss.NewStyle().Foreground(s.th.Primary).Render(focusGlyph + " ") + line
 		} else {
 			line = "  " + line
 		}
