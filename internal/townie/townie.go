@@ -8,9 +8,23 @@ package townie
 import (
 	"bufio"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
+
+// nonInteractiveEnv forces git/git-town to never open an editor or pager, so a
+// `continue` that wants to amend a commit message (or a sync that would page)
+// proceeds unattended inside the TUI instead of blocking on a terminal we don't
+// own.
+func nonInteractiveEnv() []string {
+	return append(os.Environ(),
+		"GIT_EDITOR=true",
+		"GIT_SEQUENCE_EDITOR=true",
+		"GIT_PAGER=cat",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+}
 
 // Runner executes an external command in a working directory and returns its
 // combined stdout+stderr. It's an interface so the op layer is unit-testable
@@ -27,6 +41,7 @@ func (ExecRunner) Run(dir, name string, args ...string) (string, error) {
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	cmd.Env = nonInteractiveEnv()
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -63,6 +78,15 @@ func argv(verb, name string) []string {
 		// Two steps; the first is git, the second restacks descendants. Run()
 		// special-cases this verb.
 		return []string{"git", "commit", "--amend", "--no-edit"}
+	case "continue":
+		// Resume a sync/rebase paused on a conflict (after the resolver staged the
+		// fixes). Kept out of Catalog() — not a stack-authoring verb. ExecRunner
+		// forces a non-interactive editor so it never blocks waiting for one.
+		return []string{"git-town", "continue"}
+	case "undo":
+		// Roll the whole in-progress operation back (the conflict resolver's
+		// "abort all"). Also out of Catalog().
+		return []string{"git-town", "undo"}
 	default:
 		return nil
 	}
@@ -158,6 +182,7 @@ func (ExecRunner) Stream(dir, name string, args []string, emit func(line string)
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	cmd.Env = nonInteractiveEnv()
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw

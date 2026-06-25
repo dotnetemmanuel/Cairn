@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/dotnetemmanuel/cairn/internal/config"
+	"github.com/dotnetemmanuel/cairn/internal/conflict"
 	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/stack"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
@@ -43,6 +44,7 @@ const (
 	modeDashboard appMode = iota
 	modeDetail
 	modeStack
+	modeConflict
 )
 
 // Model is the root Bubble Tea model.
@@ -56,6 +58,7 @@ type Model struct {
 	mode      appMode
 	detail    detailModel
 	stackMode stackModel
+	conflict  conflictModel
 
 	sections []section
 	active   int
@@ -312,6 +315,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stackMode, cmd = m.stackMode.Update(msg)
 			return m, cmd
 		}
+		if m.mode == modeConflict {
+			var cmd tea.Cmd
+			m.conflict, cmd = m.conflict.Update(msg)
+			return m, cmd
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -327,6 +335,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeDashboard
 		return m, nil
 
+	case enterConflictMsg:
+		st, err := detectConflict(msg.dir)
+		if err != nil || st.Op == conflict.OpNone || len(st.Files) == 0 {
+			return m, nil // nothing to resolve after all
+		}
+		m.conflict = newConflictModel(m.th, msg.dir, st, diskLoader(msg.dir))
+		m.conflict.gitTown = msg.gitTown
+		// Auto-opened from a git-town op (sync) → greet with a "conflicts detected"
+		// gate first, rather than dropping the user straight into the resolver. A
+		// manual R entry is already a deliberate choice, so it skips the gate.
+		m.conflict.intro = msg.gitTown
+		m.conflict, _ = m.conflict.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		m.mode = modeConflict
+		// Clear the screen so the failed-op output behind us doesn't ghost through.
+		return m, tea.ClearScreen
+
+	case conflictExitMsg:
+		// Back to the stack screen. Drop the now-stale failed-op output/error from
+		// the op that triggered the conflict, then reload to reflect the resolved
+		// (or undone) tree.
+		m.stackMode.clearOp()
+		m.stackMode.reload()
+		m.mode = modeStack
+		return m, tea.ClearScreen
+
 	case tea.KeyMsg:
 		// The help overlay is global and captures keys while open.
 		if m.showHelp {
@@ -339,7 +372,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Open help on ? — unless a text field is capturing input, where ? is a
 		// literal character.
 		capturing := (m.mode == modeDetail && m.detail.composing()) ||
-			(m.mode == modeStack && m.stackMode.capturing())
+			(m.mode == modeStack && m.stackMode.capturing()) ||
+			(m.mode == modeConflict && m.conflict.capturing())
 		if msg.String() == "?" && !capturing {
 			m.showHelp = true
 			return m, nil
@@ -357,6 +391,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == modeStack {
 		var cmd tea.Cmd
 		m.stackMode, cmd = m.stackMode.Update(msg)
+		return m, cmd
+	}
+
+	// In conflict mode, everything else routes to the resolver.
+	if m.mode == modeConflict {
+		var cmd tea.Cmd
+		m.conflict, cmd = m.conflict.Update(msg)
 		return m, cmd
 	}
 
@@ -556,6 +597,9 @@ func (m Model) View() string {
 	}
 	if m.mode == modeStack {
 		return m.stackMode.View(m.spinner.View())
+	}
+	if m.mode == modeConflict {
+		return m.conflict.View()
 	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.viewHeader(),

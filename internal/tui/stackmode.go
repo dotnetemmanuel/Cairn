@@ -104,6 +104,16 @@ func newStackModel(th theme.Theme, repo string) stackModel {
 	return s
 }
 
+// clearOp drops the output/error of the last run op and returns to the browsing
+// phase. Used when leaving the conflict resolver so a since-resolved sync failure
+// doesn't linger on the stack screen.
+func (s *stackModel) clearOp() {
+	s.phase = stackBrowsing
+	s.output = ""
+	s.runErr = nil
+	s.opName = ""
+}
+
 // reload re-reads the local lineage and working-tree status. Called on entry and
 // after every mutation so the tree and statusline reflect git-town's new reality.
 func (s *stackModel) reload() {
@@ -211,6 +221,11 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 			s.runErr = msg.ev.Err
 			s.phase = stackDone
 			s.reload() // tree + status now reflect what git-town did
+			// A failed op that left unmerged paths is a conflict — hand off to the
+			// full-screen resolver instead of just showing the error.
+			if s.runErr != nil && s.status.Conflicts > 0 {
+				return s, func() tea.Msg { return enterConflictMsg{dir: "", gitTown: true} }
+			}
 			return s, nil
 		}
 		// Append the line as it streams in; keep reading the next.
@@ -241,6 +256,13 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 }
 
 func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
+	// Mid-conflict, R opens the resolver. This takes precedence over the restack
+	// accelerator (also R) — which is inert during a conflict — but only while
+	// conflicts exist, so restack keeps R the rest of the time. The working dir is
+	// cwd (""), the dir townie/stack operate in; s.repo is owner/name, not a path.
+	if msg.String() == "R" && s.status.Conflicts > 0 {
+		return s, func() tea.Msg { return enterConflictMsg{dir: ""} }
+	}
 	switch msg.String() {
 	case "esc", "q":
 		return s, func() tea.Msg { return stackExitMsg{} }
@@ -812,11 +834,17 @@ func (s stackModel) renderOutput(w int) string {
 // step, while the results below them stay plain text. Carriage returns are
 // sanitized and long lines hard-wrapped to the pane first.
 func (s stackModel) renderRunLog(out string, w int) string {
-	cmd := lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true)
-	res := lipgloss.NewStyle().Foreground(s.th.Text)
-	// git-town colorizes its own output (e.g. bold command echoes wrapped in
-	// \x1b[1m…\x1b[0m). Strip that first so Cairn fully controls styling and the
-	// "[branch] …" command detection sees plain text, not an escape prefix.
+	return styleRunLog(s.th, out, w)
+}
+
+// styleRunLog is the shared run-log styler used by the stack run screen and the
+// conflict resolver's done screen. git-town colorizes its own output (e.g. bold
+// command echoes wrapped in \x1b[1m…\x1b[0m), so strip that first — then Cairn
+// fully controls styling and the "[branch] …" command detection sees plain text,
+// not an escape prefix.
+func styleRunLog(th theme.Theme, out string, w int) string {
+	cmd := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
+	res := lipgloss.NewStyle().Foreground(th.Text)
 	var b strings.Builder
 	for i, ln := range strings.Split(sanitizeCR(ansi.Strip(out)), "\n") {
 		if i > 0 {
@@ -840,6 +868,13 @@ func isCommandEcho(line string) bool {
 }
 
 func (s stackModel) viewFooter(spinnerFrame string) string {
+	base := lipgloss.NewStyle().Width(s.width).Padding(0, 1)
+	// A pending conflict is the one thing worth shouting about — render the count in
+	// danger red, the rest of the hint muted.
+	if s.phase == stackBrowsing && s.status.Conflicts > 0 {
+		red := errStyle(s.th).Bold(true).Render(fmt.Sprintf("%d conflict(s) — R resolve", s.status.Conflicts))
+		return base.Render(red + mutedStyle(s.th).Render(" · r refresh · esc dashboard"))
+	}
 	var help string
 	switch s.phase {
 	case stackBrowsing:
@@ -860,7 +895,7 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	case stackDone:
 		help = "any key to return to actions"
 	}
-	return lipgloss.NewStyle().Width(s.width).Foreground(s.th.Muted).Padding(0, 1).Render(help)
+	return base.Foreground(s.th.Muted).Render(help)
 }
 
 // --- small text helpers ---
