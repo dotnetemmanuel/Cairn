@@ -25,6 +25,13 @@ type sectionHeader struct{ label string }
 
 func (sectionHeader) FilterValue() string { return "" }
 
+// listNote is a non-selectable, muted placeholder row — e.g. "nothing open" under
+// an OPEN header for a section whose only matches are closed. Navigation skips it,
+// like sectionHeader.
+type listNote struct{ text string }
+
+func (listNote) FilterValue() string { return "" }
+
 // isClosed reports whether an item is no longer open (CLOSED or MERGED).
 func isClosed(it gh.Item) bool {
 	return it.State != "" && !strings.EqualFold(it.State, "OPEN")
@@ -97,6 +104,10 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			fill = 0
 		}
 		fmt.Fprint(w, style.Render(text+strings.Repeat("─", fill)))
+		return
+	}
+	if n, ok := listItem.(listNote); ok {
+		fmt.Fprint(w, lipgloss.NewStyle().Foreground(d.th.Muted).Render("  "+n.text))
 		return
 	}
 	it, ok := listItem.(prItem)

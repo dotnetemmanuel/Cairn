@@ -49,8 +49,9 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	cfg config.Config
-	th  theme.Theme
+	cfg       config.Config
+	th        theme.Theme
+	themeMode string // "dark" | "light"; toggled with ctrl+t
 
 	width  int
 	height int
@@ -83,7 +84,11 @@ type Model struct {
 
 // New constructs the root model from loaded config.
 func New(cfg config.Config) Model {
-	th := theme.New(cfg.Theme)
+	mode := cfg.ThemeMode
+	if mode != theme.ModeLight {
+		mode = theme.ModeDark
+	}
+	th := theme.Resolve(mode, cfg.Theme)
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
@@ -92,6 +97,7 @@ func New(cfg config.Config) Model {
 	m := Model{
 		cfg:           cfg,
 		th:            th,
+		themeMode:     mode,
 		spinner:       sp,
 		headerLoading: true,
 		showStack:     true,
@@ -212,18 +218,24 @@ func closedFilter(filter string) string {
 }
 
 // sectionRows assembles a section's list rows: open items, then any recently
-// closed/merged items beneath a divider. The "OPEN"/"CLOSED" labels appear
-// only when both groups are present — a lone group needs no header.
+// closed/merged items beneath a divider. Whenever a closed tail is present the
+// OPEN/CLOSED structure is shown — including when there are zero open PRs, where a
+// muted "nothing open" placeholder sits under the OPEN header — so an all-closed
+// section reads as "nothing open + N closed" rather than an unlabeled list that
+// looks miscounted. A lone open group (no closed tail) needs no header.
 func sectionRows(open, closed []gh.Item) []list.Item {
-	rows := make([]list.Item, 0, len(open)+len(closed)+3)
-	both := len(open) > 0 && len(closed) > 0
-	if both {
+	rows := make([]list.Item, 0, len(open)+len(closed)+4)
+	labeled := len(closed) > 0
+	if labeled {
 		rows = append(rows, sectionHeader{"OPEN"})
+		if len(open) == 0 {
+			rows = append(rows, listNote{"nothing open"})
+		}
 	}
 	for _, it := range open {
 		rows = append(rows, prItem{it})
 	}
-	if both {
+	if labeled {
 		// A blank spacer sets the closed group apart from the open list.
 		rows = append(rows, sectionHeader{""}, sectionHeader{"CLOSED"})
 	}
@@ -378,6 +390,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelp = true
 			return m, nil
 		}
+		// Theme toggle is global — flip light/dark from any screen. ctrl+t is a
+		// control key, so it never collides with text fields (no capturing guard).
+		if msg.String() == "ctrl+t" {
+			return m.toggleTheme()
+		}
 	}
 
 	// In detail mode, everything else routes to the detail screen.
@@ -485,6 +502,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// toggleTheme flips between the light and dark palettes live, threading the new
+// theme into every open screen, re-rendering cached viewport content, and
+// persisting the choice. The redraw clears first so old-palette backgrounds
+// don't ghost behind the new ones.
+func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
+	m.themeMode = theme.Toggle(m.themeMode)
+	m.th = theme.Resolve(m.themeMode, m.cfg.Theme)
+	m.spinner.Style = lipgloss.NewStyle().Foreground(m.th.Focus)
+
+	// The list-row delegate carries the theme, so rebuild it; then push the new
+	// theme into whichever sub-screen is live (detail caches rendered viewports,
+	// so it needs an explicit re-render — stack and conflict render from th).
+	m.resizeLists()
+	switch m.mode {
+	case modeDetail:
+		m.detail.restyle(m.th)
+	case modeStack:
+		m.stackMode.th = m.th
+	case modeConflict:
+		m.conflict.th = m.th
+	}
+
+	// Persist out-of-band; a write failure must not break the live toggle.
+	mode := m.themeMode
+	persist := func() tea.Msg { _ = config.SaveThemeMode(mode); return nil }
+	return m, tea.Batch(tea.ClearScreen, persist)
+}
+
 // openSelected opens the highlighted dashboard row in the detail screen, if it
 // is a pull request. Non-PR rows (issues, number-less notifications) are
 // ignored for now — the review pane is PR-only.
@@ -590,49 +635,75 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
 	}
-	if m.showHelp {
-		return m.renderHelp()
+	var body string
+	switch {
+	case m.showHelp:
+		body = m.renderHelp()
+	case m.mode == modeDetail:
+		body = m.detail.View(m.spinner.View())
+	case m.mode == modeStack:
+		body = m.stackMode.View(m.spinner.View())
+	case m.mode == modeConflict:
+		body = m.conflict.View()
+	default:
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			m.viewHeader(),
+			m.viewTabs(),
+			m.viewBody(),
+			m.viewFooter(),
+		)
 	}
-	if m.mode == modeDetail {
-		return m.detail.View(m.spinner.View())
+	return m.paintBackground(body)
+}
+
+// paintBackground fills the whole frame with the theme's Base background and Text
+// foreground. lipgloss ends every styled run with a full reset (ESC[0m), which also
+// clears the background, so plain text following a reset on the same line falls back
+// to the terminal's own background. In dark mode that's invisible (terminal ≈ Base),
+// but in light mode the body would show the dark terminal through. We reassert the
+// document default (Text on Base) after every reset so unstyled regions keep the
+// page color, then let the outer style pad each line to full width and the frame to
+// full height.
+func (m Model) paintBackground(view string) string {
+	def := lipgloss.NewStyle().Foreground(m.th.Text).Background(m.th.Base)
+	// The opening SGR for the default: render a marker and slice off the codes
+	// before it. Empty when the color profile has no color (e.g. tests) — a no-op.
+	stamped := def.Render("\x00")
+	reassert := stamped[:strings.IndexByte(stamped, '\x00')]
+	if reassert != "" {
+		view = strings.ReplaceAll(view, "\x1b[0m", "\x1b[0m"+reassert)
+		view = reassert + view
 	}
-	if m.mode == modeStack {
-		return m.stackMode.View(m.spinner.View())
-	}
-	if m.mode == modeConflict {
-		return m.conflict.View()
-	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.viewHeader(),
-		m.viewTabs(),
-		m.viewBody(),
-		m.viewFooter(),
-	)
+	return def.Width(m.width).Height(m.height).Render(view)
 }
 
 func (m Model) viewHeader() string {
 	row := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).
 		Foreground(m.th.Text).Padding(0, 1)
+	// Every fragment carries the Surface background itself: lipgloss ends each
+	// styled run with a reset, and paintBackground reasserts Base after every reset,
+	// so a fragment styled with only a foreground would show Base mid-row (the
+	// "two background colors" bug). seg keeps the whole header uniformly Surface.
+	seg := lipgloss.NewStyle().Background(m.th.Surface)
 
 	// Row 1 — brand. The mark + name get their own line so they read as a
 	// masthead rather than competing with the status text.
-	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
-	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
+	brand := seg.Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := seg.Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
 	brandRow := row.Render(brand + tagline)
 
 	// Row 2 — session/status.
 	var status string
 	switch {
 	case m.headerLoading:
-		status = lipgloss.NewStyle().Foreground(m.th.Focus).Render("connecting…")
+		status = seg.Foreground(m.th.Focus).Render("connecting…")
 	case m.headerErr != nil:
-		status = lipgloss.NewStyle().Foreground(m.th.Danger).Render(m.headerErr.Error())
+		status = seg.Foreground(m.th.Danger).Render(m.headerErr.Error())
 	default:
-		who := lipgloss.NewStyle().Foreground(m.th.Info).Render(m.login)
-		calls := lipgloss.NewStyle().Foreground(m.th.Muted).
-			Render(fmt.Sprintf("%d API calls remaining", m.rate))
-		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
-			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
+		who := seg.Foreground(m.th.Info).Render(m.login)
+		calls := seg.Foreground(m.th.Muted).Render(fmt.Sprintf("%d API calls remaining", m.rate))
+		status = seg.Foreground(m.th.Text).Render("Logged in as ") + who +
+			seg.Foreground(m.th.Muted).Render(" · ") + calls
 	}
 	statusRow := row.Render(status)
 
@@ -837,6 +908,22 @@ func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w
 	return b.String()
 }
 
+// themeFooterHint renders the light/dark toggle affordance for any footer: a sun
+// and moon glyph flanking the ^t key, with the active mode's glyph lit (amber sun
+// in light mode, cyan moon in dark) and the other muted. The mode is read from
+// the theme itself, so every footer can share this without tracking it.
+func themeFooterHint(th theme.Theme) string {
+	sun := lipgloss.NewStyle().Foreground(th.Muted).Render("☀")
+	moon := lipgloss.NewStyle().Foreground(th.Muted).Render("☾")
+	if theme.IsLight(th) {
+		sun = lipgloss.NewStyle().Foreground(th.Warning).Render("☀")
+	} else {
+		moon = lipgloss.NewStyle().Foreground(th.Info).Render("☾")
+	}
+	muted := lipgloss.NewStyle().Foreground(th.Muted)
+	return sun + muted.Render(" / ") + moon + muted.Render(" ctrl + t theme")
+}
+
 func (m Model) viewFooter() string {
 	dim := lipgloss.NewStyle().Foreground(m.th.Muted)
 	sep := dim.Render(" · ")
@@ -852,6 +939,7 @@ func (m Model) viewFooter() string {
 		dim.Render("s sidebar"),
 		stackHint,
 		dim.Render("r refresh"),
+		themeFooterHint(m.th),
 		dim.Render("? help"),
 		dim.Render("q quit"),
 	}

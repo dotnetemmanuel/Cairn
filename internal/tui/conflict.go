@@ -680,11 +680,13 @@ func (m conflictModel) tintedCode(lines []string, hl highlighter, w int, bg stri
 	if len(lines) == 0 {
 		return mutedStyle(m.th).Render("(empty)")
 	}
-	bgStyle := lipgloss.NewStyle().Background(lipgloss.Color(bg)).Width(w)
+	// Reuse the diff pane's tintRow: it re-asserts the "R;G;B" background after each
+	// chroma per-token reset and pads to width, so the tint spans the whole line
+	// instead of bleeding to the page background between syntax tokens.
 	var out []string
 	for _, ln := range lines {
 		rendered := hl.line(expandTabs(ln))
-		out = append(out, bgStyle.Render(truncate(rendered, w)))
+		out = append(out, tintRow(truncate(rendered, w), bg, w))
 	}
 	return strings.Join(out, "\n")
 }

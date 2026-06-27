@@ -799,6 +799,24 @@ func (m *detailModel) refreshInfo() {
 	m.infoVP.SetContent(m.renderInfo())
 }
 
+// restyle swaps the theme and re-renders the cached viewports in place (a live
+// light/dark toggle). It preserves the cursor, selection, and scroll positions —
+// only the colors change. A still-loading screen needs no work: its next render
+// already uses the new theme.
+func (m *detailModel) restyle(th theme.Theme) {
+	m.th = th
+	if m.loading || m.err != nil {
+		return
+	}
+	if len(m.files) > 0 {
+		m.renderDiffContent()
+	} else {
+		m.diffVP.SetContent(mutedStyle(m.th).Render("  (no files changed)"))
+	}
+	m.refreshInfo()
+	m.renderConvContent()
+}
+
 // refreshConv re-renders the conversation, places the thread cursor on the first
 // repliable thread (if any), and scrolls to the top — a full reload.
 func (m *detailModel) refreshConv() {

@@ -77,9 +77,10 @@ func mdRenderer(width int, th theme.Theme) *glamour.TermRenderer {
 	mdMu.Lock()
 	defer mdMu.Unlock()
 
-	key := string(th.Text) + "|" + string(th.Focus) + "|" + string(th.Primary) +
-		"|" + string(th.Info) + "|" + string(th.Accent2) + "|" + string(th.Surface) +
-		"|" + string(th.Warning) + "|" + string(th.Muted) + "|" + string(th.Overlay)
+	// Full fingerprint: cairnGlamourStyle (code blocks included) consumes Success
+	// and Danger too, so a partial key would leave those orphaned — stale code-block
+	// strings/errors if only they changed.
+	key := theme.Fingerprint(th)
 	if key != mdStyleKey {
 		mdStyleKey = key
 		mdStyle = cairnGlamourStyle(th)
@@ -147,7 +148,7 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 	s.Link.Color = sptr(th.Info)
 	s.LinkText.Color = sptr(th.Info)
 	s.Code.Color = sptr(th.Accent2)
-	s.Code.BackgroundColor = sptr(th.Overlay)
+	s.Code.BackgroundColor = sptr(th.CodeBg)
 
 	s.Emph.Color = sptr(th.Warning)
 	s.Strong.Color = sptr(th.Text)
@@ -170,7 +171,7 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 	// value before mutating, or we'd corrupt the shared style for everyone.
 	if s.CodeBlock.Chroma != nil {
 		c := *s.CodeBlock.Chroma
-		bg := string(th.Overlay)
+		bg := string(th.CodeBg)
 		// Recolor chroma's syntax tokens onto Cairn's semantic palette so code blocks
 		// match the rest of the TUI instead of glamour's built-in dark theme. Each token
 		// gets the Overlay backdrop plus a themed foreground; other attributes (bold,
@@ -215,7 +216,7 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 		s.CodeBlock.Chroma = &c
 	}
 	// And the fallback (no-language / non-color) path renders via this primitive.
-	s.CodeBlock.StyleBlock.StylePrimitive.BackgroundColor = sptr(th.Overlay)
+	s.CodeBlock.StyleBlock.StylePrimitive.BackgroundColor = sptr(th.CodeBg)
 	// Bracket each block with sentinels so padCodeBlocks can square it into a solid
 	// rectangle. glamour renders these with the document style (no background), and
 	// they're stripped before display.
@@ -258,7 +259,7 @@ func padCodeBlocks(out string, th theme.Theme) string {
 }
 
 // squareCodeBlock pads every line of a single code block to the width of its widest
-// line, backgrounded with Overlay so the block reads as one rectangle.
+// line, backgrounded with CodeBg so the block reads as one rectangle.
 func squareCodeBlock(block []string, th theme.Theme) []string {
 	contents := make([]string, len(block))
 	widths := make([]int, len(block))
@@ -273,7 +274,7 @@ func squareCodeBlock(block []string, th theme.Theme) []string {
 			target = widths[j]
 		}
 	}
-	bg := lipgloss.NewStyle().Background(th.Overlay)
+	bg := lipgloss.NewStyle().Background(th.CodeBg)
 	for j := range block {
 		// Reset after the trimmed content, then lay down a backgrounded run of spaces
 		// to reach the common width. The content's last cell already carries Overlay,
