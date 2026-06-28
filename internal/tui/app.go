@@ -677,35 +677,51 @@ func (m Model) paintBackground(view string) string {
 	return def.Width(m.width).Height(m.height).Render(view)
 }
 
-func (m Model) viewHeader() string {
-	row := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).
-		Foreground(m.th.Text).Padding(0, 1)
-	// Every fragment carries the Surface background itself: lipgloss ends each
-	// styled run with a reset, and paintBackground reasserts Base after every reset,
-	// so a fragment styled with only a foreground would show Base mid-row (the
-	// "two background colors" bug). seg keeps the whole header uniformly Surface.
-	seg := lipgloss.NewStyle().Background(m.th.Surface)
+// surfaceBar paints content as a full-width bar in the theme's Surface color —
+// the shared primitive behind both the top header and every screen's bottom
+// footer, so the eye reads them as one matched frame around the Base body (the
+// action area "pops" from the center). Same mechanism as paintBackground but for
+// Surface: lipgloss ends every styled run with ESC[0m, which clears the
+// background, so any gap between fragments (or a fragment styled with only a
+// foreground) would fall back to whatever bg is active — Base, after
+// paintBackground's global reassert — and read as a second color on the bar.
+// We reassert Surface after every reset inside content so the whole bar stays
+// one color. Composition is order-safe: paintBackground later inserts its Base
+// reassert immediately after each ESC[0m, i.e. *before* the Surface one we
+// inject here, so Surface wins on the bar while Base still wins off it. Content
+// must already carry its own left padding; the helper sets only width + colors.
+func surfaceBar(th theme.Theme, width int, content string) string {
+	s := lipgloss.NewStyle().Foreground(th.Text).Background(th.Surface)
+	stamped := s.Render("\x00")
+	reassert := stamped[:strings.IndexByte(stamped, '\x00')]
+	if reassert != "" {
+		content = strings.ReplaceAll(content, "\x1b[0m", "\x1b[0m"+reassert)
+		content = reassert + content
+	}
+	return s.Width(width).Render(content)
+}
 
+func (m Model) viewHeader() string {
 	// Row 1 — brand. The mark + name get their own line so they read as a
 	// masthead rather than competing with the status text.
-	brand := seg.Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
-	tagline := seg.Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
-	brandRow := row.Render(brand + tagline)
+	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
+	brandRow := surfaceBar(m.th, m.width, " "+brand+tagline)
 
 	// Row 2 — session/status.
 	var status string
 	switch {
 	case m.headerLoading:
-		status = seg.Foreground(m.th.Focus).Render("connecting…")
+		status = lipgloss.NewStyle().Foreground(m.th.Focus).Render("connecting…")
 	case m.headerErr != nil:
-		status = seg.Foreground(m.th.Danger).Render(m.headerErr.Error())
+		status = lipgloss.NewStyle().Foreground(m.th.Danger).Render(m.headerErr.Error())
 	default:
-		who := seg.Foreground(m.th.Info).Render(m.login)
-		calls := seg.Foreground(m.th.Muted).Render(fmt.Sprintf("%d API calls remaining", m.rate))
-		status = seg.Foreground(m.th.Text).Render("Logged in as ") + who +
-			seg.Foreground(m.th.Muted).Render(" · ") + calls
+		who := lipgloss.NewStyle().Foreground(m.th.Info).Render(m.login)
+		calls := lipgloss.NewStyle().Foreground(m.th.Muted).Render(fmt.Sprintf("%d API calls remaining", m.rate))
+		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
+			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
 	}
-	statusRow := row.Render(status)
+	statusRow := surfaceBar(m.th, m.width, " "+status)
 
 	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
@@ -964,7 +980,9 @@ func (m Model) viewFooter() string {
 	}, groupSep)
 
 	box := lipgloss.NewStyle().Width(m.width).Padding(0, 1)
-	// Legend on top, a rule, then keybindings.
+	// Legend on top, a rule, then keybindings — the whole stack painted as one
+	// Surface bar so it matches the header and pops off the Base body.
 	rule := lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Repeat("─", m.width))
-	return lipgloss.JoinVertical(lipgloss.Left, box.Render(legend), rule, box.Render(keys))
+	return surfaceBar(m.th, m.width,
+		lipgloss.JoinVertical(lipgloss.Left, box.Render(legend), rule, box.Render(keys)))
 }

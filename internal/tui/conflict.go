@@ -771,14 +771,14 @@ func (m conflictModel) footer() string {
 		return base.Render("")
 	}
 	if m.status != "" {
-		return base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2)))
+		return surfaceBar(m.th, m.width, base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2))))
 	}
 	nav := "n/N conflict · [ ] file · a incoming · d yours · b both · e edit · f rail · esc back"
 	if m.allResolved() {
 		lead := okStyle(m.th).Bold(true).Render("all resolved · c continue")
-		return base.Render(lead + mutedStyle(m.th).Render(" · "+nav))
+		return surfaceBar(m.th, m.width, base.Render(lead+mutedStyle(m.th).Render(" · "+nav)))
 	}
-	return base.Foreground(m.th.Muted).Render(truncate(nav, max(10, m.width-2)))
+	return surfaceBar(m.th, m.width, base.Foreground(m.th.Muted).Render(truncate(nav, max(10, m.width-2))))
 }
 
 func opWord(op conflict.Op) string {

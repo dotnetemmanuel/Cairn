@@ -1522,7 +1522,8 @@ func (m detailModel) viewComposer() string {
 
 func (m detailModel) viewFooter() string {
 	if m.status != "" {
-		return lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(m.status)
+		return surfaceBar(m.th, m.width,
+			lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(m.status))
 	}
 	var help string
 	switch {
@@ -1545,8 +1546,9 @@ func (m detailModel) viewFooter() string {
 	default:
 		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
 	}
-	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
-		Render(truncate(help, max(10, m.width-2)))
+	return surfaceBar(m.th, m.width,
+		lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
+			Render(truncate(help, max(10, m.width-2))))
 }
 
 // ---- small styling helpers ----

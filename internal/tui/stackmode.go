@@ -873,7 +873,7 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	// danger red, the rest of the hint muted.
 	if s.phase == stackBrowsing && s.status.Conflicts > 0 {
 		red := errStyle(s.th).Bold(true).Render(fmt.Sprintf("%d conflict(s) — R resolve", s.status.Conflicts))
-		return base.Render(red + mutedStyle(s.th).Render(" · r refresh · esc dashboard"))
+		return surfaceBar(s.th, s.width, base.Render(red+mutedStyle(s.th).Render(" · r refresh · esc dashboard")))
 	}
 	var help string
 	switch s.phase {
@@ -895,7 +895,7 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 	case stackDone:
 		help = "any key to return to actions"
 	}
-	return base.Foreground(s.th.Muted).Render(help)
+	return surfaceBar(s.th, s.width, base.Foreground(s.th.Muted).Render(help))
 }
 
 // --- small text helpers ---
