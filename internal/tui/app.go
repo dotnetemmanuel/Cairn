@@ -558,6 +558,11 @@ const (
 	colHeaderH = 1 // the PR-list column-label row above each section
 )
 
+// appMarginLeft is the left gutter for body content so it clears the terminal's
+// left edge. It is applied per-region via indentBody (body content only) — the
+// full-width Surface bars (header, footer, statusline) stay flush to the edge.
+const appMarginLeft = 2
+
 // logoGlyph is Cairn's mark in the header brand line. Pulled out so it's a
 // one-line swap; ⟁ (a small triangle within a triangle) reads as a cairn/peak.
 const logoGlyph = "⟁"
@@ -567,10 +572,11 @@ func (m *Model) resizeLists() {
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	listW := m.width
+	bw := bodyWidth(m.width)
+	listW := bw
 	listH := bodyH - colHeaderH // the column-label row sits above the list
 	if m.sidebarVisible() {
-		listW = m.width - stackPaneW - 1 // sidebar + vertical separator
+		listW = bw - stackPaneW - 1 // sidebar + vertical separator
 		if listW < 20 {
 			listW = 20
 		}
@@ -642,14 +648,16 @@ func (m Model) View() string {
 	case m.mode == modeDetail:
 		body = m.detail.View(m.spinner.View())
 	case m.mode == modeStack:
-		body = m.stackMode.View(m.spinner.View())
+		body = m.stackMode.View(m.spinner.View(), m.viewHeader())
 	case m.mode == modeConflict:
 		body = m.conflict.View()
 	default:
+		// Header and footer are full-width bars (flush to the edges); only the
+		// tabs+body content is indented by the left gutter.
+		mid := indentBody(lipgloss.JoinVertical(lipgloss.Left, m.viewTabs(), m.viewBody()))
 		body = lipgloss.JoinVertical(lipgloss.Left,
 			m.viewHeader(),
-			m.viewTabs(),
-			m.viewBody(),
+			mid,
 			m.viewFooter(),
 		)
 	}
@@ -677,6 +685,34 @@ func (m Model) paintBackground(view string) string {
 	return def.Width(m.width).Height(m.height).Render(view)
 }
 
+// indentBody left-pads every line of a body block by appMarginLeft spaces so the
+// content clears the terminal's left edge, while full-width bars (header, footer,
+// statusline) rendered outside it stay flush to the edge. Plain spaces suffice:
+// paintBackground keeps Base asserted at the start of every line, so the gutter
+// renders in the page color. Callers must size the block to bodyWidth(width) so
+// indent + content lands back at full width.
+func indentBody(s string) string {
+	if appMarginLeft <= 0 {
+		return s
+	}
+	pad := strings.Repeat(" ", appMarginLeft)
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = pad + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// bodyWidth is the width available to indented body content: the full width minus
+// the left gutter indentBody adds back.
+func bodyWidth(width int) int {
+	w := width - appMarginLeft
+	if w < 1 {
+		w = width
+	}
+	return w
+}
+
 // surfaceBar paints content as a full-width bar in the theme's Surface color —
 // the shared primitive behind both the top header and every screen's bottom
 // footer, so the eye reads them as one matched frame around the Base body (the
@@ -702,26 +738,35 @@ func surfaceBar(th theme.Theme, width int, content string) string {
 }
 
 func (m Model) viewHeader() string {
+	return renderBrandHeader(m.th, m.login, m.rate, m.headerLoading, m.headerErr, m.width)
+}
+
+// renderBrandHeader draws Cairn's two-row masthead — the brand line over the
+// session/status line — as a Surface bar. It is a standalone function (not a
+// Model method) so full-screen modes that take over the dashboard, like stack
+// mode, can show the same top bar without duplicating it. headerH (2) must match
+// the line count this returns.
+func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, herr error, width int) string {
 	// Row 1 — brand. The mark + name get their own line so they read as a
 	// masthead rather than competing with the status text.
-	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
-	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
-	brandRow := surfaceBar(m.th, m.width, " "+brand+tagline)
+	brand := lipgloss.NewStyle().Foreground(th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := lipgloss.NewStyle().Foreground(th.Muted).Render("   keyboard cockpit for GitHub")
+	brandRow := surfaceBar(th, width, " "+brand+tagline)
 
 	// Row 2 — session/status.
 	var status string
 	switch {
-	case m.headerLoading:
-		status = lipgloss.NewStyle().Foreground(m.th.Focus).Render("connecting…")
-	case m.headerErr != nil:
-		status = lipgloss.NewStyle().Foreground(m.th.Danger).Render(m.headerErr.Error())
+	case loading:
+		status = lipgloss.NewStyle().Foreground(th.Focus).Render("connecting…")
+	case herr != nil:
+		status = lipgloss.NewStyle().Foreground(th.Danger).Render(herr.Error())
 	default:
-		who := lipgloss.NewStyle().Foreground(m.th.Info).Render(m.login)
-		calls := lipgloss.NewStyle().Foreground(m.th.Muted).Render(fmt.Sprintf("%d API calls remaining", m.rate))
-		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
-			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
+		who := lipgloss.NewStyle().Foreground(th.Info).Render(login)
+		calls := lipgloss.NewStyle().Foreground(th.Muted).Render(fmt.Sprintf("%d API calls remaining", rate))
+		status = lipgloss.NewStyle().Foreground(th.Text).Render("Logged in as ") + who +
+			lipgloss.NewStyle().Foreground(th.Muted).Render(" · ") + calls
 	}
-	statusRow := surfaceBar(m.th, m.width, " "+status)
+	statusRow := surfaceBar(th, width, " "+status)
 
 	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
@@ -755,7 +800,7 @@ func (m Model) viewTabs() string {
 
 	// Extend the body's top line to the full width past the last tab — the
 	// whole rule reads as one continuous focus-colored line.
-	gap := m.width - lipgloss.Width(row)
+	gap := bodyWidth(m.width) - lipgloss.Width(row)
 	if gap < 0 {
 		gap = 0
 	}
@@ -768,15 +813,16 @@ func (m Model) viewBody() string {
 	if bodyH < 1 {
 		bodyH = 1
 	}
+	bw := bodyWidth(m.width)
 	if len(m.sections) == 0 {
-		return lipgloss.NewStyle().Width(m.width).Height(bodyH).
+		return lipgloss.NewStyle().Width(bw).Height(bodyH).
 			Foreground(m.th.Muted).Render("  no sections configured")
 	}
 
 	sidebar := m.sidebarVisible()
-	listW, listH := m.width, bodyH-colHeaderH
+	listW, listH := bw, bodyH-colHeaderH
 	if sidebar {
-		listW = m.width - stackPaneW - 1
+		listW = bw - stackPaneW - 1
 		listH = bodyH - 2 - colHeaderH
 	}
 

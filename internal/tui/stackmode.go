@@ -564,25 +564,28 @@ func (s stackModel) affectedBranches(c townie.Command, name string) []string {
 
 // View renders the three zones. spinnerFrame is threaded from the root model so
 // the running state animates with the same spinner as the rest of the app.
-func (s stackModel) View(spinnerFrame string) string {
+// header is the app's brand masthead (rendered by the root model, which owns the
+// login/rate it shows) so stack mode keeps the same top bar as the dashboard.
+func (s stackModel) View(spinnerFrame, header string) string {
 	statusline := renderStatusline(s.th, s.repo, s.status, s.hasGitTown(), s.width)
 
-	bodyH := s.height - 1 /*statusline*/ - 1 /*footer*/
+	bodyH := s.height - headerH /*brand*/ - 1 /*statusline*/ - 1 /*footer*/
 	if bodyH < 1 {
 		bodyH = 1
 	}
 
 	treeW := stackPaneW
-	rightW := s.width - treeW - 1
+	rightW := bodyWidth(s.width) - treeW - 1
 	if rightW < 20 {
 		rightW = 20
 	}
 
 	left := lipgloss.NewStyle().Width(treeW).Height(bodyH).Render(s.renderLocalTree(treeW))
 	right := lipgloss.NewStyle().Width(rightW).Height(bodyH).Render(s.renderRight(rightW))
-	body := lipgloss.JoinHorizontal(lipgloss.Top, left, stackVBar(s.th, bodyH), right)
+	// Header/statusline/footer are full-width bars (flush); only the panes indent.
+	body := indentBody(lipgloss.JoinHorizontal(lipgloss.Top, left, stackVBar(s.th, bodyH), right))
 
-	return lipgloss.JoinVertical(lipgloss.Left, statusline, body, s.viewFooter(spinnerFrame))
+	return lipgloss.JoinVertical(lipgloss.Left, header, statusline, body, s.viewFooter(spinnerFrame))
 }
 
 // renderLocalTree draws the cwd repo's git-town stack with the CURRENT branch
