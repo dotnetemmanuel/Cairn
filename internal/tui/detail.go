@@ -721,7 +721,8 @@ func (m detailModel) bottomReserve() int {
 }
 
 func (m *detailModel) paneWidths() (files, diff, info int) {
-	w := m.width
+	// Lay out within the indented body width so header/footer bars stay flush.
+	w := bodyWidth(m.width)
 	files = 30
 	if files > w/3 {
 		files = w / 3
@@ -766,8 +767,8 @@ func (m *detailModel) relayout() {
 		m.infoVP.Width = infoW
 		m.infoVP.Height = vpH
 	}
-	// The conversation page is full width.
-	m.convVP.Width = m.width
+	// The conversation page spans the indented body width.
+	m.convVP.Width = bodyWidth(m.width)
 	m.convVP.Height = vpH
 	m.composer.SetWidth(m.width - 4)
 	m.composer.SetHeight(composerH)
@@ -881,7 +882,7 @@ func (m detailModel) View(spinner string) string {
 			// White text, blue spinner — same as the dashboard's loading line.
 			msg := lipgloss.NewStyle().Foreground(m.th.Text).
 				Render(fmt.Sprintf("refreshing PR #%d…", m.number))
-			body := "\n  " + spinner + " " + msg
+			body := indentBody("\n  " + spinner + " " + msg)
 			return lipgloss.JoinVertical(lipgloss.Left, m.viewHeader(), body, m.viewFooter())
 		}
 		return fmt.Sprintf("\n  %s loading PR #%d…", spinner, m.number)
@@ -897,6 +898,8 @@ func (m detailModel) View(spinner string) string {
 	} else {
 		body = m.viewBody()
 	}
+	// Header and footer are full-width bars (flush); the body is indented.
+	body = indentBody(body)
 
 	if m.composing() {
 		return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewComposer())
@@ -911,7 +914,7 @@ func (m detailModel) viewConversation() string {
 	}
 	n := len(m.detail.Comments) + len(m.detail.Reviews) + len(m.detail.ReviewComments)
 	title := fmt.Sprintf("Conversation · %d items", n)
-	return m.paneBox(title, m.convVP.View(), m.width, bodyH, true)
+	return m.paneBox(title, m.convVP.View(), bodyWidth(m.width), bodyH, true)
 }
 
 // renderConversation builds the full-width thread. Reviews lead with their
@@ -1280,8 +1283,9 @@ func (m detailModel) viewHeader() string {
 	if m.detail.IsDraft {
 		state += "  " + draftBadge(m.th)
 	}
-	line1 := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).Padding(0, 1).
-		Render(fmt.Sprintf("%s %s  %s", num, title, state))
+	// Surface bar via surfaceBar so the trailing pad doesn't bleed to Base (the
+	// "double background" on the header) — same fix as the dashboard masthead.
+	line1 := surfaceBar(m.th, m.width, " "+fmt.Sprintf("%s %s  %s", num, title, state))
 
 	refs := fmt.Sprintf("%s ← %s", m.detail.BaseRef, m.detail.HeadRef)
 	stats := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", m.detail.Additions)) +

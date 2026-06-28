@@ -147,14 +147,9 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	if selected {
 		// On the selection bar, colors would clash — render the whole row in
 		// primary-on-surface, keeping only the CI dot colored for at-a-glance
-		// status. (The dot uses true color regardless of background.)
-		rowStyle := lipgloss.NewStyle().
-			Foreground(d.th.Primary).
-			Background(d.th.Surface).
-			Width(d.width)
-		// The draft tag keeps its peach color on the bar (same nesting trick as
-		// the CI dot): style it explicitly over the surface so it survives the
-		// uniform row style instead of turning primary like the rest.
+		// status. (The dot uses true color regardless of background.) styledBar
+		// reasserts the surface background after the CI dot's (and draft tag's)
+		// reset so the highlight spans the entire line, not just up to the dot.
 		titleCell := title
 		if draftTag != "" {
 			tag := lipgloss.NewStyle().Foreground(d.th.Warning).Background(d.th.Surface).
@@ -162,7 +157,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			titleCell = tag + title[len(draftTag):]
 		}
 		plain := strings.Join([]string{ref, rev, titleCell, author, upd}, " ")
-		fmt.Fprint(w, rowStyle.Render(focusCell+" "+ci+" "+plain))
+		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+ci+" "+plain))
 		return
 	}
 

@@ -727,7 +727,16 @@ func bodyWidth(width int) int {
 // inject here, so Surface wins on the bar while Base still wins off it. Content
 // must already carry its own left padding; the helper sets only width + colors.
 func surfaceBar(th theme.Theme, width int, content string) string {
-	s := lipgloss.NewStyle().Foreground(th.Text).Background(th.Surface)
+	return styledBar(th.Text, th.Surface, width, content)
+}
+
+// styledBar is surfaceBar generalized to any fg/bg: it paints content as a
+// full-width bar and reasserts fg+bg after every ESC[0m inside it, so inner
+// styled fragments (a colored CI dot, a draft tag) don't punch the background
+// back to the page color after their own reset. Used for the selected list row
+// (Primary-on-Surface), whose highlight must span the whole line in both themes.
+func styledBar(fg, bg lipgloss.Color, width int, content string) string {
+	s := lipgloss.NewStyle().Foreground(fg).Background(bg)
 	stamped := s.Render("\x00")
 	reassert := stamped[:strings.IndexByte(stamped, '\x00')]
 	if reassert != "" {

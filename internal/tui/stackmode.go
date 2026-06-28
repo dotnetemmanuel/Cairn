@@ -705,7 +705,11 @@ func (s stackModel) renderActions(w int) string {
 		}
 		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), shortStyle.Render(c.Short))
 		if i == s.cursor && s.focus == focusActions {
-			line = lipgloss.NewStyle().Foreground(s.th.Primary).Render(focusGlyph + " ") + line
+			// Same full-width Surface highlight as the focused PR row: styledBar
+			// reasserts the background after each fragment's reset so the bar spans
+			// the whole line (both themes), with the cursor glyph in Primary.
+			cursor := lipgloss.NewStyle().Foreground(s.th.Primary).Render(focusGlyph + " ")
+			line = styledBar(s.th.Text, s.th.Surface, w, cursor+line)
 		} else {
 			line = "  " + line
 		}
