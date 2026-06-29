@@ -56,7 +56,7 @@ func TestDashboardRendersHeaderTabsAndRows(t *testing.T) {
 		"My PRs", "Needs Review",
 		"mpd#29", "PWA UI improvements", "3h",
 		"grantigo#327", "Drink modal", "2d",
-		"r refresh", "q quit",
+		"r sync all", "q quit",
 	}
 	for _, w := range wants {
 		if !strings.Contains(view, w) {
@@ -193,7 +193,7 @@ func TestToggleSelectedGroup(t *testing.T) {
 		t.Fatalf("cursor should rest on the OPEN header, got %#v", lst.SelectedItem())
 	}
 	m = drive(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if !m.sections[0].openCollapsed {
+	if !m.sections[0].collapsed["OPEN"] {
 		t.Fatal("enter on the OPEN header should have folded the group")
 	}
 	// The open item must no longer be a row, and the cursor stays on the header.
@@ -208,8 +208,144 @@ func TestToggleSelectedGroup(t *testing.T) {
 
 	// Enter again unfolds.
 	m = drive(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.sections[0].openCollapsed {
+	if m.sections[0].collapsed["OPEN"] {
 		t.Fatal("a second enter should have unfolded the OPEN group")
+	}
+}
+
+func TestGroupedRows(t *testing.T) {
+	groups := []group{
+		{title: "ASSIGNED TO ME", items: []gh.Item{{IsPR: true, Number: 1, State: "OPEN"}}},
+		{title: "MENTIONED", items: nil}, // empty → muted "none"
+		{title: "PARTICIPATING", items: []gh.Item{{IsPR: true, Number: 2, State: "OPEN"}}},
+	}
+	rows := groupedRows(groups, map[string]bool{})
+	// ASSIGNED header + item, spacer + MENTIONED header + none-note, spacer +
+	// PARTICIPATING header + item = 8 rows.
+	if len(rows) != 8 {
+		t.Fatalf("want 8 rows, got %d: %#v", len(rows), rows)
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "ASSIGNED TO ME" || !h.collapsible {
+		t.Errorf("row 0 should be the ASSIGNED header, got %#v", rows[0])
+	}
+	if _, ok := rows[4].(listNote); !ok {
+		t.Errorf("empty MENTIONED group should show a 'none' note, got %#v", rows[4])
+	}
+
+	// Folding ASSIGNED hides its item but keeps the header (with its count).
+	folded := groupedRows(groups, map[string]bool{"ASSIGNED TO ME": true})
+	if h, ok := folded[0].(sectionHeader); !ok || !h.collapsed || h.count != 1 {
+		t.Errorf("ASSIGNED header should be collapsed carrying count 1, got %#v", folded[0])
+	}
+	if _, ok := folded[1].(sectionHeader); !ok {
+		t.Errorf("folded ASSIGNED should be followed by the spacer, not its item, got %#v", folded[1])
+	}
+}
+
+func TestRefreshSyncsAllTabs(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{
+		{Title: "My PRs", Filter: "a"},
+		{Title: "Involved", Type: config.SectionInvolved},
+		{Title: "Orgs", Type: config.SectionOrgs},
+	}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	// Mark every section settled so we can see refresh flip them back to loading.
+	for i := range m.sections {
+		m.sections[i].loading = false
+		m.sections[i].loaded = true
+	}
+	// r while on tab 0 must mark ALL tabs loading — a whole-board sync — so a PR
+	// that moved tabs reaches its new home without a per-tab refresh.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	for i := range m.sections {
+		if !m.sections[i].loading {
+			t.Errorf("section %d (%s) should be loading after r", i, m.sections[i].title)
+		}
+	}
+	if !m.headerLoading {
+		t.Error("r should also refresh the header/viewer")
+	}
+}
+
+func TestPostThenExitSyncsBoard(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{
+		{Title: "My PRs", Filter: "a"},
+		{Title: "Orgs", Type: config.SectionOrgs},
+	}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	settle := func() {
+		for i := range m.sections {
+			m.sections[i].loading = false
+			m.sections[i].loaded = true
+		}
+		m.flash = ""
+	}
+
+	// Exiting detail without posting must not resync or flash.
+	settle()
+	m = drive(m, detailExitMsg{posted: false})
+	if m.flash != "" {
+		t.Errorf("no flash expected on a no-op exit, got %q", m.flash)
+	}
+	for i := range m.sections {
+		if m.sections[i].loading {
+			t.Errorf("section %d should not reload on a no-op exit", i)
+		}
+	}
+
+	// Exiting after a post syncs every tab and shows an explanatory flash.
+	settle()
+	m = drive(m, detailExitMsg{posted: true})
+	if m.flash == "" {
+		t.Error("expected a header flash explaining the auto-sync")
+	}
+	if !m.headerLoading {
+		t.Error("post-exit sync should refresh the header too")
+	}
+	for i := range m.sections {
+		if !m.sections[i].loading {
+			t.Errorf("section %d (%s) should reload after a post-exit", i, m.sections[i].title)
+		}
+	}
+
+	// The flash dismisses on its timer.
+	m = drive(m, flashClearMsg{})
+	if m.flash != "" {
+		t.Errorf("flashClearMsg should clear the flash, got %q", m.flash)
+	}
+}
+
+func TestOrgGroups(t *testing.T) {
+	orgs := []string{"Mindful-Stack", "Veygr-watch"}
+	items := []gh.Item{
+		{IsPR: true, Repo: "Mindful-Stack/mpd", Number: 33, State: "OPEN"},
+		{IsPR: true, Repo: "mindful-stack/web", Number: 2, State: "OPEN"}, // case differs on purpose
+		{IsPR: true, Repo: "Other-Org/x", Number: 9, State: "OPEN"},       // not in our orgs → dropped
+	}
+	groups, total := orgGroups(orgs, items)
+	if len(groups) != 2 {
+		t.Fatalf("want one group per org (2), got %d", len(groups))
+	}
+	if groups[0].title != "MINDFUL-STACK" || len(groups[0].items) != 2 {
+		t.Errorf("Mindful-Stack group should hold both items (case-insensitive), got %q n=%d", groups[0].title, len(groups[0].items))
+	}
+	if groups[1].title != "VEYGR-WATCH" || len(groups[1].items) != 0 {
+		t.Errorf("empty Veygr-watch group should still appear with 0 items, got %q n=%d", groups[1].title, len(groups[1].items))
+	}
+	if total != 2 { // the Other-Org PR isn't counted — it's not one of our orgs
+		t.Errorf("total should count only matched-org items (2), got %d", total)
+	}
+}
+
+func TestInvolvedSpecsExcludeOwnAndReview(t *testing.T) {
+	// Every Involved sub-query must exclude your own PRs and review requests so a
+	// PR has a single home (the most-actionable tab). Guards the dedup contract.
+	for _, sp := range involvedSpecs() {
+		if !strings.Contains(sp.filter, "-author:@me") || !strings.Contains(sp.filter, "-review-requested:@me") {
+			t.Errorf("group %q filter %q must exclude -author:@me and -review-requested:@me", sp.title, sp.filter)
+		}
 	}
 }
 

@@ -86,6 +86,7 @@ type detailModel struct {
 	state    detailState
 	composer textarea.Model
 	status   string // transient feedback line
+	posted   bool   // user submitted a comment/reply/review this session → sync board on exit
 
 	// Anchor for an in-progress inline comment (stateLineComment).
 	anchorPath string
@@ -154,7 +155,9 @@ type actionDoneMsg struct {
 	err  error
 }
 
-type detailExitMsg struct{}
+// detailExitMsg returns control to the dashboard. posted is true when the user
+// submitted something this session, so the dashboard can auto-sync all tabs.
+type detailExitMsg struct{ posted bool }
 
 func loadPR(owner, repo string, number int, keep bool) tea.Cmd {
 	return func() tea.Msg {
@@ -256,6 +259,9 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 			return m, nil
 		}
 		m.status = okStyle(m.th).Render("✓ " + msg.verb + " submitted")
+		// Remember the user changed their involvement so the dashboard syncs every
+		// tab on exit (e.g. an Orgs PR you just commented on moves into Involved).
+		m.posted = true
 		// Reload conversation/checks so the new review/comment shows — but stay
 		// on the current file, line, and scroll position.
 		return m, loadPR(m.owner, m.repo, m.number, true)
@@ -332,7 +338,8 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.page = pageDiff
 			return m, nil
 		}
-		return m, func() tea.Msg { return detailExitMsg{} }
+		posted := m.posted
+		return m, func() tea.Msg { return detailExitMsg{posted: posted} }
 	case "v":
 		// Toggle the full conversation: v opens it, v again closes it back to
 		// the diff (esc also closes it).

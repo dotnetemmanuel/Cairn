@@ -6,6 +6,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -23,7 +24,17 @@ import (
 // separately, so capping is visible rather than silent).
 const searchLimit = 50
 
-// section is one board tab — either a search filter or the notifications feed.
+// group is one labeled list within a grouped section (e.g. "ASSIGNED TO ME"),
+// holding the open PRs that matched its sub-query after cross-group dedup.
+type group struct {
+	title string
+	items []gh.Item
+}
+
+// section is one board tab. Most sections are a single search filter (with an
+// OPEN/CLOSED split); a notifications section pulls the REST feed; a grouped
+// section (typ == SectionInvolved) renders several labeled sub-query lists
+// instead of the open/closed split.
 type section struct {
 	title       string
 	typ         string
@@ -36,19 +47,33 @@ type section struct {
 	err         error
 	total       int
 
-	// Raw matches kept apart from the list so the OPEN/CLOSED groups can be
-	// re-folded without re-fetching: rebuildRows reassembles list items from these
-	// plus the collapse flags.
-	open            []gh.Item
-	closed          []gh.Item
-	openCollapsed   bool // OPEN group folded (its items hidden under the header)
-	closedCollapsed bool // CLOSED group folded
+	// Raw matches kept apart from the list so the groups can be re-folded without
+	// re-fetching: rebuildRows reassembles list items from these plus the fold
+	// state. A plain section uses open/closed; a grouped one uses groups.
+	open   []gh.Item
+	closed []gh.Item
+	groups []group
+
+	// collapsed records each foldable group's fold state, keyed by header label
+	// (e.g. "OPEN", "ASSIGNED TO ME"). Persists across refresh + section switches
+	// within a session; reset (expanded) on each launch.
+	collapsed map[string]bool
 }
 
-// rebuildRows reassembles the section's list rows from its stored open/closed
-// matches and current fold state. Called on load and whenever a group is toggled.
+// grouped reports whether the section renders labeled sub-query lists rather than
+// the OPEN/CLOSED split.
+func (s *section) grouped() bool {
+	return s.typ == config.SectionInvolved || s.typ == config.SectionOrgs
+}
+
+// rebuildRows reassembles the section's list rows from its stored matches and
+// current fold state. Called on load and whenever a group is toggled.
 func (s *section) rebuildRows() {
-	s.list.SetItems(sectionRows(s.open, s.closed, s.openCollapsed, s.closedCollapsed))
+	if s.grouped() {
+		s.list.SetItems(groupedRows(s.groups, s.collapsed))
+		return
+	}
+	s.list.SetItems(sectionRows(s.open, s.closed, s.collapsed["OPEN"], s.collapsed["CLOSED"]))
 }
 
 // appMode selects which screen is active.
@@ -94,6 +119,11 @@ type Model struct {
 	rate          int
 	limit         int
 	headerErr     error
+
+	// flash is a transient status line shown in the header (overriding the session
+	// line) — e.g. while auto-syncing the board after you post on a PR. Cleared on
+	// a timer so the user sees what's happening without it sticking.
+	flash string
 }
 
 // New constructs the root model from loaded config.
@@ -158,6 +188,7 @@ func New(cfg config.Config) Model {
 			closedLimit: limit,
 			list:        l,
 			loading:     true,
+			collapsed:   map[string]bool{},
 		})
 	}
 	return m
@@ -187,11 +218,60 @@ func fetchViewer() tea.Msg {
 // neither the section nor the global config specifies one.
 const closedLimit = 15
 
+// syncAllCmds marks every section (and the header) loading and returns the
+// commands to reload them — the whole-board sync shared by manual refresh (r) and
+// the auto-sync after you post on a PR. It mutates the receiver via the shared
+// section slice + header fields, so callers pass the returned cmds to tea.Batch.
+func (m *Model) syncAllCmds() []tea.Cmd {
+	cmds := []tea.Cmd{fetchViewer}
+	for i := range m.sections {
+		s := &m.sections[i]
+		s.loading = true
+		s.err = nil
+		cmds = append(cmds, loadSection(i, s.typ, s.filter, s.showClosed, s.closedLimit))
+	}
+	m.headerLoading = true
+	return cmds
+}
+
+// flashClearMsg dismisses the header flash after its display window.
+type flashClearMsg struct{}
+
+// clearFlashAfter dismisses the header flash a few seconds out — long enough to
+// read "syncing…", short enough not to linger after the sync has landed.
+func clearFlashAfter() tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return flashClearMsg{} })
+}
+
+// involvedSpec is one role group of the Involved tab: a label and its search
+// sub-query. The base excludes your own PRs (the My PRs tab) and review requests
+// (the Needs my review tab) so each PR has a single home — the most-actionable
+// tab that applies. Groups are deduped in priority order: Assigned > Mentioned >
+// Participating.
+type involvedSpec struct {
+	title, filter string
+}
+
+func involvedSpecs() []involvedSpec {
+	const base = "is:open is:pr -author:@me -review-requested:@me"
+	return []involvedSpec{
+		{"ASSIGNED TO ME", "assignee:@me " + base},
+		{"MENTIONED", "mentions:@me " + base},
+		{"PARTICIPATING", "commenter:@me " + base},
+	}
+}
+
 func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cmd {
 	return func() tea.Msg {
 		if typ == config.SectionNotifications {
 			items, total, err := gh.FetchNotifications(searchLimit)
 			return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
+		}
+		if typ == config.SectionInvolved {
+			return loadInvolved(idx)
+		}
+		if typ == config.SectionOrgs {
+			return loadOrgs(idx)
 		}
 		items, total, err := gh.SearchItems(filter, searchLimit)
 		if err != nil {
@@ -205,6 +285,93 @@ func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cm
 		}
 		return sectionLoadedMsg{idx: idx, items: items, closed: closed, total: total}
 	}
+}
+
+// groupedLoadedMsg carries a grouped section's loaded role groups (Involved).
+type groupedLoadedMsg struct {
+	idx    int
+	groups []group
+	total  int
+	err    error
+}
+
+// loadInvolved runs each role sub-query in turn, deduping across groups so a PR
+// surfaces only in its highest-priority group (Assigned > Mentioned >
+// Participating). A failure on any sub-query fails the section.
+func loadInvolved(idx int) tea.Msg {
+	seen := map[string]bool{}
+	var groups []group
+	total := 0
+	for _, sp := range involvedSpecs() {
+		items, _, err := gh.SearchItems(sp.filter, searchLimit)
+		if err != nil {
+			return groupedLoadedMsg{idx: idx, err: err}
+		}
+		kept := items[:0:0]
+		for _, it := range items {
+			key := fmt.Sprintf("%s#%d", it.Repo, it.Number)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			kept = append(kept, it)
+		}
+		groups = append(groups, group{title: sp.title, items: kept})
+		total += len(kept)
+	}
+	return groupedLoadedMsg{idx: idx, groups: groups, total: total}
+}
+
+// loadOrgs powers the discovery Orgs tab: it resolves the orgs you belong to,
+// then fetches open PRs across them that you are NOT yet involved in (and that
+// aren't review-requested from you — those live in Needs my review), one group
+// per org. A single search spans all orgs; results are bucketed by owner so each
+// org reads as its own foldable list.
+func loadOrgs(idx int) tea.Msg {
+	orgs, err := gh.FetchOrgs()
+	if err != nil {
+		return groupedLoadedMsg{idx: idx, err: err}
+	}
+	if len(orgs) == 0 {
+		return groupedLoadedMsg{idx: idx} // no orgs → empty tab, not an error
+	}
+
+	// Discovery filter: open PRs I have no relationship with yet, freshest first.
+	q := "is:open is:pr -involves:@me -review-requested:@me sort:updated-desc"
+	for _, o := range orgs {
+		q += " org:" + o
+	}
+	items, _, err := gh.SearchItems(q, searchLimit)
+	if err != nil {
+		return groupedLoadedMsg{idx: idx, err: err}
+	}
+
+	groups, total := orgGroups(orgs, items)
+	return groupedLoadedMsg{idx: idx, groups: groups, total: total}
+}
+
+// orgGroups buckets items into one group per org (in the given order), keyed by
+// repo owner case-insensitively — org logins and a repo's nameWithOwner share
+// GitHub's canonical case, but we normalize defensively. An org with no matches
+// still gets an (empty) group so it reads as "checked, nothing new". Group titles
+// are uppercased to match the other section headers (OPEN, ASSIGNED TO ME, …).
+func orgGroups(orgs []string, items []gh.Item) (groups []group, total int) {
+	byOrg := map[string][]gh.Item{}
+	for _, it := range items {
+		owner := it.Repo
+		if i := strings.IndexByte(owner, '/'); i >= 0 {
+			owner = owner[:i]
+		}
+		key := strings.ToLower(owner)
+		byOrg[key] = append(byOrg[key], it)
+	}
+	groups = make([]group, 0, len(orgs))
+	for _, o := range orgs {
+		gi := byOrg[strings.ToLower(o)]
+		groups = append(groups, group{title: strings.ToUpper(o), items: gi})
+		total += len(gi)
+	}
+	return groups, total
 }
 
 // closedFilter turns a section's (open) search into its closed counterpart:
@@ -264,6 +431,32 @@ func sectionRows(open, closed []gh.Item, openCollapsed, closedCollapsed bool) []
 	rows = append(rows, sectionHeader{}, sectionHeader{label: "CLOSED", collapsible: true, collapsed: closedCollapsed, count: len(closed)})
 	if !closedCollapsed {
 		for _, it := range closed {
+			rows = append(rows, prItem{it})
+		}
+	}
+	return rows
+}
+
+// groupedRows assembles a grouped section's rows: each group gets a foldable
+// header (with its count) followed by its open items, separated by a blank
+// spacer. A folded group hides its items; an empty, expanded group shows a muted
+// "none" placeholder so it doesn't read as broken. Group titles are unique, so
+// the collapsed map keys cleanly by label.
+func groupedRows(groups []group, collapsed map[string]bool) []list.Item {
+	rows := make([]list.Item, 0, len(groups)*2)
+	for i, g := range groups {
+		if i > 0 {
+			rows = append(rows, sectionHeader{}) // spacer between groups
+		}
+		folded := collapsed[g.title]
+		rows = append(rows, sectionHeader{label: g.title, collapsible: true, collapsed: folded, count: len(g.items)})
+		if folded {
+			continue
+		}
+		if len(g.items) == 0 {
+			rows = append(rows, listNote{"none"})
+		}
+		for _, it := range g.items {
 			rows = append(rows, prItem{it})
 		}
 	}
@@ -436,6 +629,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailExitMsg:
 		m.mode = modeDashboard
+		// If you posted on the PR, auto-sync the whole board so it moves to its new
+		// home (e.g. Orgs → Involved) without a manual refresh — with a header flash
+		// so it's clear why every tab just reloaded.
+		if msg.posted {
+			m.flash = "↻ You posted — syncing all tabs so this PR moves to its new home…"
+			cmds := append(m.syncAllCmds(), clearFlashAfter())
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case flashClearMsg:
+		m.flash = ""
 		return m, nil
 
 	case stackExitMsg:
@@ -547,6 +752,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case groupedLoadedMsg:
+		if msg.idx < 0 || msg.idx >= len(m.sections) {
+			return m, nil
+		}
+		s := &m.sections[msg.idx]
+		s.loading = false
+		s.loaded = true
+		s.err = msg.err
+		s.total = msg.total
+		if msg.err == nil {
+			s.groups = msg.groups
+			s.rebuildRows()
+			preferItem(&s.list)
+			m.rebuildStacks()
+			m.resizeLists()
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -587,13 +810,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = modeStack
 			return m, nil
 		case "r":
-			cmds := []tea.Cmd{fetchViewer}
-			s := &m.sections[m.active]
-			s.loading = true
-			s.err = nil
-			cmds = append(cmds, loadSection(m.active, s.typ, s.filter, s.showClosed, s.closedLimit))
-			m.headerLoading = true
-			return m, tea.Batch(cmds...)
+			// Refresh is a whole-board sync, not just the active tab: re-run every
+			// section's query so a PR whose state changed (e.g. you just commented on
+			// an Orgs PR) lands in its correct home across all tabs in one press,
+			// instead of needing a separate refresh per tab.
+			return m, tea.Batch(m.syncAllCmds()...)
 		}
 		// Forward navigation to the active section's list. j/k/arrows move to the
 		// next selectable row, skipping divider headers and wrapping at the ends.
@@ -662,12 +883,7 @@ func (m Model) toggleSelectedGroup() bool {
 		return false
 	}
 	idx := s.list.Index()
-	switch h.label {
-	case "OPEN":
-		s.openCollapsed = !s.openCollapsed
-	case "CLOSED":
-		s.closedCollapsed = !s.closedCollapsed
-	}
+	s.collapsed[h.label] = !s.collapsed[h.label]
 	s.rebuildRows()
 	// The toggled header keeps its index (only rows below it appear/disappear), so
 	// the cursor stays put; ensureSelectable is a safety net.
@@ -749,7 +965,12 @@ func (m *Model) rebuildStacks() {
 	// Iterate the stored matches, not the visible list rows, so folding a group
 	// doesn't drop its PRs from the reconstructed sidebar.
 	for i := range m.sections {
-		for _, it := range append(append([]gh.Item{}, m.sections[i].open...), m.sections[i].closed...) {
+		s := &m.sections[i]
+		items := append(append([]gh.Item{}, s.open...), s.closed...)
+		for _, g := range s.groups {
+			items = append(items, g.items...)
+		}
+		for _, it := range items {
 			if !it.IsPR || it.HeadBranch == "" {
 				continue
 			}
@@ -894,7 +1115,7 @@ func styledBar(fg, bg lipgloss.Color, width int, content string) string {
 }
 
 func (m Model) viewHeader() string {
-	return renderBrandHeader(m.th, m.login, m.rate, m.headerLoading, m.headerErr, m.width)
+	return renderBrandHeader(m.th, m.login, m.rate, m.headerLoading, m.headerErr, m.width, m.flash)
 }
 
 // renderBrandHeader draws Cairn's two-row masthead — the brand line over the
@@ -902,16 +1123,19 @@ func (m Model) viewHeader() string {
 // Model method) so full-screen modes that take over the dashboard, like stack
 // mode, can show the same top bar without duplicating it. headerH (2) must match
 // the line count this returns.
-func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, herr error, width int) string {
+func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, herr error, width int, flash string) string {
 	// Row 1 — brand. The mark + name get their own line so they read as a
 	// masthead rather than competing with the status text.
 	brand := lipgloss.NewStyle().Foreground(th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
 	tagline := lipgloss.NewStyle().Foreground(th.Muted).Render("   keyboard cockpit for GitHub")
 	brandRow := surfaceBar(th, width, " "+brand+tagline)
 
-	// Row 2 — session/status.
+	// Row 2 — session/status. A flash (e.g. the post-then-sync notice) takes the
+	// line so the user sees what's happening, overriding the usual session info.
 	var status string
 	switch {
+	case flash != "":
+		status = lipgloss.NewStyle().Foreground(th.Focus).Bold(true).Render(flash)
 	case loading:
 		status = lipgloss.NewStyle().Foreground(th.Focus).Render("connecting…")
 	case herr != nil:
@@ -1157,7 +1381,7 @@ func (m Model) viewFooter() string {
 		dim.Render("enter open / fold"),
 		dim.Render("s sidebar"),
 		stackHint,
-		dim.Render("r refresh"),
+		dim.Render("r sync all"),
 		themeFooterHint(m.th),
 		dim.Render("? help"),
 		dim.Render("q quit"),

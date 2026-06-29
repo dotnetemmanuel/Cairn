@@ -46,3 +46,32 @@ func FetchViewer() (Viewer, error) {
 		RateLimit:     query.RateLimit.Limit,
 	}, nil
 }
+
+// FetchOrgs returns the login names of the organizations the authenticated user
+// belongs to (including private memberships, since the query runs as the
+// viewer). Order follows GitHub's default; the Orgs tab groups PRs by these.
+func FetchOrgs() ([]string, error) {
+	client, err := graphQLClient()
+	if err != nil {
+		return nil, err
+	}
+
+	var query struct {
+		Viewer struct {
+			Organizations struct {
+				Nodes []struct{ Login string }
+			} `graphql:"organizations(first: 100)"`
+		}
+	}
+	if err := client.Query("CairnOrgs", &query, nil); err != nil {
+		return nil, err
+	}
+
+	orgs := make([]string, 0, len(query.Viewer.Organizations.Nodes))
+	for _, n := range query.Viewer.Organizations.Nodes {
+		if n.Login != "" {
+			orgs = append(orgs, n.Login)
+		}
+	}
+	return orgs, nil
+}

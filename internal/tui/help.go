@@ -86,7 +86,7 @@ func (m Model) renderHelp() string {
 			{"enter", "open the PR — or fold/unfold an OPEN/CLOSED group"},
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
-			{"r", "refresh"},
+			{"r", "sync all tabs (re-run every query)"},
 			{"?", "toggle this help"},
 			{"q", "quit"},
 		} {

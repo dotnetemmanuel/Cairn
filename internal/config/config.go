@@ -17,6 +17,16 @@ import (
 const (
 	SectionSearch        = "search"        // default: a GitHub search filter
 	SectionNotifications = "notifications" // the notifications REST feed
+	// SectionInvolved is a built-in grouped section: instead of an OPEN/CLOSED
+	// split it shows your involvement by role — Assigned, Mentioned, Participating
+	// — excluding your own PRs and review requests (those have their own tabs). Its
+	// Filter is ignored; the sub-queries are defined in the TUI.
+	SectionInvolved = "involved"
+	// SectionOrgs is a built-in grouped section for discovery: open PRs across the
+	// organizations you belong to that you are NOT yet involved in (so you can
+	// start participating), grouped by org. Its orgs are resolved at runtime and
+	// its Filter is ignored.
+	SectionOrgs = "orgs"
 )
 
 // Section is a board section. A search section is backed by a GitHub search
@@ -68,7 +78,8 @@ func Default() Config {
 		Sections: []Section{
 			{Title: "My PRs", Filter: "is:open is:pr author:@me"},
 			{Title: "Needs my review", Filter: "is:open is:pr review-requested:@me"},
-			{Title: "Involved", Filter: "is:open is:pr involves:@me"},
+			{Title: "Involved", Type: SectionInvolved},
+			{Title: "Orgs", Type: SectionOrgs},
 			{Title: "Notifications", Type: SectionNotifications},
 		},
 	}
