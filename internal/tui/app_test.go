@@ -87,26 +87,129 @@ func TestSectionRowsDividers(t *testing.T) {
 	open := []gh.Item{{IsPR: true, Number: 1, State: "OPEN"}}
 	closed := []gh.Item{{IsPR: true, Number: 2, State: "MERGED"}}
 
-	// Both groups present → OPEN header, items, a blank spacer, CLOSED header.
-	rows := sectionRows(open, closed)
+	// Both groups present, nothing folded → OPEN header, items, a blank spacer,
+	// CLOSED header.
+	rows := sectionRows(open, closed, false, false)
 	if len(rows) != 5 {
 		t.Fatalf("want 5 rows (OPEN + item + spacer + CLOSED + item), got %d", len(rows))
 	}
-	if h, ok := rows[0].(sectionHeader); !ok || h.label != "OPEN" {
-		t.Errorf("row 0 should be the OPEN header, got %#v", rows[0])
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "OPEN" || !h.collapsible {
+		t.Errorf("row 0 should be the foldable OPEN header, got %#v", rows[0])
 	}
-	if h, ok := rows[2].(sectionHeader); !ok || h.label != "" {
+	if h, ok := rows[2].(sectionHeader); !ok || h.label != "" || h.collapsible {
 		t.Errorf("row 2 should be the blank spacer, got %#v", rows[2])
 	}
-	if h, ok := rows[3].(sectionHeader); !ok || h.label != "CLOSED" {
-		t.Errorf("row 3 should be the CLOSED header, got %#v", rows[3])
+	if h, ok := rows[3].(sectionHeader); !ok || h.label != "CLOSED" || !h.collapsible {
+		t.Errorf("row 3 should be the foldable CLOSED header, got %#v", rows[3])
 	}
 
 	// A lone group needs no header.
-	if rows := sectionRows(open, nil); len(rows) != 1 {
+	if rows := sectionRows(open, nil, false, false); len(rows) != 1 {
 		t.Fatalf("open-only should be a flat list of 1, got %d", len(rows))
 	} else if _, ok := rows[0].(prItem); !ok {
 		t.Errorf("open-only row should be a prItem, got %#v", rows[0])
+	}
+}
+
+func TestSectionRowsFolded(t *testing.T) {
+	open := []gh.Item{
+		{IsPR: true, Number: 1, State: "OPEN"},
+		{IsPR: true, Number: 2, State: "OPEN"},
+	}
+	closed := []gh.Item{{IsPR: true, Number: 3, State: "MERGED"}}
+
+	// OPEN folded → its items vanish, leaving the collapsed header, spacer, CLOSED
+	// header, and the closed item.
+	rows := sectionRows(open, closed, true, false)
+	if len(rows) != 4 {
+		t.Fatalf("OPEN folded: want 4 rows, got %d", len(rows))
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "OPEN" || !h.collapsed || h.count != 2 {
+		t.Errorf("row 0 should be the collapsed OPEN header carrying its count, got %#v", rows[0])
+	}
+	for _, r := range rows {
+		if it, ok := r.(prItem); ok && it.Number != 3 {
+			t.Errorf("OPEN folded should hide open items, but found %#v", it)
+		}
+	}
+
+	// CLOSED folded → the closed item vanishes; open items stay.
+	rows = sectionRows(open, closed, false, true)
+	if len(rows) != 5 { // OPEN, item, item, spacer, CLOSED
+		t.Fatalf("CLOSED folded: want 5 rows, got %d", len(rows))
+	}
+	if h, ok := rows[4].(sectionHeader); !ok || h.label != "CLOSED" || !h.collapsed || h.count != 1 {
+		t.Errorf("last row should be the collapsed CLOSED header, got %#v", rows[4])
+	}
+	if _, ok := rows[len(rows)-1].(prItem); ok {
+		t.Error("CLOSED folded should hide the closed item")
+	}
+}
+
+func TestJumpBetweenGroups(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "x"}}}
+	m := New(cfg)
+	open := []gh.Item{
+		{IsPR: true, Repo: "o/r", Number: 1, Title: "open A", State: "OPEN"},
+		{IsPR: true, Repo: "o/r", Number: 2, Title: "open B", State: "OPEN"},
+	}
+	closed := []gh.Item{{IsPR: true, Repo: "o/r", Number: 3, Title: "closed C", State: "CLOSED"}}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		sectionLoadedMsg{idx: 0, items: open, closed: closed, total: 2},
+	)
+
+	// n jumps to the next group header regardless of where the cursor sits.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "CLOSED" {
+		t.Fatalf("n should jump to the CLOSED header, got %#v", m.sections[0].list.SelectedItem())
+	}
+	// n again wraps back to OPEN.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "OPEN" {
+		t.Fatalf("a second n should wrap to the OPEN header, got %#v", m.sections[0].list.SelectedItem())
+	}
+	// N goes the other way: from OPEN back to CLOSED.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("N")})
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "CLOSED" {
+		t.Fatalf("N should jump to the CLOSED header, got %#v", m.sections[0].list.SelectedItem())
+	}
+}
+
+func TestToggleSelectedGroup(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "x"}}}
+	m := New(cfg)
+	open := []gh.Item{{IsPR: true, Repo: "o/r", Number: 1, Title: "open A", State: "OPEN"}}
+	closed := []gh.Item{{IsPR: true, Repo: "o/r", Number: 2, Title: "closed B", State: "CLOSED"}}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		sectionLoadedMsg{idx: 0, items: open, closed: closed, total: 1},
+	)
+
+	// Move up onto the OPEN header (cursor starts on the first item), then fold it.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	lst := &m.sections[0].list
+	if h, ok := lst.SelectedItem().(sectionHeader); !ok || h.label != "OPEN" {
+		t.Fatalf("cursor should rest on the OPEN header, got %#v", lst.SelectedItem())
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.sections[0].openCollapsed {
+		t.Fatal("enter on the OPEN header should have folded the group")
+	}
+	// The open item must no longer be a row, and the cursor stays on the header.
+	for _, li := range m.sections[0].list.Items() {
+		if it, ok := li.(prItem); ok && it.Number == 1 {
+			t.Error("open item should be hidden after folding OPEN")
+		}
+	}
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "OPEN" {
+		t.Errorf("cursor should still be on the OPEN header after folding, got %#v", m.sections[0].list.SelectedItem())
+	}
+
+	// Enter again unfolds.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.sections[0].openCollapsed {
+		t.Fatal("a second enter should have unfolded the OPEN group")
 	}
 }
 
@@ -126,22 +229,23 @@ func TestNavSkipsDividers(t *testing.T) {
 	)
 	lst := &m.sections[0].list
 
-	// Initial selection must land on the first real item, not the OPEN header.
+	// Initial selection must land on the first real item, not a header.
 	if _, ok := lst.Items()[lst.Index()].(prItem); !ok {
 		t.Fatalf("cursor started on a divider (index %d)", lst.Index())
 	}
 
-	// Walking the whole list with j must never rest on a divider, and must
-	// cross the CLOSED divider to reach the closed item.
+	// Walking the whole list with j may rest on foldable headers (they're
+	// navigable now) but never on the blank spacer or a note, and must cross the
+	// CLOSED divider to reach the closed item.
 	sawClosed := false
 	for i := 0; i < len(lst.Items())*2; i++ {
 		m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 		lst = &m.sections[0].list
-		it, ok := lst.Items()[lst.Index()].(prItem)
-		if !ok {
-			t.Fatalf("cursor landed on a divider at index %d", lst.Index())
+		sel := lst.Items()[lst.Index()]
+		if !navigable(sel) {
+			t.Fatalf("cursor landed on a non-navigable row at index %d: %#v", lst.Index(), sel)
 		}
-		if it.Number == 3 {
+		if it, ok := sel.(prItem); ok && it.Number == 3 {
 			sawClosed = true
 		}
 	}

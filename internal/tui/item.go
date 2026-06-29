@@ -18,10 +18,18 @@ type prItem struct{ gh.Item }
 
 func (i prItem) FilterValue() string { return i.Title }
 
-// sectionHeader is a non-selectable divider row that labels the group of items
-// that follows it (e.g. "OPEN", "CLOSED"). Navigation skips over it; see
-// ensureSelectable / selectAdjacent in app.go.
-type sectionHeader struct{ label string }
+// sectionHeader is a divider row that labels the group of items that follows it
+// (e.g. "OPEN", "CLOSED"). A collapsible header is navigable — the cursor can
+// rest on it and enter folds/unfolds the group; count is the number of items in
+// the group (shown when collapsed) and collapsed is its current fold state. A
+// header with collapsible=false (notably the blank spacer, label=="") is skipped
+// by navigation; see navigable / ensureSelectable in app.go.
+type sectionHeader struct {
+	label       string
+	collapsible bool
+	collapsed   bool
+	count       int
+}
 
 func (sectionHeader) FilterValue() string { return "" }
 
@@ -97,12 +105,32 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			// A blank spacer row (e.g. breathing room above the CLOSED divider).
 			return
 		}
-		style := lipgloss.NewStyle().Foreground(d.th.Muted).Bold(true)
-		text := "─ " + h.label + " "
+		selected := index == m.Index()
+		// A chevron shows the fold state; the indent (focus cell + chevron) lines the
+		// label up with the item rows' content. When collapsed, append the hidden
+		// count so the header still reports what's tucked away.
+		chevron := "▾"
+		label := h.label
+		if h.collapsed {
+			chevron = "▸"
+			label = fmt.Sprintf("%s · %d", h.label, h.count)
+		}
+		focusCell := " "
+		if selected {
+			focusCell = focusGlyph
+		}
+		text := focusCell + " " + chevron + " " + label + " "
 		fill := d.width - lipgloss.Width(text)
 		if fill < 0 {
 			fill = 0
 		}
+		// The focused header glows in the focus accent so it reads as the cursor's
+		// resting place; otherwise it recedes to muted like the old divider.
+		color := d.th.Muted
+		if selected {
+			color = d.th.Focus
+		}
+		style := lipgloss.NewStyle().Foreground(color).Bold(true)
 		fmt.Fprint(w, style.Render(text+strings.Repeat("─", fill)))
 		return
 	}

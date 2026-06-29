@@ -81,8 +81,9 @@ func (m Model) renderHelp() string {
 		b.WriteString(head("Navigation") + "\n")
 		for _, nav := range [][2]string{
 			{"↑/↓", "move within the list / stack"},
+			{"n/N", "jump to the next/prev OPEN/CLOSED group"},
 			{"←/→ tab", "switch section"},
-			{"enter", "open the selected PR"},
+			{"enter", "open the PR — or fold/unfold an OPEN/CLOSED group"},
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
 			{"r", "refresh"},

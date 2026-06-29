@@ -35,6 +35,20 @@ type section struct {
 	loaded      bool
 	err         error
 	total       int
+
+	// Raw matches kept apart from the list so the OPEN/CLOSED groups can be
+	// re-folded without re-fetching: rebuildRows reassembles list items from these
+	// plus the collapse flags.
+	open            []gh.Item
+	closed          []gh.Item
+	openCollapsed   bool // OPEN group folded (its items hidden under the header)
+	closedCollapsed bool // CLOSED group folded
+}
+
+// rebuildRows reassembles the section's list rows from its stored open/closed
+// matches and current fold state. Called on load and whenever a group is toggled.
+func (s *section) rebuildRows() {
+	s.list.SetItems(sectionRows(s.open, s.closed, s.openCollapsed, s.closedCollapsed))
 }
 
 // appMode selects which screen is active.
@@ -223,32 +237,58 @@ func closedFilter(filter string) string {
 // muted "nothing open" placeholder sits under the OPEN header — so an all-closed
 // section reads as "nothing open + N closed" rather than an unlabeled list that
 // looks miscounted. A lone open group (no closed tail) needs no header.
-func sectionRows(open, closed []gh.Item) []list.Item {
+//
+// The OPEN/CLOSED headers are collapsible: when openCollapsed/closedCollapsed is
+// set the group's items (and the "nothing open" note) are omitted, leaving just
+// the foldable header. The headers are only emitted when a closed tail exists —
+// a lone open group stays a flat, unfoldable list.
+func sectionRows(open, closed []gh.Item, openCollapsed, closedCollapsed bool) []list.Item {
 	rows := make([]list.Item, 0, len(open)+len(closed)+4)
 	labeled := len(closed) > 0
-	if labeled {
-		rows = append(rows, sectionHeader{"OPEN"})
+	if !labeled {
+		for _, it := range open {
+			rows = append(rows, prItem{it})
+		}
+		return rows
+	}
+	rows = append(rows, sectionHeader{label: "OPEN", collapsible: true, collapsed: openCollapsed, count: len(open)})
+	if !openCollapsed {
 		if len(open) == 0 {
 			rows = append(rows, listNote{"nothing open"})
 		}
+		for _, it := range open {
+			rows = append(rows, prItem{it})
+		}
 	}
-	for _, it := range open {
-		rows = append(rows, prItem{it})
-	}
-	if labeled {
-		// A blank spacer sets the closed group apart from the open list.
-		rows = append(rows, sectionHeader{""}, sectionHeader{"CLOSED"})
-	}
-	for _, it := range closed {
-		rows = append(rows, prItem{it})
+	// A blank spacer sets the closed group apart from the open list.
+	rows = append(rows, sectionHeader{}, sectionHeader{label: "CLOSED", collapsible: true, collapsed: closedCollapsed, count: len(closed)})
+	if !closedCollapsed {
+		for _, it := range closed {
+			rows = append(rows, prItem{it})
+		}
 	}
 	return rows
 }
 
-// ensureSelectable nudges the cursor off a divider row onto the nearest
-// selectable item (searching forward, then wrapping). No-op when already on a
-// real item or when the list holds none.
-func ensureSelectable(lst *list.Model) {
+// navigable reports whether the cursor may rest on this row: real items and
+// collapsible group headers (so the user can fold/unfold them with enter), but
+// not the blank spacer or muted notes.
+func navigable(li list.Item) bool {
+	switch h := li.(type) {
+	case prItem:
+		return true
+	case sectionHeader:
+		return h.collapsible
+	}
+	return false
+}
+
+// preferItem rests the cursor on a real PR row whenever there is one, nudging
+// off any header/spacer (scanning forward, then wrapping). Used after (re)loading
+// so the cursor lands on a PR rather than the freshly-arrived OPEN header — even
+// though headers are otherwise navigable. Falls back to ensureSelectable when the
+// list has no PR rows (all groups folded, or empty).
+func preferItem(lst *list.Model) {
 	items := lst.Items()
 	n := len(items)
 	if n == 0 {
@@ -257,9 +297,31 @@ func ensureSelectable(lst *list.Model) {
 	if _, ok := items[lst.Index()].(prItem); ok {
 		return
 	}
-	for i := 1; i <= n; i++ {
+	for i := 0; i < n; i++ {
 		idx := (lst.Index() + i) % n
 		if _, ok := items[idx].(prItem); ok {
+			lst.Select(idx)
+			return
+		}
+	}
+	ensureSelectable(lst)
+}
+
+// ensureSelectable nudges the cursor off a non-navigable row (the blank spacer or
+// a note) onto the nearest navigable row — a real item or a foldable header —
+// searching forward then wrapping. No-op when already navigable or list is empty.
+func ensureSelectable(lst *list.Model) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	if navigable(items[lst.Index()]) {
+		return
+	}
+	for i := 1; i <= n; i++ {
+		idx := (lst.Index() + i) % n
+		if navigable(items[idx]) {
 			lst.Select(idx)
 			return
 		}
@@ -270,16 +332,29 @@ func ensureSelectable(lst *list.Model) {
 // selectable (non-divider) rows, and the total selectable count — so the
 // position counter ignores divider headers.
 func selectablePos(lst *list.Model) (pos, total int) {
-	for i, li := range lst.Items() {
+	items := lst.Items()
+	idx := lst.Index()
+	// total counts PRs only — group headers are not items, so they don't inflate
+	// the count. nextRank is the rank of the first PR at or after the cursor, so a
+	// cursor parked on an OPEN/CLOSED header reads as the start of that group
+	// rather than 0.
+	nextRank := 0
+	for i, li := range items {
 		if _, ok := li.(prItem); !ok {
 			continue
 		}
 		total++
-		if i <= lst.Index() {
-			pos = total
+		if nextRank == 0 && i >= idx {
+			nextRank = total
 		}
 	}
-	return pos, total
+	if total == 0 {
+		return 0, 0
+	}
+	if nextRank == 0 { // cursor sits past the last PR
+		nextRank = total
+	}
+	return nextRank, total
 }
 
 // selectAdjacent moves the cursor to the next selectable item in direction dir
@@ -293,7 +368,27 @@ func selectAdjacent(lst *list.Model, dir int) {
 	cur := lst.Index()
 	for i := 0; i < n; i++ {
 		cur = (cur + dir + n) % n
-		if _, ok := items[cur].(prItem); ok {
+		if navigable(items[cur]) {
+			lst.Select(cur)
+			return
+		}
+	}
+}
+
+// selectAdjacentHeader jumps the cursor straight to the next foldable group
+// header (OPEN/CLOSED) in direction dir, wrapping — so n/N hop between the two
+// group selectors regardless of how many PRs sit between them. A no-op when the
+// list has no headers (a lone open group with no closed tail).
+func selectAdjacentHeader(lst *list.Model, dir int) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	cur := lst.Index()
+	for i := 0; i < n; i++ {
+		cur = (cur + dir + n) % n
+		if h, ok := items[cur].(sectionHeader); ok && h.collapsible {
 			lst.Select(cur)
 			return
 		}
@@ -441,8 +536,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.err = msg.err
 		s.total = msg.total
 		if msg.err == nil {
-			s.list.SetItems(sectionRows(msg.items, msg.closed))
-			ensureSelectable(&s.list)
+			// Keep the raw matches so the OPEN/CLOSED groups can be re-folded
+			// without re-fetching; fold state persists across the reload.
+			s.open = msg.items
+			s.closed = msg.closed
+			s.rebuildRows()
+			preferItem(&s.list)
 			m.rebuildStacks()
 			m.resizeLists() // sidebar visibility may have changed
 		}
@@ -453,12 +552,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "enter":
+			// On a foldable OPEN/CLOSED header, enter collapses/expands the group;
+			// on a PR row it opens the detail screen.
+			if m.toggleSelectedGroup() {
+				return m, nil
+			}
 			return m.openSelected()
 		case "tab", "l", "right":
 			m.active = (m.active + 1) % len(m.sections)
 			return m, nil
 		case "shift+tab", "h", "left":
 			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
+			return m, nil
+		case "n":
+			// Hop straight to the next OPEN/CLOSED group header — quick travel
+			// between the two selectors even with many PRs between them.
+			if len(m.sections) > 0 {
+				selectAdjacentHeader(&m.sections[m.active].list, +1)
+			}
+			return m, nil
+		case "N":
+			if len(m.sections) > 0 {
+				selectAdjacentHeader(&m.sections[m.active].list, -1)
+			}
 			return m, nil
 		case "s":
 			m.showStack = !m.showStack
@@ -528,6 +644,36 @@ func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
 	mode := m.themeMode
 	persist := func() tea.Msg { _ = config.SaveThemeMode(mode); return nil }
 	return m, tea.Batch(tea.ClearScreen, persist)
+}
+
+// toggleSelectedGroup folds or unfolds the OPEN/CLOSED group whose header is
+// highlighted, rebuilding the list in place and keeping the cursor on the header
+// so it can be toggled back. Reports whether a foldable header was acted on (so
+// the caller can fall through to opening a PR when it wasn't). It mutates the
+// active section through the shared slice backing array, so the value receiver is
+// fine — same pattern as the loading/refresh handlers.
+func (m Model) toggleSelectedGroup() bool {
+	if len(m.sections) == 0 {
+		return false
+	}
+	s := &m.sections[m.active]
+	h, ok := s.list.SelectedItem().(sectionHeader)
+	if !ok || !h.collapsible {
+		return false
+	}
+	idx := s.list.Index()
+	switch h.label {
+	case "OPEN":
+		s.openCollapsed = !s.openCollapsed
+	case "CLOSED":
+		s.closedCollapsed = !s.closedCollapsed
+	}
+	s.rebuildRows()
+	// The toggled header keeps its index (only rows below it appear/disappear), so
+	// the cursor stays put; ensureSelectable is a safety net.
+	s.list.Select(idx)
+	ensureSelectable(&s.list)
+	return true
 }
 
 // openSelected opens the highlighted dashboard row in the detail screen, if it
@@ -600,10 +746,11 @@ const stackPaneW = 34
 func (m *Model) rebuildStacks() {
 	seen := map[string]bool{}
 	var refs []stack.PRRef
+	// Iterate the stored matches, not the visible list rows, so folding a group
+	// doesn't drop its PRs from the reconstructed sidebar.
 	for i := range m.sections {
-		for _, li := range m.sections[i].list.Items() {
-			it, ok := li.(prItem)
-			if !ok || !it.IsPR || it.HeadBranch == "" {
+		for _, it := range append(append([]gh.Item{}, m.sections[i].open...), m.sections[i].closed...) {
+			if !it.IsPR || it.HeadBranch == "" {
 				continue
 			}
 			key := fmt.Sprintf("%s#%d", it.Repo, it.Number)
@@ -1005,8 +1152,9 @@ func (m Model) viewFooter() string {
 
 	parts := []string{
 		dim.Render("↑/↓ move"),
+		dim.Render("n/N group"),
 		dim.Render("←/→ section"),
-		dim.Render("enter open"),
+		dim.Render("enter open / fold"),
 		dim.Render("s sidebar"),
 		stackHint,
 		dim.Render("r refresh"),
