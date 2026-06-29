@@ -317,6 +317,162 @@ func TestPostThenExitSyncsBoard(t *testing.T) {
 	}
 }
 
+func TestNotifRowsSplit(t *testing.T) {
+	unread := []gh.Notification{{ThreadID: "1", Title: "a", Unread: true}}
+	read := []gh.Notification{{ThreadID: "2", Title: "b"}, {ThreadID: "3", Title: "c"}}
+	rows := notifRows(unread, read, map[string]bool{})
+	// UNREAD header + item, spacer + READ header + 2 items = 6 rows.
+	if len(rows) != 6 {
+		t.Fatalf("want 6 rows, got %d: %#v", len(rows), rows)
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "UNREAD" || h.count != 1 {
+		t.Errorf("row 0 should be UNREAD header (count 1), got %#v", rows[0])
+	}
+	if h, ok := rows[3].(sectionHeader); !ok || h.label != "READ" || h.count != 2 {
+		t.Errorf("row 3 should be READ header (count 2), got %#v", rows[3])
+	}
+	// An empty side still shows its header plus a muted note.
+	rows = notifRows(nil, read, map[string]bool{})
+	if _, ok := rows[1].(listNote); !ok {
+		t.Errorf("empty UNREAD should show a note, got %#v", rows[1])
+	}
+}
+
+func TestMarkSelectedReadMovesRow(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "Notifications", Type: config.SectionNotifications}}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = drive(m, notifFeedMsg{idx: 0,
+		unread: []gh.Notification{{ThreadID: "1", Title: "unread one", Unread: true, Type: "PullRequest", Number: 7, Repo: "o/r"}},
+		read:   []gh.Notification{{ThreadID: "2", Title: "read one", Type: "PullRequest"}},
+	})
+	// Cursor should land on the unread item; mark it read.
+	if n, ok := m.selectedNotif(); !ok || n.ThreadID != "1" {
+		t.Fatalf("cursor should rest on the unread item, got %#v ok=%v", n, ok)
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if len(m.sections[0].notifUnread) != 0 {
+		t.Errorf("unread list should be empty after marking read, got %d", len(m.sections[0].notifUnread))
+	}
+	if len(m.sections[0].notifRead) != 2 {
+		t.Errorf("read list should now hold 2, got %d", len(m.sections[0].notifRead))
+	}
+	// The freshly-read one goes to the top of READ.
+	if m.sections[0].notifRead[0].ThreadID != "1" || m.sections[0].notifRead[0].Unread {
+		t.Errorf("freshly-read item should be first and not unread, got %#v", m.sections[0].notifRead[0])
+	}
+}
+
+func TestNotifPreviewFocus(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "Notifications", Type: config.SectionNotifications}}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = drive(m, notifFeedMsg{idx: 0,
+		read: []gh.Notification{{ThreadID: "1", Title: "a", Type: "PullRequest", Number: 7, Repo: "o/r"}},
+	})
+	if _, ok := m.selectedNotif(); !ok {
+		t.Fatal("expected a PR notification selected")
+	}
+	// enter focuses the preview; esc returns to the list.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.notifPrev.focused {
+		t.Fatal("enter should focus the preview")
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.notifPrev.focused {
+		t.Fatal("esc should return focus to the list")
+	}
+	// right opens (focuses) the preview; right again hides it.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
+	if !m.notifPrev.focused {
+		t.Fatal("right should focus the preview")
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
+	if m.notifPrev.focused {
+		t.Fatal("right again should hide the preview")
+	}
+}
+
+func TestRenderNotifConversationNoPanic(t *testing.T) {
+	m := New(config.Config{})
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	// Empty detail → the "no conversation yet" path; a populated one → real render.
+	if got := renderNotifConversation(gh.PRDetail{}, 60, m.th); got == "" {
+		t.Error("empty conversation should still render a placeholder line")
+	}
+	d := gh.PRDetail{
+		Author: "octocat", Body: "Fixes the thing. cc @dotnetemmanuel",
+		Comments: []gh.Comment{{Author: "someone", Body: "looks good @octocat", CreatedAt: time.Now()}},
+	}
+	_ = renderNotifConversation(d, 60, m.th) // must not panic
+}
+
+func TestEnterHintContext(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "Notifications", Type: config.SectionNotifications}}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = drive(m, notifFeedMsg{idx: 0,
+		unread: []gh.Notification{{ThreadID: "1", Title: "a", Unread: true, Type: "PullRequest", Number: 7, Repo: "o/r"}},
+	})
+	// List-focused on a PR notification: enter reads (focuses the preview).
+	if got := m.enterHint(); got != "read" {
+		t.Errorf("on a PR notification (list) want %q, got %q", "read", got)
+	}
+	// Once the preview is focused, enter opens the full detail.
+	m.notifPrev.focused = true
+	if got := m.enterHint(); got != "open PR" {
+		t.Errorf("preview-focused want %q, got %q", "open PR", got)
+	}
+	m.notifPrev.focused = false
+	// Up onto the UNREAD header → the hint becomes fold/unfold.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if _, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok {
+		t.Fatalf("expected cursor on a header, got %#v", m.sections[0].list.SelectedItem())
+	}
+	if got := m.enterHint(); got != "fold / unfold" {
+		t.Errorf("on a header want %q, got %q", "fold / unfold", got)
+	}
+}
+
+func TestSelectedAsItemFromNotif(t *testing.T) {
+	pr := selectedAsItem(notifItem{gh.Notification{Type: "PullRequest", Repo: "o/r", Number: 9, Title: "t"}})
+	if !pr.IsPR || pr.Number != 9 || pr.Repo != "o/r" {
+		t.Errorf("PR notification should map to a PR item, got %#v", pr)
+	}
+	issue := selectedAsItem(notifItem{gh.Notification{Type: "Issue", Repo: "o/r", Number: 3}})
+	if issue.IsPR {
+		t.Errorf("issue notification should not map to a PR item, got %#v", issue)
+	}
+}
+
+func TestNotifInboxRenders(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{
+		{Title: "My PRs", Filter: "a"},
+		{Title: "Notifications", Type: config.SectionNotifications},
+	}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = drive(m, notifFeedMsg{idx: 1,
+		unread: []gh.Notification{{ThreadID: "1", Title: "review me", Unread: true, Reason: "review_requested", Type: "PullRequest", Repo: "o/r", Number: 7}},
+		read:   nil,
+	})
+	// Switch to the inbox and render — must not panic and must show the panes.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	view := m.View()
+	for _, want := range []string{"UNREAD", "review me", "review"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("inbox view missing %q\n---\n%s", want, view)
+		}
+	}
+	// The footer shows the inbox glyph legend (TYPE/WHY), not the PR one.
+	if !strings.Contains(view, "TYPE") || !strings.Contains(view, "WHY") {
+		t.Errorf("inbox footer should show the TYPE/WHY glyph legend\n---\n%s", view)
+	}
+	if strings.Contains(view, "CHECKS") {
+		t.Errorf("inbox footer should not show the PR CHECKS legend\n---\n%s", view)
+	}
+}
+
 func TestOrgGroups(t *testing.T) {
 	orgs := []string{"Mindful-Stack", "Veygr-watch"}
 	items := []gh.Item{

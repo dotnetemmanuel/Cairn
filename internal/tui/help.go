@@ -84,6 +84,8 @@ func (m Model) renderHelp() string {
 			{"n/N", "jump to the next/prev OPEN/CLOSED group"},
 			{"←/→ tab", "switch section"},
 			{"enter", "open the PR — or fold/unfold an OPEN/CLOSED group"},
+			{"→ / enter", "Notifications: focus the conversation preview (↑/↓ scroll, ← / esc back)"},
+			{"x", "mark notification read (Notifications inbox)"},
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
 			{"r", "sync all tabs (re-run every query)"},

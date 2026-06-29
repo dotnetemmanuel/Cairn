@@ -18,6 +18,13 @@ type prItem struct{ gh.Item }
 
 func (i prItem) FilterValue() string { return i.Title }
 
+// notifItem adapts a gh.Notification to the list, for the Notifications inbox. It
+// renders differently from prItem (a type glyph + reason tag rather than PR
+// columns) and drives the preview pane via the selected row.
+type notifItem struct{ gh.Notification }
+
+func (i notifItem) FilterValue() string { return i.Title }
+
 // sectionHeader is a divider row that labels the group of items that follows it
 // (e.g. "OPEN", "CLOSED"). A collapsible header is navigable — the cursor can
 // rest on it and enter folds/unfolds the group; count is the number of items in
@@ -138,6 +145,10 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		fmt.Fprint(w, lipgloss.NewStyle().Foreground(d.th.Muted).Render("  "+n.text))
 		return
 	}
+	if n, ok := listItem.(notifItem); ok {
+		d.renderNotif(w, n.Notification, index == m.Index())
+		return
+	}
 	it, ok := listItem.(prItem)
 	if !ok {
 		return
@@ -210,6 +221,152 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 
 	row := strings.Join([]string{focusCell, ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
 	fmt.Fprint(w, row)
+}
+
+// notifReasonW is the fixed width of the reason tag column in a notification row,
+// so titles line up regardless of reason length.
+const notifReasonW = 9
+
+// renderNotif draws one inbox row: focus cursor, a type glyph (colored), the
+// reason tag, the title, and the relative age. A selected row gets the full-bleed
+// focus bar; an unselected read row recedes to muted (its own header already says
+// READ), while unread rows keep their title bright.
+func (d itemDelegate) renderNotif(w io.Writer, n gh.Notification, selected bool) {
+	focusCell := " "
+	if selected {
+		focusCell = focusGlyph
+	}
+	typeG := notifGlyph(n.Type)
+	rGlyph := reasonGlyph(n.Reason)
+	// Reason cell: an illustrating glyph + the short label, padded so titles align.
+	reasonLabelTxt := pad(truncate(reasonLabel(n.Reason), notifReasonW-2), notifReasonW-2)
+	upd := pad(relTime(n.UpdatedAt), colUpdW)
+
+	// Title takes whatever's left after the fixed cells (focus, type glyph, reason
+	// glyph + label, age) and their separators.
+	titleW := d.width - (focusW + 2 + 2 + notifReasonW + colUpdW + 3)
+	if titleW < 8 {
+		titleW = 8
+	}
+	title := pad(truncate(n.Title, titleW), titleW)
+
+	if selected {
+		reason := rGlyph + " " + reasonLabelTxt
+		plain := strings.Join([]string{typeG, reason, title, upd}, " ")
+		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+plain))
+		return
+	}
+
+	typeStyled := lipgloss.NewStyle().Foreground(notifColor(d.th, n.Type)).Render(typeG)
+	rc := lipgloss.NewStyle().Foreground(reasonColor(d.th, n.Reason))
+	reasonStyled := rc.Render(rGlyph + " " + reasonLabelTxt)
+	titleColor := d.th.Text
+	if !n.Unread {
+		titleColor = d.th.Muted // read rows recede
+	}
+	titleStyled := lipgloss.NewStyle().Foreground(titleColor).Render(title)
+	updStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(upd)
+	fmt.Fprint(w, strings.Join([]string{focusCell, typeStyled, reasonStyled, titleStyled, updStyled}, " "))
+}
+
+// reasonGlyph maps a notification reason to a small FontAwesome icon that
+// illustrates why you got it — like GitHub's inbox. FontAwesome range (same Nerd
+// Font family as the stack sidebar icons); written as \u escapes because the raw
+// PUA glyphs don't survive editing.
+func reasonGlyph(reason string) string {
+	switch reason {
+	case "review_requested":
+		return "" // eye
+	case "mention":
+		return "" // at
+	case "team_mention":
+		return "" // users
+	case "assign":
+		return "" // user
+	case "comment":
+		return "" // comment
+	case "author":
+		return "" // pencil
+	case "ci_activity":
+		return "" // gear
+	case "state_change":
+		return "" // exchange
+	case "subscribed":
+		return "" // bell
+	default:
+		return "" // bell-o
+	}
+}
+
+// notifGlyph maps a notification subject type to a GitHub-style Nerd Font
+// octicon. Unknown types fall back to a bell.
+func notifGlyph(typ string) string {
+	switch typ {
+	case "PullRequest":
+		return "" // code-fork
+	case "Issue":
+		return "" // dot-circle-o
+	case "Release":
+		return "" // tag
+	case "Discussion":
+		return "" // comments
+	case "Commit":
+		return "" // circle
+	case "CheckSuite":
+		return "" // check
+	default:
+		return "" // bell
+	}
+}
+
+// notifColor tints the type glyph: PRs/Issues in info, the rest muted.
+func notifColor(th theme.Theme, typ string) lipgloss.Color {
+	switch typ {
+	case "PullRequest", "Issue":
+		return th.Info
+	default:
+		return th.Muted
+	}
+}
+
+// reasonLabel shortens a GitHub notification reason to a compact tag.
+func reasonLabel(reason string) string {
+	switch reason {
+	case "review_requested":
+		return "review"
+	case "mention":
+		return "mention"
+	case "assign":
+		return "assigned"
+	case "comment":
+		return "comment"
+	case "author":
+		return "author"
+	case "team_mention":
+		return "team"
+	case "ci_activity":
+		return "ci"
+	case "state_change":
+		return "state"
+	case "subscribed":
+		return "watching"
+	default:
+		return reason
+	}
+}
+
+// reasonColor ranks reasons by how much they want you: a review request is your
+// cue to act (focus), a mention/assignment is a nudge (warning), the rest are
+// ambient (muted).
+func reasonColor(th theme.Theme, reason string) lipgloss.Color {
+	switch reason {
+	case "review_requested":
+		return th.Focus
+	case "mention", "team_mention", "assign":
+		return th.Warning
+	default:
+		return th.Muted
+	}
 }
 
 // styleTitle colors the unfocused-row title cell. The title recedes to muted —
