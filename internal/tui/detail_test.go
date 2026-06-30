@@ -297,10 +297,10 @@ func TestSuggestPrefillsBlock(t *testing.T) {
 	m = driveDetail(m,
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
-		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")},
 	)
 	if m.state != stateLineComment {
-		t.Fatalf("expected stateLineComment after s, got %d", m.state)
+		t.Fatalf("expected stateLineComment after S, got %d", m.state)
 	}
 	val := m.composer.Value()
 	if !strings.Contains(val, "```suggestion") || !strings.Contains(val, "added1") {
@@ -564,5 +564,38 @@ func TestCopyLinkResolvesCommentPermalink(t *testing.T) {
 	f.url = prURL
 	if url, kind := f.linkForSelection(); url != prURL || kind != "PR" {
 		t.Errorf("fallback: linkForSelection = %q/%q, want %q/PR", url, kind, prURL)
+	}
+}
+
+func TestFilesPaneToggle(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	if f, _, _ := m.paneWidths(); f == 0 {
+		t.Fatal("files pane should be shown by default")
+	}
+	// s hides it; the diff gets that width and focus leaves the files pane.
+	m.focus = focusFiles
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if f, _, _ := m.paneWidths(); f != 0 {
+		t.Errorf("files pane should be hidden after s, got width %d", f)
+	}
+	if m.focus == focusFiles {
+		t.Error("focus should move off the hidden files pane")
+	}
+	if m.nextFocus(1) == focusFiles {
+		t.Error("tab must not cycle into the hidden files pane")
+	}
+	// s again restores it.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if f, _, _ := m.paneWidths(); f == 0 {
+		t.Error("files pane should be shown again after a second s")
+	}
+}
+
+func TestHunkNavFocusesDiff(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m.focus = focusFiles // start on the files pane
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if m.focus != focusDiff {
+		t.Error("n (next change) should move focus to the diff so ↑/↓ walk diff lines, not files")
 	}
 }

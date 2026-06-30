@@ -466,3 +466,26 @@ func TestTreeShowsPRNumberFlag(t *testing.T) {
 		t.Errorf("tree should flag feat-base with its PR number; got:\n%s", out)
 	}
 }
+
+func TestTreeWidthFitsLongBranchAndClamps(t *testing.T) {
+	s := fixtureModel()
+	s.width = 200 // plenty of room
+	if w := s.treeWidth(); w != stackPaneW {
+		t.Errorf("short branch names should give the floor %d, got %d", stackPaneW, w)
+	}
+	// A long branch name grows the pane past the floor.
+	lin := stack.Lineage{
+		Trunk:     "main",
+		Parents:   map[string]string{"feat/session-auth-consolidation-rollout": "main"},
+		Perennial: map[string]bool{},
+	}
+	s.tree = stack.BuildTree(lin, "main", func(_, _ string) bool { return false })
+	if w := s.treeWidth(); w <= stackPaneW {
+		t.Errorf("a long branch should widen the pane beyond %d, got %d", stackPaneW, w)
+	}
+	// On a tiny terminal it can't exceed the floor (the View clamps the right pane).
+	s.width = 30
+	if w := s.treeWidth(); w != stackPaneW {
+		t.Errorf("tiny terminal should clamp to the floor %d, got %d", stackPaneW, w)
+	}
+}

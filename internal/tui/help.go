@@ -7,10 +7,71 @@ import (
 	"github.com/dotnetemmanuel/cairn/internal/townie"
 )
 
-// renderHelp draws the help overlay: a pedagogical guide to the stack commands
-// (for people new to git-town) plus the general navigation keys. It is rendered
-// centered over the current screen.
+// helpMaxW caps the help overlay's width at a comfortable reading measure even on
+// very wide monitors.
+const helpMaxW = 100
+
+// helpBoxWidth returns the overlay's box width: it grows with the terminal up to
+// helpMaxW, so the component is wide where there's room (fewer wrapped lines) and
+// shrinks gracefully on a narrow screen.
+func helpBoxWidth(termW int) int {
+	w := termW - 8
+	if w > helpMaxW {
+		w = helpMaxW
+	}
+	if w < 34 {
+		w = 34
+	}
+	return w
+}
+
+// openHelp builds the help content for the current mode and loads it into a
+// viewport sized to fit the terminal — so a long guide (e.g. the full stack
+// command reference) scrolls instead of bleeding off the top and bottom.
+func (m *Model) openHelp() {
+	inner := helpBoxWidth(m.width) - 4 // minus the box's 2-col padding each side
+	body := m.helpBody(inner)
+	vp := newVP() // arrows + j/k scroll
+	vp.Width = inner
+	maxH := m.height - 5 // border (2) + padding (2) + the hint line (1)
+	if maxH < 3 {
+		maxH = 3
+	}
+	if h := lipgloss.Height(body); h < maxH {
+		vp.Height = h
+	} else {
+		vp.Height = maxH
+	}
+	vp.SetContent(body)
+	m.helpVP = vp
+}
+
+// renderHelp draws the help overlay box around the scrollable content, centered
+// over the current screen. The body itself is built by helpBody and lives in
+// m.helpVP (sized by openHelp), so it can never exceed the terminal height.
 func (m Model) renderHelp() string {
+	w := helpBoxWidth(m.width)
+	hint := "? or esc to close"
+	if m.helpVP.TotalLineCount() > m.helpVP.Height {
+		hint = "↑/↓ scroll · " + hint
+	}
+	inner := lipgloss.JoinVertical(lipgloss.Left, m.helpVP.View(),
+		lipgloss.NewStyle().Foreground(m.th.Muted).Render(hint))
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.th.Focus).
+		Background(m.th.Base).
+		Padding(1, 2).
+		Width(w).
+		Render(inner)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// helpBody builds the overlay's inner text (no border), wrapped to inner columns.
+// It is a pedagogical guide to the stack commands (for people new to git-town)
+// plus the general navigation keys, mode-aware so it only lists keys that act in
+// the screen the help was opened from.
+func (m Model) helpBody(inner int) string {
 	th := m.th
 	head := func(s string) string {
 		return lipgloss.NewStyle().Foreground(th.Focus).Bold(true).Render(s)
@@ -19,16 +80,6 @@ func (m Model) renderHelp() string {
 		return lipgloss.NewStyle().Foreground(th.Primary).Bold(true).Render(s)
 	}
 	dim := func(s string) string { return lipgloss.NewStyle().Foreground(th.Muted).Render(s) }
-
-	// Box width, bounded by the terminal; inner = box minus 2-col padding.
-	w := 60
-	if m.width-8 < w {
-		w = m.width - 8
-	}
-	if w < 34 {
-		w = 34
-	}
-	inner := w - 4
 
 	indentWrap := func(s, indent string) string {
 		return indent + wrapPlain(s, inner-len(indent), indent)
@@ -100,17 +151,7 @@ func (m Model) renderHelp() string {
 				"current repo. Its own ? lists the stack commands (new, insert, sync, "+
 				"restack, amend).", inner, "")) + "\n")
 	}
-	b.WriteString("\n" + dim("? or esc to close"))
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(th.Focus).
-		Background(th.Base).
-		Padding(1, 2).
-		Width(w).
-		Render(strings.TrimRight(b.String(), "\n"))
-
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // wrapPlain word-wraps s to width, prefixing every line after the first with

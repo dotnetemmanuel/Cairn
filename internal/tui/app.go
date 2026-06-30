@@ -122,6 +122,7 @@ type Model struct {
 	localRepo  string // owner/name of the cwd repo, "" if none
 	showStack  bool
 	showHelp   bool
+	helpVP     viewport.Model // scrollable body of the help overlay
 
 	spinner spinner.Model
 
@@ -705,6 +706,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeLists()
+		if m.showHelp {
+			m.openHelp() // re-flow the overlay to the new size
+		}
 		if m.mode == modeDetail {
 			var cmd tea.Cmd
 			m.detail, cmd = m.detail.Update(msg) // keep the detail screen sized
@@ -778,8 +782,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "?", "esc", "q":
 				m.showHelp = false
+				return m, nil
 			}
-			return m, nil
+			// Anything else scrolls the (possibly taller-than-screen) help body.
+			var cmd tea.Cmd
+			m.helpVP, cmd = m.helpVP.Update(msg)
+			return m, cmd
 		}
 		// Open help on ? — unless a text field is capturing input, where ? is a
 		// literal character.
@@ -788,6 +796,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			(m.mode == modeConflict && m.conflict.capturing())
 		if msg.String() == "?" && !capturing {
 			m.showHelp = true
+			m.openHelp() // build + size the scrollable help body for this mode/terminal
 			return m, nil
 		}
 		// Theme toggle is global — flip light/dark from any screen. ctrl+t is a
@@ -987,6 +996,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "s":
+			// The stack sidebar is a PR-list-tab feature; on the Notifications inbox
+			// it has nowhere to render, so s is a no-op there.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+				return m, nil
+			}
 			m.showStack = !m.showStack
 			m.resizeLists()
 			return m, nil
@@ -1168,14 +1182,15 @@ func (m *Model) resizeLists() {
 	}
 	bw := bodyWidth(m.width)
 	listW := bw
-	listH := bodyH - colHeaderH // the column-label row sits above the list
 	if m.sidebarVisible() {
 		listW = bw - stackPaneW - 1 // sidebar + vertical separator
 		if listW < 20 {
 			listW = 20
 		}
-		listH = bodyH - 2 - colHeaderH // the list pane also gains a title + rule
 	}
+	// The list pane always carries a section title + rule (the "Orgs ▴ 1/10 ▾"
+	// subheader) above the column-label row, sidebar or not.
+	listH := bodyH - 2 - colHeaderH
 	if listH < 1 {
 		listH = 1
 	}
@@ -1215,8 +1230,11 @@ func (m *Model) resizeLists() {
 	}
 }
 
-// stackPaneW is the fixed width of the stack sidebar.
-const stackPaneW = 34
+// stackPaneW is the base width of the stack sidebar (dashboard) and the floor for
+// the stack-mode tree, which grows past it to fit long branch names. A compact
+// default that keeps room for the main content; toggle the dashboard sidebar off
+// with `s` on a narrow monitor.
+const stackPaneW = 36
 
 // notifListW is the fixed width of the inbox's left (list) pane; the preview pane
 // takes the remaining body width.
@@ -1470,10 +1488,13 @@ func (m Model) viewBody() string {
 	}
 
 	sidebar := m.sidebarVisible()
-	listW, listH := bw, bodyH-colHeaderH
+	listW := bw
 	if sidebar {
 		listW = bw - stackPaneW - 1
-		listH = bodyH - 2 - colHeaderH
+	}
+	listH := bodyH - 2 - colHeaderH // section title + rule always sit above the list
+	if listH < 1 {
+		listH = 1
 	}
 
 	s := m.sections[m.active]
@@ -1493,22 +1514,20 @@ func (m Model) viewBody() string {
 	default:
 		listBody = s.list.View()
 	}
-	body := lipgloss.JoinVertical(lipgloss.Left, colHead, listBody)
-
-	if !sidebar {
-		return body
-	}
-
-	// The list is the focused pane: a blue title (with a position counter so
-	// it's obvious you're moving the PR list, not the stack) over a blue rule.
+	// The section subheader (a blue title with a position counter so it's obvious
+	// you're moving the PR list, not the stack) over a blue rule — always shown,
+	// whether or not the stack sidebar is open.
 	label := s.title
 	if pos, n := selectablePos(&s.list); n > 0 {
 		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
 	}
 	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
 	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
-	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, body)
+	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, colHead, listBody)
 
+	if !sidebar {
+		return listPane
+	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, m.renderStackSidebar(stackPaneW, bodyH), stackVBar(m.th, bodyH), listPane)
 }
 
@@ -1664,13 +1683,19 @@ func (m Model) viewFooter() string {
 			dim.Render("n/N group"),
 			dim.Render("←/→ section"),
 			dim.Render("enter " + m.enterHint()),
-			dim.Render("s sidebar"),
+		}
+		// The stack sidebar is a PR-list-tab feature; it has no place on the
+		// Notifications inbox, so don't advertise s there.
+		if !(len(m.sections) > 0 && m.sections[m.active].isNotif()) {
+			parts = append(parts, dim.Render("s sidebar"))
+		}
+		parts = append(parts,
 			stackHint,
 			dim.Render("r sync all"),
 			themeFooterHint(m.th),
 			dim.Render("? help"),
 			dim.Render("q quit"),
-		}
+		)
 	}
 	keys := strings.Join(parts, sep)
 

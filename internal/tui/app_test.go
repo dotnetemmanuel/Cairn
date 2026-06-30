@@ -646,3 +646,40 @@ func TestEnterStackModeFromDashboard(t *testing.T) {
 		t.Errorf("esc should return to the dashboard, got mode %d", m.mode)
 	}
 }
+
+func TestHelpOverlayFitsTerminal(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "is:open"}}}
+	m := New(cfg)
+	// A short terminal where stack mode's full command reference can't fit at once.
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 24})
+	m.mode = modeStack
+	m.openHelp()
+	if got := m.helpVP.Height; got > 24-5 {
+		t.Errorf("help body height %d should be clamped to the terminal (<= %d)", got, 24-5)
+	}
+	if m.helpVP.TotalLineCount() <= m.helpVP.Height {
+		t.Error("stack help should overflow on a short terminal (so it must scroll)")
+	}
+	// The rendered overlay must not be taller than the terminal.
+	if h := strings.Count(m.renderHelp(), "\n") + 1; h > 24 {
+		t.Errorf("rendered help height %d exceeds terminal height 24", h)
+	}
+}
+
+func TestSubheaderShowsWithoutSidebar(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "Orgs", Filter: "is:open"}}}
+	m := New(cfg)
+	items := []gh.Item{{IsPR: true, Repo: "o/r", Number: 1, Title: "x", Author: "a", UpdatedAt: time.Now()}}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 120, Height: 30},
+		viewerMsg{v: gh.Viewer{Login: "me"}},
+		sectionLoadedMsg{idx: 0, items: items, total: 10},
+	)
+	if m.sidebarVisible() {
+		t.Skip("test assumes no stack sidebar (no stacks loaded)")
+	}
+	// The section subheader ("Orgs ▴ x/y ▾") must render even with the sidebar off.
+	if v := m.View(); !strings.Contains(v, "Orgs  ▴") {
+		t.Errorf("expected the section subheader without a sidebar; got:\n%s", v)
+	}
+}

@@ -857,7 +857,7 @@ func (s stackModel) View(spinnerFrame, header string) string {
 		// preview on the right — the tree isn't needed while you write.
 		body = indentBody(s.renderCompose(bodyWidth(s.width), bodyH))
 	} else {
-		treeW := stackPaneW
+		treeW := s.treeWidth()
 		rightW := bodyWidth(s.width) - treeW - 1
 		if rightW < 20 {
 			rightW = 20
@@ -869,6 +869,36 @@ func (s stackModel) View(spinnerFrame, header string) string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, statusline, body, s.viewFooter(spinnerFrame))
+}
+
+// treeWidth sizes the local-stack pane to fit its longest row (depth indent +
+// branch name + PR #flag + drift mark), so long branch names aren't truncated.
+// It's clamped between the sidebar floor (stackPaneW) and ~half the body, so the
+// action pane keeps room on narrow terminals.
+func (s stackModel) treeWidth() int {
+	w := stackPaneW
+	if s.tree != nil {
+		for _, n := range s.tree.Order {
+			need := 2 + 2*n.Depth + lipgloss.Width(n.Name) + 1 // marker + indent + name + slack
+			if num := s.prNums[n.Name]; num > 0 {
+				need += len(fmt.Sprintf(" #%d", num))
+			}
+			if n.Drifted {
+				need += 2
+			}
+			if need > w {
+				w = need
+			}
+		}
+	}
+	maxW := bodyWidth(s.width) / 2 // keep at least half the body for the action pane
+	if maxW < stackPaneW {
+		maxW = stackPaneW // tiny terminals: hold the floor (View clamps the right pane)
+	}
+	if w > maxW {
+		w = maxW
+	}
+	return w
 }
 
 // renderLocalTree draws the cwd repo's git-town stack with the CURRENT branch

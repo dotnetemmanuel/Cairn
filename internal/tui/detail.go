@@ -70,10 +70,11 @@ type detailModel struct {
 	detail     gh.PRDetail
 	files      []gh.FileDiff
 
-	page     detailPage
-	selected int // index into files
-	focus    focusPane
-	showInfo bool
+	page      detailPage
+	selected  int // index into files
+	focus     focusPane
+	showInfo  bool
+	showFiles bool // the left files pane (toggle with f to give the diff full width)
 
 	diffVP     viewport.Model
 	infoVP     viewport.Model
@@ -125,18 +126,19 @@ func newDetail(th theme.Theme, it gh.Item) detailModel {
 	// &FocusedStyle pointer.
 	styleComposer(&ta, th)
 	return detailModel{
-		th:       th,
-		owner:    owner,
-		repo:     repo,
-		number:   it.Number,
-		url:      it.URL,
-		title:    it.Title,
-		loading:  true,
-		showInfo: true,
-		composer: ta,
-		diffVP:   newVP(),
-		infoVP:   newVP(),
-		convVP:   newVP(),
+		th:        th,
+		owner:     owner,
+		repo:      repo,
+		number:    it.Number,
+		url:       it.URL,
+		title:     it.Title,
+		loading:   true,
+		showInfo:  true,
+		showFiles: true,
+		composer:  ta,
+		diffVP:    newVP(),
+		infoVP:    newVP(),
+		convVP:    newVP(),
 	}
 }
 
@@ -373,6 +375,17 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		}
 		m.refreshDiff()
 		return m, nil
+	case "s":
+		// Toggle the files sidebar to give the diff the full width (handy on narrow
+		// screens) — same key as the dashboard's sidebar toggle. Move focus off it
+		// when hiding so you can't tab into nothing.
+		m.showFiles = !m.showFiles
+		if !m.showFiles && m.focus == focusFiles {
+			m.focus = focusDiff
+		}
+		m.relayout()
+		m.refreshDiff()
+		return m, nil
 	case "o":
 		return m, openBrowser(m.url)
 	case "y":
@@ -392,9 +405,11 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		m.composer.Placeholder = "Write a comment (GitHub-flavored Markdown)…"
 		m.composer.Focus()
 		return m, textarea.Blink
-	case "s":
+	case "S":
 		// Suggest a change on the cursor line: a comment pre-filled with a
 		// GitHub ```suggestion block seeded from the line's current content.
+		// (Moved off s, which now toggles the files sidebar — consistent with the
+		// dashboard's s.)
 		if m.page == pageDiff && m.focus == focusDiff {
 			return m.startLineComment("suggest")
 		}
@@ -432,6 +447,9 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.moveConvThread(1)
 			return m, nil
 		}
+		// Jumping between changes implies you're reading the diff — focus it so the
+		// very next ↑/↓ walks diff lines instead of switching files.
+		m.focus = focusDiff
 		m.gotoHunk(1)
 		return m, nil
 	case "N":
@@ -439,6 +457,7 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.moveConvThread(-1)
 			return m, nil
 		}
+		m.focus = focusDiff
 		m.gotoHunk(-1)
 		return m, nil
 	}
@@ -489,7 +508,10 @@ func (m *detailModel) infoVisible() bool {
 }
 
 func (m *detailModel) nextFocus(dir int) focusPane {
-	order := []focusPane{focusFiles, focusDiff}
+	order := []focusPane{focusDiff}
+	if m.showFiles {
+		order = []focusPane{focusFiles, focusDiff}
+	}
 	if m.infoVisible() {
 		order = append(order, focusInfo)
 	}
@@ -787,12 +809,15 @@ func (m detailModel) bottomReserve() int {
 func (m *detailModel) paneWidths() (files, diff, info int) {
 	// Lay out within the indented body width so header/footer bars stay flush.
 	w := bodyWidth(m.width)
-	files = 30
-	if files > w/3 {
-		files = w / 3
-	}
-	if files < 16 {
-		files = 16
+	files = 0
+	if m.showFiles {
+		files = 36
+		if files > w/3 {
+			files = w / 3
+		}
+		if files < 16 {
+			files = 16
+		}
 	}
 	info = 0
 	if m.showInfo && w >= 100 {
@@ -801,11 +826,15 @@ func (m *detailModel) paneWidths() (files, diff, info int) {
 			info = w * 2 / 5
 		}
 	}
-	gaps := 1
-	if info > 0 {
-		gaps = 2
+	// One separator between each visible pane (diff is always shown).
+	panes := 1
+	if files > 0 {
+		panes++
 	}
-	diff = w - files - info - gaps
+	if info > 0 {
+		panes++
+	}
+	diff = w - files - info - (panes - 1)
 	if diff < 10 {
 		diff = 10
 	}
@@ -1379,7 +1408,6 @@ func (m detailModel) viewBody() string {
 	}
 	filesW, _, infoW := m.paneWidths()
 
-	filePane := m.paneBox("Files", m.renderFileList(filesW, bodyH-2), filesW, bodyH, m.focus == focusFiles)
 	diffTitle := "Diff"
 	if len(m.files) > 0 {
 		diffTitle = "Diff · " + shortPath(m.files[m.selected].Filename, m.diffVP.Width-8)
@@ -1389,7 +1417,11 @@ func (m detailModel) viewBody() string {
 	}
 	diffPane := m.paneBox(diffTitle, m.diffVP.View(), m.diffVP.Width, bodyH, m.focus == focusDiff)
 
-	panes := []string{filePane, diffPane}
+	var panes []string
+	if filesW > 0 {
+		panes = append(panes, m.paneBox("Files", m.renderFileList(filesW, bodyH-2), filesW, bodyH, m.focus == focusFiles))
+	}
+	panes = append(panes, diffPane)
 	if infoW > 0 {
 		infoTitle := "Conversation · Checks"
 		if len(m.lineComments()) > 0 {
@@ -1617,10 +1649,10 @@ func (m detailModel) viewFooter() string {
 		if len(m.lineComments()) > 0 {
 			rk = " · r reply · y copy link"
 		}
-		help = "↑/↓ line · n/N change · c comment line · s suggest" + rk +
-			" · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
+		help = "↑/↓ line · n/N change · c comment line · S suggest" + rk +
+			" · s/i files/panel · ←/→ focus · v conversation · a approve · o open · esc back"
 	default:
-		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
+		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · s/i files/panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
 	}
 	return surfaceBar(m.th, m.width,
 		lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
