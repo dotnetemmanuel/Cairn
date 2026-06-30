@@ -995,9 +995,11 @@ func (s stackModel) renderActions(w int) string {
 		labelStyle := lipgloss.NewStyle().Foreground(s.th.Text).Bold(true)
 		shortStyle := lipgloss.NewStyle().Foreground(s.th.Muted)
 		if !on {
-			key = lipgloss.NewStyle().Foreground(s.th.Overlay).Render(c.Key)
-			labelStyle = lipgloss.NewStyle().Foreground(s.th.Overlay)
-			shortStyle = lipgloss.NewStyle().Foreground(s.th.Overlay)
+			// Disabled rows: use Muted (inactive TEXT), not Overlay (divider color),
+			// which was too faint to read in both light and dark.
+			key = lipgloss.NewStyle().Foreground(s.th.Muted).Render(c.Key)
+			labelStyle = lipgloss.NewStyle().Foreground(s.th.Muted)
+			shortStyle = lipgloss.NewStyle().Foreground(s.th.Muted)
 		}
 		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), shortStyle.Render(short))
 		if i == s.cursor && s.focus == focusActions {
@@ -1131,19 +1133,23 @@ func styleComposer(ta *textarea.Model, th theme.Theme) {
 
 	ta.FocusedStyle.Base = text
 	ta.FocusedStyle.Text = text
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(th.Surface).Foreground(th.Text)
+	ta.FocusedStyle.CursorLine = text // no current-line highlight band — plain text
 	ta.FocusedStyle.Placeholder = muted
 	ta.FocusedStyle.Prompt = muted
 	ta.FocusedStyle.EndOfBuffer = eob
 
 	ta.BlurredStyle.Base = text
 	ta.BlurredStyle.Text = text
-	ta.BlurredStyle.CursorLine = text // no highlight band when the body isn't focused
+	ta.BlurredStyle.CursorLine = text
 	ta.BlurredStyle.Placeholder = muted
 	ta.BlurredStyle.Prompt = muted
 	ta.BlurredStyle.EndOfBuffer = eob
 
-	ta.Cursor.Style = lipgloss.NewStyle().Foreground(th.Primary)
+	// With no line highlight, the cursor must carry visibility itself. The cursor
+	// view renders Style with Reverse(true) (it SWAPS fg/bg), so set the pre-reverse
+	// colors swapped — fg Primary, bg Base — to display as a solid Primary block
+	// with a Base-colored glyph, obvious in both themes.
+	ta.Cursor.Style = lipgloss.NewStyle().Foreground(th.Primary).Background(th.Base)
 }
 
 // restyleComposer re-themes the composer in place after a live theme toggle. It
@@ -1165,7 +1171,7 @@ func styleTitleInput(ti *textinput.Model, th theme.Theme) {
 	ti.TextStyle = lipgloss.NewStyle().Foreground(th.Text)
 	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(th.Muted)
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(th.Muted)
-	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Primary)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(th.Primary).Background(th.Base)
 }
 
 // fieldLabel renders a composer field's label, brightened when that field has focus.
