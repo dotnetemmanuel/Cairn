@@ -70,6 +70,11 @@ func argv(verb, name string) []string {
 		// isn't listed as a git-town stack command, but routed through Run so the
 		// stack mode reuses one execution path.
 		return []string{"git", "checkout", name}
+	case "push":
+		// Publish a branch to origin so a PR can be opened against it. Works on a
+		// branch that isn't checked out (refs/heads/<name>). Out of Catalog() — it's
+		// a step inside propose, not a stack-authoring verb of its own.
+		return []string{"git", "push", "-u", "origin", name}
 	case "sync":
 		return []string{"git-town", "sync", "--stack"}
 	case "restack":
@@ -143,16 +148,26 @@ type StreamRunner interface {
 // with Run via plan, and routes execution through the Runner (so tests still
 // observe the commands). The channel is closed after the Done event.
 func (o Ops) Stream(verb, name string) <-chan StreamEvent {
+	cmds, err := plan(verb, name)
+	if err != nil {
+		ch := make(chan StreamEvent, 1)
+		ch <- StreamEvent{Done: true, Err: err}
+		close(ch)
+		return ch
+	}
+	return o.streamCmds(cmds)
+}
+
+// streamCmds runs each command in order, streaming its output line-by-line, then a
+// single {Done:true} (Err set on the first failure; remaining steps are skipped).
+// Shared by Stream (verb-driven) and the one-off ops like SetParent.
+func (o Ops) streamCmds(cmds [][]string) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 64)
 	go func() {
 		defer close(ch)
-		cmds, err := plan(verb, name)
-		if err != nil {
-			ch <- StreamEvent{Done: true, Err: err}
-			return
-		}
 		sr, live := o.Runner.(StreamRunner)
 		for _, a := range cmds {
+			var err error
 			if live {
 				err = sr.Stream(o.Dir, a[0], a[1:], func(line string) {
 					ch <- StreamEvent{Line: line}
@@ -173,6 +188,14 @@ func (o Ops) Stream(verb, name string) <-chan StreamEvent {
 		ch <- StreamEvent{Done: true}
 	}()
 	return ch
+}
+
+// SetParent records branch's git-town parent in local .git/config — the "track
+// this branch" action that adds an untracked branch to the stack tree. Nothing is
+// committed, staged, or pushed. Streamed like the other ops so the stack screen
+// reuses one execution + output path.
+func (o Ops) SetParent(branch, parent string) <-chan StreamEvent {
+	return o.streamCmds([][]string{{"git", "config", "git-town-branch." + branch + ".parent", parent}})
 }
 
 // Stream is ExecRunner's live implementation: pipe the process's combined output
@@ -265,6 +288,11 @@ func (c Command) Hint() string {
 		// ship isn't a single git-town call: Cairn merges the PR via gh, then syncs.
 		return "gh: merge PR (squash)  →  git-town sync --stack"
 	}
+	if c.Verb == "propose" {
+		// propose isn't a single git-town call: Cairn pushes the branch, then opens
+		// the PR via gh with the base read from the local lineage.
+		return "git push -u origin <branch>  →  gh: create PR (base ← parent)"
+	}
 	a := argv(c.Verb, "<name>")
 	if a == nil {
 		return ""
@@ -283,6 +311,16 @@ func Catalog() []Command {
 				"the next layer of the stack. When you propose it, its PR will target " +
 				"the current branch, not main. Use this when your next change builds on " +
 				"the one you're on.",
+		},
+		{
+			Key: "p", Verb: "propose", Title: "propose", Mutates: true,
+			Short: "open a pull request for a branch",
+			Long: "Opens a GitHub pull request for the selected branch. Its base is set " +
+				"automatically to whatever the branch is stacked on — the branch below it " +
+				"in the stack, or the trunk (main) for the bottom branch — read from the " +
+				"local lineage, so a stacked PR targets the right place, not main. Cairn " +
+				"pushes the branch first, then you title it and write the description in " +
+				"Markdown (with a live preview).",
 		},
 		{
 			Key: "I", Verb: "insert", Title: "insert", NeedsName: true, Mutates: true,

@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	chromastyles "github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
@@ -67,23 +68,61 @@ func renderMarkdown(s string, width int, th theme.Theme) string {
 	// Square off code blocks into a solid rectangle (see padCodeBlocks) before the
 	// outer newline trim.
 	out = padCodeBlocks(out, th)
+	// Colorize @mentions so people stand out from blue inline code and muted prose.
+	out = colorizeMentions(out, th)
 	// glamour brackets the document with blank lines (Document BlockPrefix/Suffix);
 	// trim those so the body sits flush with our own headers and dividers. Trim
 	// only newlines — leading spaces inside code blocks are meaningful.
 	return strings.Trim(out, "\n")
 }
 
+// viewerLogin is the authenticated user's login, set once the viewer loads. Used
+// to make your own @mention pop brighter than others. Package-level so the
+// stateless renderMarkdown can reach it without threading it through every call.
+var viewerLogin string
+
+// mentionRE matches an @mention at a word boundary: an @ not preceded by a word
+// char (so it skips emails like a@b), then a GitHub-style login.
+var mentionRE = regexp.MustCompile(`(^|[^\w@/])(@[A-Za-z0-9][A-Za-z0-9-]{0,38})`)
+
+// colorizeMentions tints @mentions in already-rendered markdown: your own login
+// in the focus accent (bold), everyone else in the brand accent — distinct from
+// blue inline code. After the mention it reasserts the body text color so the
+// rest of the line keeps glamour's flow. (A light touch: it can occasionally hit
+// an @token inside code, which is harmless.)
+func colorizeMentions(s string, th theme.Theme) string {
+	me := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
+	other := lipgloss.NewStyle().Foreground(th.Primary)
+	resume := "\x1b[39m" // reset foreground to the terminal default, not a full SGR reset
+	return mentionRE.ReplaceAllStringFunc(s, func(m string) string {
+		loc := mentionRE.FindStringSubmatch(m)
+		lead, at := loc[1], loc[2]
+		style := other
+		if viewerLogin != "" && strings.EqualFold(at, "@"+viewerLogin) {
+			style = me
+		}
+		return lead + style.Render(at) + resume
+	})
+}
+
 func mdRenderer(width int, th theme.Theme) *glamour.TermRenderer {
 	mdMu.Lock()
 	defer mdMu.Unlock()
 
-	key := string(th.Text) + "|" + string(th.Focus) + "|" + string(th.Primary) +
-		"|" + string(th.Info) + "|" + string(th.Accent2) + "|" + string(th.Surface) +
-		"|" + string(th.Warning) + "|" + string(th.Muted) + "|" + string(th.Overlay)
+	// Full fingerprint: cairnGlamourStyle (code blocks included) consumes Success
+	// and Danger too, so a partial key would leave those orphaned — stale code-block
+	// strings/errors if only they changed.
+	key := theme.Fingerprint(th)
 	if key != mdStyleKey {
 		mdStyleKey = key
 		mdStyle = cairnGlamourStyle(th)
 		mdRenderers = map[int]*glamour.TermRenderer{}
+		// glamour registers its code-block chroma style under the fixed name "charm"
+		// and refuses to re-register if it already exists (ansi/codeblock.go), so the
+		// FIRST theme rendered bakes the code-block colors into chroma's global
+		// registry forever — toggling the theme then leaves stale code backgrounds.
+		// Evict that entry so glamour re-registers with the new palette.
+		delete(chromastyles.Registry, "charm")
 	}
 
 	if r, ok := mdRenderers[width]; ok {
@@ -146,8 +185,15 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 	// Links and inline code in their dashboard-equivalent colors.
 	s.Link.Color = sptr(th.Info)
 	s.LinkText.Color = sptr(th.Info)
-	s.Code.Color = sptr(th.Accent2)
-	s.Code.BackgroundColor = sptr(th.Overlay)
+	// Inline code: the Accent2 teal reads well on the dark code panel, but on the
+	// light sand panel it's too faint — fall back to the strong body text color
+	// there (the tinted background already marks it as code).
+	codeFg := th.Accent2
+	if theme.IsLight(th) {
+		codeFg = th.Text
+	}
+	s.Code.Color = sptr(codeFg)
+	s.Code.BackgroundColor = sptr(th.CodeBg)
 
 	s.Emph.Color = sptr(th.Warning)
 	s.Strong.Color = sptr(th.Text)
@@ -170,7 +216,7 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 	// value before mutating, or we'd corrupt the shared style for everyone.
 	if s.CodeBlock.Chroma != nil {
 		c := *s.CodeBlock.Chroma
-		bg := string(th.Overlay)
+		bg := string(th.CodeBg)
 		// Recolor chroma's syntax tokens onto Cairn's semantic palette so code blocks
 		// match the rest of the TUI instead of glamour's built-in dark theme. Each token
 		// gets the Overlay backdrop plus a themed foreground; other attributes (bold,
@@ -215,7 +261,7 @@ func cairnGlamourStyle(th theme.Theme) ansi.StyleConfig {
 		s.CodeBlock.Chroma = &c
 	}
 	// And the fallback (no-language / non-color) path renders via this primitive.
-	s.CodeBlock.StyleBlock.StylePrimitive.BackgroundColor = sptr(th.Overlay)
+	s.CodeBlock.StyleBlock.StylePrimitive.BackgroundColor = sptr(th.CodeBg)
 	// Bracket each block with sentinels so padCodeBlocks can square it into a solid
 	// rectangle. glamour renders these with the document style (no background), and
 	// they're stripped before display.
@@ -258,7 +304,7 @@ func padCodeBlocks(out string, th theme.Theme) string {
 }
 
 // squareCodeBlock pads every line of a single code block to the width of its widest
-// line, backgrounded with Overlay so the block reads as one rectangle.
+// line, backgrounded with CodeBg so the block reads as one rectangle.
 func squareCodeBlock(block []string, th theme.Theme) []string {
 	contents := make([]string, len(block))
 	widths := make([]int, len(block))
@@ -273,7 +319,7 @@ func squareCodeBlock(block []string, th theme.Theme) []string {
 			target = widths[j]
 		}
 	}
-	bg := lipgloss.NewStyle().Background(th.Overlay)
+	bg := lipgloss.NewStyle().Background(th.CodeBg)
 	for j := range block {
 		// Reset after the trimmed content, then lay down a backgrounded run of spaces
 		// to reach the common width. The content's last cell already carries Overlay,

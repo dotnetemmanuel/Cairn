@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -62,15 +64,17 @@ type detailModel struct {
 
 	width, height int
 
-	loading bool
-	err     error
-	detail  gh.PRDetail
-	files   []gh.FileDiff
+	loading    bool
+	refreshing bool // a reload of an already-loaded PR (r) vs the first load
+	err        error
+	detail     gh.PRDetail
+	files      []gh.FileDiff
 
-	page     detailPage
-	selected int // index into files
-	focus    focusPane
-	showInfo bool
+	page      detailPage
+	selected  int // index into files
+	focus     focusPane
+	showInfo  bool
+	showFiles bool // the left files pane (toggle with f to give the diff full width)
 
 	diffVP     viewport.Model
 	infoVP     viewport.Model
@@ -85,6 +89,7 @@ type detailModel struct {
 	state    detailState
 	composer textarea.Model
 	status   string // transient feedback line
+	posted   bool   // user submitted a comment/reply/review this session → sync board on exit
 
 	// Anchor for an in-progress inline comment (stateLineComment).
 	anchorPath string
@@ -115,19 +120,25 @@ func newDetail(th theme.Theme, it gh.Item) detailModel {
 	ta := textarea.New()
 	ta.Placeholder = "Write a comment (GitHub-flavored Markdown)…"
 	ta.ShowLineNumbers = false
+	// Theme the composer from the palette (not bubbles' terminal-adaptive default,
+	// which renders a black cursor-line band in a light theme on a dark terminal).
+	// Must be set on the persistent model — see styleComposer's note on the cached
+	// &FocusedStyle pointer.
+	styleComposer(&ta, th)
 	return detailModel{
-		th:       th,
-		owner:    owner,
-		repo:     repo,
-		number:   it.Number,
-		url:      it.URL,
-		title:    it.Title,
-		loading:  true,
-		showInfo: true,
-		composer: ta,
-		diffVP:   newVP(),
-		infoVP:   newVP(),
-		convVP:   newVP(),
+		th:        th,
+		owner:     owner,
+		repo:      repo,
+		number:    it.Number,
+		url:       it.URL,
+		title:     it.Title,
+		loading:   true,
+		showInfo:  true,
+		showFiles: true,
+		composer:  ta,
+		diffVP:    newVP(),
+		infoVP:    newVP(),
+		convVP:    newVP(),
 	}
 }
 
@@ -153,7 +164,9 @@ type actionDoneMsg struct {
 	err  error
 }
 
-type detailExitMsg struct{}
+// detailExitMsg returns control to the dashboard. posted is true when the user
+// submitted something this session, so the dashboard can auto-sync all tabs.
+type detailExitMsg struct{ posted bool }
 
 func loadPR(owner, repo string, number int, keep bool) tea.Cmd {
 	return func() tea.Msg {
@@ -217,6 +230,7 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 
 	case prLoadedMsg:
 		m.loading = false
+		m.refreshing = false
 		m.err = msg.err
 		m.detail = msg.detail
 		// A post-action reload keeps you where you were; the initial load
@@ -254,6 +268,9 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 			return m, nil
 		}
 		m.status = okStyle(m.th).Render("✓ " + msg.verb + " submitted")
+		// Remember the user changed their involvement so the dashboard syncs every
+		// tab on exit (e.g. an Orgs PR you just commented on moves into Involved).
+		m.posted = true
 		// Reload conversation/checks so the new review/comment shows — but stay
 		// on the current file, line, and scroll position.
 		return m, loadPR(m.owner, m.repo, m.number, true)
@@ -330,7 +347,8 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.page = pageDiff
 			return m, nil
 		}
-		return m, func() tea.Msg { return detailExitMsg{} }
+		posted := m.posted
+		return m, func() tea.Msg { return detailExitMsg{posted: posted} }
 	case "v":
 		// Toggle the full conversation: v opens it, v again closes it back to
 		// the diff (esc also closes it).
@@ -357,8 +375,24 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		}
 		m.refreshDiff()
 		return m, nil
+	case "s":
+		// Toggle the files sidebar to give the diff the full width (handy on narrow
+		// screens) — same key as the dashboard's sidebar toggle. Move focus off it
+		// when hiding so you can't tab into nothing.
+		m.showFiles = !m.showFiles
+		if !m.showFiles && m.focus == focusFiles {
+			m.focus = focusDiff
+		}
+		m.relayout()
+		m.refreshDiff()
+		return m, nil
 	case "o":
 		return m, openBrowser(m.url)
+	case "y":
+		// Yank the GitHub link for the comment under the cursor (a diff-line inline
+		// comment, or the selected conversation thread) to the clipboard — a one-key
+		// handoff to paste back into chat. Falls back to the PR link.
+		return m.copyLink()
 	case "c":
 		// On the diff with the diff pane focused, c comments on the cursor
 		// line (GitHub's "Add single comment"); otherwise it's a PR-level
@@ -371,21 +405,25 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		m.composer.Placeholder = "Write a comment (GitHub-flavored Markdown)…"
 		m.composer.Focus()
 		return m, textarea.Blink
-	case "s":
+	case "S":
 		// Suggest a change on the cursor line: a comment pre-filled with a
 		// GitHub ```suggestion block seeded from the line's current content.
+		// (Moved off s, which now toggles the files sidebar — consistent with the
+		// dashboard's s.)
 		if m.page == pageDiff && m.focus == focusDiff {
 			return m.startLineComment("suggest")
 		}
 	case "r":
-		// Reply to a thread: the selected one in the conversation view, or the
-		// thread on the cursor's diff line.
-		if m.page == pageConversation {
+		// Reply when a thread is in focus (conversation thread, or the cursor's
+		// diff line); otherwise refresh the PR — r=refresh, matching the dashboard.
+		if m.page == pageConversation && len(m.convThreads) > 0 {
 			return m.startConvReply()
 		}
-		if m.page == pageDiff && m.focus == focusDiff {
+		if m.page == pageDiff && m.focus == focusDiff && len(m.lineComments()) > 0 {
 			return m.startReply()
 		}
+		m.loading, m.refreshing = true, true
+		return m, loadPR(m.owner, m.repo, m.number, true)
 	case "x":
 		m.state = stateReject
 		m.composer.Reset()
@@ -409,6 +447,9 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.moveConvThread(1)
 			return m, nil
 		}
+		// Jumping between changes implies you're reading the diff — focus it so the
+		// very next ↑/↓ walks diff lines instead of switching files.
+		m.focus = focusDiff
 		m.gotoHunk(1)
 		return m, nil
 	case "N":
@@ -416,6 +457,7 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.moveConvThread(-1)
 			return m, nil
 		}
+		m.focus = focusDiff
 		m.gotoHunk(-1)
 		return m, nil
 	}
@@ -466,7 +508,10 @@ func (m *detailModel) infoVisible() bool {
 }
 
 func (m *detailModel) nextFocus(dir int) focusPane {
-	order := []focusPane{focusFiles, focusDiff}
+	order := []focusPane{focusDiff}
+	if m.showFiles {
+		order = []focusPane{focusFiles, focusDiff}
+	}
 	if m.infoVisible() {
 		order = append(order, focusInfo)
 	}
@@ -502,15 +547,25 @@ func (m *detailModel) gotoHunk(dir int) {
 	// Cycle: n past the last hunk wraps to the first, N past the first to the last.
 	n := len(m.hunks)
 	m.curHunk = (m.curHunk + dir + n) % n
-	// Park the line cursor on the hunk header, re-render (marks the active
-	// hunk + cursor), then scroll so it sits near the top. The scroll is a
-	// no-op when the whole diff fits, but the markers still move — so
-	// navigation stays visible. Move the cursor first so the contextual right
-	// pane updates too.
+	// Park the line cursor on the hunk header, re-render (marks the active hunk +
+	// cursor), then bring it into view. Move the cursor first so the contextual
+	// right pane updates too.
 	m.diffCursor = m.hunks[m.curHunk]
 	m.renderDiffContent()
 	m.refreshInfo()
-	m.diffVP.SetYOffset(m.visualRow(m.curHunkRow()))
+	// Minimal scroll: only move the viewport when the active hunk header is
+	// outside it, with a small lead-in — staying put when it's already visible.
+	// Matches the conversation pane's n/N thread jumps so the two feel the same.
+	row := m.visualRow(m.curHunkRow())
+	top := m.diffVP.YOffset
+	bottom := top + m.diffVP.Height - 1
+	if row < top || row > bottom {
+		target := row - 2
+		if target < 0 {
+			target = 0
+		}
+		m.diffVP.SetYOffset(target)
+	}
 }
 
 // curHunkRow is the patch-line index of the active hunk header.
@@ -559,6 +614,51 @@ func (m *detailModel) lineComments() []gh.ReviewComment {
 		}
 	}
 	return out
+}
+
+// commentPermalink builds the GitHub permalink for an inline review comment from
+// the PR url and the comment's REST id: <pr-url>#discussion_r<id>, the anchor
+// GitHub uses to deep-link a review-thread comment.
+func commentPermalink(prURL string, commentID int) string {
+	return prURL + "#discussion_r" + strconv.Itoa(commentID)
+}
+
+// linkForSelection returns the most specific GitHub link for what's under the
+// cursor, plus a label for the status line: the selected conversation thread or
+// the diff cursor's inline comment when there is one, otherwise the PR itself.
+func (m detailModel) linkForSelection() (url, kind string) {
+	if m.url == "" {
+		return "", ""
+	}
+	// Conversation page: the selected (n/N) inline thread.
+	if m.page == pageConversation && m.convCursor >= 0 && m.convCursor < len(m.convThreads) {
+		if id := m.convThreads[m.convCursor].id; id > 0 {
+			return commentPermalink(m.url, id), "comment"
+		}
+	}
+	// Diff page: an inline comment anchored to the cursor's line (the thread anchor).
+	if m.page == pageDiff {
+		if cs := m.lineComments(); len(cs) > 0 && cs[0].DatabaseID > 0 {
+			return commentPermalink(m.url, cs[0].DatabaseID), "comment"
+		}
+	}
+	return m.url, "PR" // nothing comment-specific selected — yank the PR link
+}
+
+// copyLink writes the selected comment's (or PR's) GitHub link to the system
+// clipboard and reports the outcome on the status line.
+func (m detailModel) copyLink() (detailModel, tea.Cmd) {
+	url, kind := m.linkForSelection()
+	if url == "" {
+		m.status = warnStyle(m.th).Render("nothing to copy yet")
+		return m, nil
+	}
+	if err := clipboard.WriteAll(url); err != nil {
+		m.status = errStyle(m.th).Render("copy failed: " + err.Error())
+		return m, nil
+	}
+	m.status = okStyle(m.th).Render("✓ copied " + kind + " link  " + url)
+	return m, nil
 }
 
 // renderDiffContent rebuilds the diff viewport content for the current file,
@@ -707,13 +807,17 @@ func (m detailModel) bottomReserve() int {
 }
 
 func (m *detailModel) paneWidths() (files, diff, info int) {
-	w := m.width
-	files = 30
-	if files > w/3 {
-		files = w / 3
-	}
-	if files < 16 {
-		files = 16
+	// Lay out within the indented body width so header/footer bars stay flush.
+	w := bodyWidth(m.width)
+	files = 0
+	if m.showFiles {
+		files = 36
+		if files > w/3 {
+			files = w / 3
+		}
+		if files < 16 {
+			files = 16
+		}
 	}
 	info = 0
 	if m.showInfo && w >= 100 {
@@ -722,11 +826,15 @@ func (m *detailModel) paneWidths() (files, diff, info int) {
 			info = w * 2 / 5
 		}
 	}
-	gaps := 1
-	if info > 0 {
-		gaps = 2
+	// One separator between each visible pane (diff is always shown).
+	panes := 1
+	if files > 0 {
+		panes++
 	}
-	diff = w - files - info - gaps
+	if info > 0 {
+		panes++
+	}
+	diff = w - files - info - (panes - 1)
 	if diff < 10 {
 		diff = 10
 	}
@@ -752,8 +860,8 @@ func (m *detailModel) relayout() {
 		m.infoVP.Width = infoW
 		m.infoVP.Height = vpH
 	}
-	// The conversation page is full width.
-	m.convVP.Width = m.width
+	// The conversation page spans the indented body width.
+	m.convVP.Width = bodyWidth(m.width)
 	m.convVP.Height = vpH
 	m.composer.SetWidth(m.width - 4)
 	m.composer.SetHeight(composerH)
@@ -783,6 +891,32 @@ func (m *detailModel) refreshDiff() {
 
 func (m *detailModel) refreshInfo() {
 	m.infoVP.SetContent(m.renderInfo())
+}
+
+// restyle swaps the theme and re-renders the cached viewports in place (a live
+// light/dark toggle). It preserves the cursor, selection, and scroll positions —
+// only the colors change. A still-loading screen needs no work: its next render
+// already uses the new theme.
+func (m *detailModel) restyle(th theme.Theme) {
+	m.th = th
+	// Re-theme the composer and re-point its cached active-style pointer (via
+	// Focus/Blur) so a live toggle recolors the textarea too.
+	styleComposer(&m.composer, th)
+	if m.composing() {
+		m.composer.Focus()
+	} else {
+		m.composer.Blur()
+	}
+	if m.loading || m.err != nil {
+		return
+	}
+	if len(m.files) > 0 {
+		m.renderDiffContent()
+	} else {
+		m.diffVP.SetContent(mutedStyle(m.th).Render("  (no files changed)"))
+	}
+	m.refreshInfo()
+	m.renderConvContent()
 }
 
 // refreshConv re-renders the conversation, places the thread cursor on the first
@@ -837,12 +971,22 @@ func (m *detailModel) moveConvThread(dir int) {
 
 // ---- view ----
 
-func (m detailModel) View() string {
+func (m detailModel) View(spinner string) string {
 	if m.width == 0 {
 		return "loading…"
 	}
 	if m.loading {
-		return fmt.Sprintf("\n  loading PR #%d…", m.number)
+		// A refresh keeps the header/footer chrome (we still hold the PR data) and
+		// shows an animated spinner in the body, like the dashboard's section
+		// loading; the initial load is just the spinner line.
+		if m.refreshing {
+			// White text, blue spinner — same as the dashboard's loading line.
+			msg := lipgloss.NewStyle().Foreground(m.th.Text).
+				Render(fmt.Sprintf("refreshing PR #%d…", m.number))
+			body := indentBody("\n  " + spinner + " " + msg)
+			return lipgloss.JoinVertical(lipgloss.Left, m.viewHeader(), body, m.viewFooter())
+		}
+		return fmt.Sprintf("\n  %s loading PR #%d…", spinner, m.number)
 	}
 	if m.err != nil {
 		return errStyle(m.th).Render(fmt.Sprintf("\n  failed to load PR #%d: %v\n\n  esc to go back", m.number, m.err))
@@ -855,6 +999,8 @@ func (m detailModel) View() string {
 	} else {
 		body = m.viewBody()
 	}
+	// Header and footer are full-width bars (flush); the body is indented.
+	body = indentBody(body)
 
 	if m.composing() {
 		return lipgloss.JoinVertical(lipgloss.Left, header, body, m.viewComposer())
@@ -869,7 +1015,7 @@ func (m detailModel) viewConversation() string {
 	}
 	n := len(m.detail.Comments) + len(m.detail.Reviews) + len(m.detail.ReviewComments)
 	title := fmt.Sprintf("Conversation · %d items", n)
-	return m.paneBox(title, m.convVP.View(), m.width, bodyH, true)
+	return m.paneBox(title, m.convVP.View(), bodyWidth(m.width), bodyH, true)
 }
 
 // renderConversation builds the full-width thread. Reviews lead with their
@@ -903,11 +1049,25 @@ func (m detailModel) renderConversation() (string, []convThread) {
 		return sel
 	}
 
+	rule := mutedStyle(m.th).Render(strings.Repeat("─", tw))
+	compact := func(k gh.TimelineKind) bool { return k == gh.KindCommit || k == gh.KindEvent }
 	for i, e := range entries {
 		if i > 0 {
-			// Blank lines above and below the rule so each comment reads as its own
-			// block — flush against content the divider looked glued on.
-			write("\n" + mutedStyle(m.th).Render(strings.Repeat("─", tw)) + "\n\n")
+			// Blank lines above and below the rule so each block reads on its own;
+			// consecutive compact rows (commits/events) stack tightly with no divider.
+			if !(compact(e.Kind) && compact(entries[i-1].Kind)) {
+				write("\n" + rule + "\n\n")
+			}
+		}
+
+		// Compact single-line rows: pushed commits and lifecycle events.
+		if e.Kind == gh.KindCommit {
+			write(m.renderCommitRow(e, tw) + "\n")
+			continue
+		}
+		if e.Kind == gh.KindEvent {
+			write(m.renderEventRow(e) + "\n")
+			continue
 		}
 
 		// A standalone inline comment (not surfaced under a review) renders its own
@@ -953,6 +1113,51 @@ func (m detailModel) renderConversation() (string, []convThread) {
 	return b.String(), threads
 }
 
+// renderCommitRow is the compact one-line timeline row for a pushed commit:
+// a node glyph, the message headline, the short sha, then the author.
+func (m detailModel) renderCommitRow(e gh.TimelineEntry, w int) string {
+	node := mutedStyle(m.th).Render("◦")
+	sha := ""
+	if len(e.SHA) >= 7 {
+		sha = mutedStyle(m.th).Render(e.SHA[:7])
+	}
+	who := infoStyle(m.th).Render("@" + e.Author)
+	msg := lipgloss.NewStyle().Foreground(m.th.Text).
+		Render(truncate(strings.TrimSpace(e.Body), max(10, w-26)))
+	return node + " " + msg + "  " + sha + "  " + who
+}
+
+// renderEventRow is the compact one-line timeline row for a lifecycle event
+// (ready-for-review, review requested, merged, closed, reopened, draft).
+func (m detailModel) renderEventRow(e gh.TimelineEntry) string {
+	glyph, text, c := m.eventDesc(e)
+	icon := lipgloss.NewStyle().Foreground(c).Render(glyph)
+	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
+	return icon + " " + who + " " + mutedStyle(m.th).Render(text+" · "+relTime(e.CreatedAt))
+}
+
+// eventDesc maps a lifecycle event to its glyph, phrase, and accent color.
+func (m detailModel) eventDesc(e gh.TimelineEntry) (string, string, lipgloss.Color) {
+	switch e.Event {
+	case "READY_FOR_REVIEW":
+		return "✓", "marked this ready for review", m.th.Success
+	case "REVIEW_REQUESTED":
+		if e.Subject != "" {
+			return "◇", "requested a review from @" + e.Subject, m.th.Focus
+		}
+		return "◇", "requested a review", m.th.Focus
+	case "MERGED":
+		return "●", "merged this", m.th.Primary
+	case "CLOSED":
+		return "●", "closed this", m.th.Danger
+	case "REOPENED":
+		return "●", "reopened this", m.th.Success
+	case "CONVERT_TO_DRAFT":
+		return "✎", "marked this as a draft", m.th.Muted
+	}
+	return "•", strings.ToLower(e.Event), m.th.Muted
+}
+
 // renderInlineComment renders one inline code comment: a "who · where" header,
 // the cited code context, a blank line, then the comment body.
 func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected bool) string {
@@ -962,7 +1167,7 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 	if selected {
 		// Conversation thread cursor: a full-width primary-on-surface bar makes the
 		// selected thread unmistakable (a lone ▌ read too faint).
-		plain := fmt.Sprintf("▌ @%s on %s:%d · %s", e.Author, shortRepo(e.Path), e.Line, relTime(e.CreatedAt))
+		plain := fmt.Sprintf("%s @%s on %s:%d · %s", focusGlyph, e.Author, shortRepo(e.Path), e.Line, relTime(e.CreatedAt))
 		header = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
 			Bold(true).Width(w).Render(plain)
 	}
@@ -1179,8 +1384,9 @@ func (m detailModel) viewHeader() string {
 	if m.detail.IsDraft {
 		state += "  " + draftBadge(m.th)
 	}
-	line1 := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).Padding(0, 1).
-		Render(fmt.Sprintf("%s %s  %s", num, title, state))
+	// Surface bar via surfaceBar so the trailing pad doesn't bleed to Base (the
+	// "double background" on the header) — same fix as the dashboard masthead.
+	line1 := surfaceBar(m.th, m.width, " "+fmt.Sprintf("%s %s  %s", num, title, state))
 
 	refs := fmt.Sprintf("%s ← %s", m.detail.BaseRef, m.detail.HeadRef)
 	stats := lipgloss.NewStyle().Foreground(m.th.Success).Render(fmt.Sprintf("+%d", m.detail.Additions)) +
@@ -1202,7 +1408,6 @@ func (m detailModel) viewBody() string {
 	}
 	filesW, _, infoW := m.paneWidths()
 
-	filePane := m.paneBox("Files", m.renderFileList(filesW, bodyH-2), filesW, bodyH, m.focus == focusFiles)
 	diffTitle := "Diff"
 	if len(m.files) > 0 {
 		diffTitle = "Diff · " + shortPath(m.files[m.selected].Filename, m.diffVP.Width-8)
@@ -1212,7 +1417,11 @@ func (m detailModel) viewBody() string {
 	}
 	diffPane := m.paneBox(diffTitle, m.diffVP.View(), m.diffVP.Width, bodyH, m.focus == focusDiff)
 
-	panes := []string{filePane, diffPane}
+	var panes []string
+	if filesW > 0 {
+		panes = append(panes, m.paneBox("Files", m.renderFileList(filesW, bodyH-2), filesW, bodyH, m.focus == focusFiles))
+	}
+	panes = append(panes, diffPane)
 	if infoW > 0 {
 		infoTitle := "Conversation · Checks"
 		if len(m.lineComments()) > 0 {
@@ -1291,10 +1500,10 @@ func (m detailModel) renderFileList(w, h int) string {
 			bubble = iconChat
 		}
 		if i == m.selected {
-			// A filled bar + ▸ arrow makes the current file unmistakable.
+			// A filled bar + ❯ cursor makes the current file unmistakable.
 			sel := lipgloss.NewStyle().Width(w).Foreground(m.th.Base).Background(m.th.Primary).Bold(true)
 			name := truncate(shortRepo(f.Filename), max(1, w-8))
-			lines = append(lines, sel.Render(fmt.Sprintf("▸ %s %s %s", statusLetterPlain(f.Status), pad(name, max(1, w-8)), bubble)))
+			lines = append(lines, sel.Render(fmt.Sprintf("%s %s %s %s", focusGlyph, statusLetterPlain(f.Status), pad(name, max(1, w-8)), bubble)))
 			continue
 		}
 		letter := statusLetter(m.th, f.Status)
@@ -1336,7 +1545,7 @@ func (m detailModel) renderInfo() string {
 			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width) + "\n")
 		}
 		b.WriteString("\n")
-		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
+		b.WriteString(mutedStyle(m.th).Render("r reply · y copy link · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
 	}
@@ -1421,29 +1630,33 @@ func (m detailModel) viewComposer() string {
 
 func (m detailModel) viewFooter() string {
 	if m.status != "" {
-		return lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(m.status)
+		return surfaceBar(m.th, m.width,
+			lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(m.status))
 	}
 	var help string
 	switch {
 	case m.page == pageConversation:
-		thread := ""
+		// r replies when a thread is selected, else it refreshes.
+		rk := " · r refresh"
 		if len(m.convThreads) > 0 {
-			thread = " · n/N thread · r reply"
+			rk = " · n/N thread · r reply · y copy link"
 		}
-		help = "↑/↓ scroll" + thread + " · c comment · a approve · x request-changes · o open · v/d/esc close"
+		help = "↑/↓ scroll" + rk + " · c comment · a approve · x request-changes · o open · v/d/esc close"
 	case m.focus == focusDiff:
-		// On the diff, c/s act on the cursor line; r replies when it has a thread.
-		reply := ""
+		// On the diff, c/s act on the cursor line; r replies when it has a thread,
+		// otherwise r refreshes.
+		rk := " · r refresh"
 		if len(m.lineComments()) > 0 {
-			reply = " · r reply"
+			rk = " · r reply · y copy link"
 		}
-		help = "↑/↓ line · n/N change · c comment line · s suggest" + reply +
-			" · i panel · ←/→ focus · v conversation · a approve · o open · esc back"
+		help = "↑/↓ line · n/N change · c comment line · S suggest" + rk +
+			" · s/i files/panel · ←/→ focus · v conversation · a approve · o open · esc back"
 	default:
-		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · i panel · v conversation · c comment · a approve · x changes · o open · esc back"
+		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · s/i files/panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
 	}
-	return lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
-		Render(truncate(help, max(10, m.width-2)))
+	return surfaceBar(m.th, m.width,
+		lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).
+			Render(truncate(help, max(10, m.width-2))))
 }
 
 // ---- small styling helpers ----

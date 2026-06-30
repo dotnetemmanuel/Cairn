@@ -88,13 +88,14 @@ func TestMaintainVerbsGatedOnTrackedBranch(t *testing.T) {
 
 func TestShipGatedToBottomBranch(t *testing.T) {
 	s := fixtureModel() // current = feat-mid (parent feat-base) — not the bottom
+	s.status.Staged = 0 // clean tree (fixture is dirty); merge needs a clean tree
 	ship := townie.Command{Verb: "ship"}
 	if s.actionEnabled(ship) {
 		t.Error("ship must be disabled on a middle branch")
 	}
 	s.status.Branch = "feat-base" // direct child of trunk = bottom
 	if !s.actionEnabled(ship) {
-		t.Error("ship should be enabled on the bottom branch")
+		t.Error("ship should be enabled on the clean bottom branch")
 	}
 	s.status.Branch = "main" // the trunk itself
 	if s.actionEnabled(ship) {
@@ -104,6 +105,33 @@ func TestShipGatedToBottomBranch(t *testing.T) {
 	s.status.Detached = true
 	if s.actionEnabled(ship) {
 		t.Error("ship must be disabled when detached")
+	}
+}
+
+func TestShipGatedOnCleanTree(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-base" // bottom of the stack
+	s.status.Staged, s.status.Unstaged, s.status.Conflicts = 0, 0, 0
+	if !s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Fatal("ship should be enabled on a clean bottom branch")
+	}
+	// Any uncommitted change to tracked files must block merge — its post-merge
+	// stack rebase would derail on a dirty tree.
+	for _, dirty := range []func(){
+		func() { s.status.Unstaged = 3 },
+		func() { s.status.Staged = 1 },
+		func() { s.status.Conflicts = 1 },
+	} {
+		s.status.Staged, s.status.Unstaged, s.status.Conflicts = 0, 0, 0
+		dirty()
+		if s.actionEnabled(townie.Command{Verb: "ship"}) {
+			t.Errorf("ship must be disabled on a dirty tree (%+v)", s.status)
+		}
+	}
+	// Untracked files alone don't block merge (they don't interfere with a rebase).
+	s.status.Staged, s.status.Unstaged, s.status.Conflicts, s.status.Untracked = 0, 0, 0, 5
+	if !s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Error("untracked files alone should not block merge")
 	}
 }
 
@@ -351,5 +379,173 @@ func TestStackExitFromBrowsing(t *testing.T) {
 	}
 	if _, ok := cmd().(stackExitMsg); !ok {
 		t.Error("esc should emit stackExitMsg")
+	}
+}
+
+func TestProposeGating(t *testing.T) {
+	s := fixtureModel() // cursor on feat-mid (non-trunk, tracked)
+	propose := *townie.Find("p")
+	if propose.Verb != "propose" {
+		t.Fatalf("Find(p) = %q, want propose", propose.Verb)
+	}
+	if !s.actionEnabled(propose) {
+		t.Error("propose should be enabled on a tracked non-trunk branch with no PR")
+	}
+	// A branch that already has an open PR can't be proposed again.
+	s.prNums = map[string]int{"feat-mid": 42}
+	if s.actionEnabled(propose) {
+		t.Error("propose must be disabled when the branch already has a PR")
+	}
+	// The trunk has no parent to target and can't be proposed.
+	s.prNums = nil
+	s.treeCursor = s.tree.IndexOf("main")
+	if s.actionEnabled(propose) {
+		t.Error("propose must be disabled on the trunk")
+	}
+}
+
+func TestProposeTargetAndBaseFollowTreeCursor(t *testing.T) {
+	s := fixtureModel()
+	for _, tc := range []struct{ branch, base string }{
+		{"feat-base", "main"},     // bottom → trunk
+		{"feat-mid", "feat-base"}, // middle → branch below
+		{"feat-top", "feat-mid"},
+	} {
+		s.treeCursor = s.tree.IndexOf(tc.branch)
+		if got := s.proposeTarget(); got != tc.branch {
+			t.Errorf("proposeTarget = %q, want %q", got, tc.branch)
+		}
+		if got := s.proposeBaseFor(tc.branch); got != tc.base {
+			t.Errorf("base for %s = %q, want %q (its parent in the stack)", tc.branch, got, tc.base)
+		}
+	}
+}
+
+func TestStartProposeOpensComposerWithDetectedBase(t *testing.T) {
+	s := fixtureModel()
+	s.treeCursor = s.tree.IndexOf("feat-mid")
+	s, _ = s.triggerAction(*townie.Find("p"))
+	if s.phase != stackComposing {
+		t.Fatalf("phase = %v, want stackComposing", s.phase)
+	}
+	if s.opName != "feat-mid" {
+		t.Errorf("opName = %q, want feat-mid", s.opName)
+	}
+	if s.proposeBase != "feat-base" {
+		t.Errorf("proposeBase = %q, want feat-base (the parent)", s.proposeBase)
+	}
+	if s.composeFocus != composeTitle {
+		t.Error("composer should start focused on the title field")
+	}
+}
+
+func TestComposeRequiresTitleBeforeConfirm(t *testing.T) {
+	s := fixtureModel()
+	s, _ = s.triggerAction(*townie.Find("p"))
+	s.titleInput.SetValue("") // blank title
+	s, _ = s.updateComposing(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if s.phase != stackComposing {
+		t.Error("ctrl+s with an empty title must stay in the composer")
+	}
+	s.titleInput.SetValue("Add retry logic")
+	s, _ = s.updateComposing(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if s.phase != stackConfirming {
+		t.Errorf("ctrl+s with a title should advance to confirm, got %v", s.phase)
+	}
+}
+
+func TestComposeTabSwitchesFieldAndEscCancels(t *testing.T) {
+	s := fixtureModel()
+	s, _ = s.triggerAction(*townie.Find("p"))
+	s, _ = s.updateComposing(tea.KeyMsg{Type: tea.KeyTab})
+	if s.composeFocus != composeBody {
+		t.Error("tab should move focus to the body")
+	}
+	s, _ = s.updateComposing(tea.KeyMsg{Type: tea.KeyEsc})
+	if s.phase != stackBrowsing {
+		t.Error("esc should cancel the composer back to browsing")
+	}
+}
+
+func TestProposeConfirmTogglesDraft(t *testing.T) {
+	s := fixtureModel()
+	s, _ = s.triggerAction(*townie.Find("p"))
+	s.titleInput.SetValue("My PR")
+	s, _ = s.updateComposing(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if s.proposeDraft {
+		t.Fatal("draft should default to off")
+	}
+	s, _ = s.updateConfirming(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if !s.proposeDraft {
+		t.Error("d should toggle draft on")
+	}
+	// esc from the propose confirm returns to the editor, not all the way out.
+	s, _ = s.updateConfirming(tea.KeyMsg{Type: tea.KeyEsc})
+	if s.phase != stackComposing {
+		t.Error("esc from the propose confirm should return to the composer")
+	}
+}
+
+func TestTreeShowsPRNumberFlag(t *testing.T) {
+	s := fixtureModel()
+	s.prNums = map[string]int{"feat-base": 12}
+	out := s.renderLocalTree(40)
+	if !strings.Contains(out, "#12") {
+		t.Errorf("tree should flag feat-base with its PR number; got:\n%s", out)
+	}
+}
+
+func TestTreeWidthFitsLongBranchAndClamps(t *testing.T) {
+	s := fixtureModel()
+	s.width = 200 // plenty of room
+	if w := s.treeWidth(); w != stackPaneW {
+		t.Errorf("short branch names should give the floor %d, got %d", stackPaneW, w)
+	}
+	// A long branch name grows the pane past the floor.
+	lin := stack.Lineage{
+		Trunk:     "main",
+		Parents:   map[string]string{"feat/session-auth-consolidation-rollout": "main"},
+		Perennial: map[string]bool{},
+	}
+	s.tree = stack.BuildTree(lin, "main", func(_, _ string) bool { return false })
+	if w := s.treeWidth(); w <= stackPaneW {
+		t.Errorf("a long branch should widen the pane beyond %d, got %d", stackPaneW, w)
+	}
+	// On a tiny terminal it can't exceed the floor (the View clamps the right pane).
+	s.width = 30
+	if w := s.treeWidth(); w != stackPaneW {
+		t.Errorf("tiny terminal should clamp to the floor %d, got %d", stackPaneW, w)
+	}
+}
+
+func TestCurrentUntrackedAndTrack(t *testing.T) {
+	s := fixtureModel() // current = feat-mid, which IS tracked
+	if s.currentUntracked() {
+		t.Error("a tracked branch should not be flagged untracked")
+	}
+	// Hop onto a branch git-town doesn't know.
+	s.status.Branch = "ui-polish"
+	if !s.currentUntracked() {
+		t.Error("an off-tree branch in a git-town repo should be flagged untracked")
+	}
+	if s.trackParent() != "main" {
+		t.Errorf("trackParent = %q, want the trunk main", s.trackParent())
+	}
+	// The action list surfaces the peach call-to-action.
+	if out := s.renderActions(70); !strings.Contains(out, "ui-polish isn't in the stack") {
+		t.Errorf("expected the untracked banner; got:\n%s", out)
+	}
+	// t starts the track op (running phase + a command).
+	s2, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if s2.phase != stackRunning {
+		t.Errorf("t should start the track op (running phase), got %v", s2.phase)
+	}
+	if cmd == nil {
+		t.Error("t should return a command to run the track op")
+	}
+	// On a tracked branch, t is inert.
+	s.status.Branch = "feat-mid"
+	if _, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}); cmd != nil {
+		t.Error("t must be a no-op on a tracked branch")
 	}
 }

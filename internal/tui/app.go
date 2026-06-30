@@ -6,9 +6,11 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cli/go-gh/v2/pkg/repository"
@@ -23,7 +25,17 @@ import (
 // separately, so capping is visible rather than silent).
 const searchLimit = 50
 
-// section is one board tab — either a search filter or the notifications feed.
+// group is one labeled list within a grouped section (e.g. "ASSIGNED TO ME"),
+// holding the open PRs that matched its sub-query after cross-group dedup.
+type group struct {
+	title string
+	items []gh.Item
+}
+
+// section is one board tab. Most sections are a single search filter (with an
+// OPEN/CLOSED split); a notifications section pulls the REST feed; a grouped
+// section (typ == SectionInvolved) renders several labeled sub-query lists
+// instead of the open/closed split.
 type section struct {
 	title       string
 	typ         string
@@ -35,6 +47,45 @@ type section struct {
 	loaded      bool
 	err         error
 	total       int
+
+	// Raw matches kept apart from the list so the groups can be re-folded without
+	// re-fetching: rebuildRows reassembles list items from these plus the fold
+	// state. A plain section uses open/closed; a grouped one uses groups.
+	open   []gh.Item
+	closed []gh.Item
+	groups []group
+
+	// Notification feed for the Notifications inbox (typ == SectionNotifications),
+	// split UNREAD/READ; the left pane's rows are built from these.
+	notifUnread []gh.Notification
+	notifRead   []gh.Notification
+
+	// collapsed records each foldable group's fold state, keyed by header label
+	// (e.g. "OPEN", "ASSIGNED TO ME"). Persists across refresh + section switches
+	// within a session; reset (expanded) on each launch.
+	collapsed map[string]bool
+}
+
+// grouped reports whether the section renders labeled sub-query lists rather than
+// the OPEN/CLOSED split.
+func (s *section) grouped() bool {
+	return s.typ == config.SectionInvolved || s.typ == config.SectionOrgs
+}
+
+// isNotif reports whether the section is the Notifications inbox (two-pane view).
+func (s *section) isNotif() bool { return s.typ == config.SectionNotifications }
+
+// rebuildRows reassembles the section's list rows from its stored matches and
+// current fold state. Called on load and whenever a group is toggled.
+func (s *section) rebuildRows() {
+	switch {
+	case s.isNotif():
+		s.list.SetItems(notifRows(s.notifUnread, s.notifRead, s.collapsed))
+	case s.grouped():
+		s.list.SetItems(groupedRows(s.groups, s.collapsed))
+	default:
+		s.list.SetItems(sectionRows(s.open, s.closed, s.collapsed["OPEN"], s.collapsed["CLOSED"]))
+	}
 }
 
 // appMode selects which screen is active.
@@ -49,8 +100,9 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	cfg config.Config
-	th  theme.Theme
+	cfg       config.Config
+	th        theme.Theme
+	themeMode string // "dark" | "light"; toggled with ctrl+t
 
 	width  int
 	height int
@@ -70,6 +122,7 @@ type Model struct {
 	localRepo  string // owner/name of the cwd repo, "" if none
 	showStack  bool
 	showHelp   bool
+	helpVP     viewport.Model // scrollable body of the help overlay
 
 	spinner spinner.Model
 
@@ -79,11 +132,44 @@ type Model struct {
 	rate          int
 	limit         int
 	headerErr     error
+
+	// flash is a transient status line shown in the header (overriding the session
+	// line) — e.g. while auto-syncing the board after you post on a PR. Cleared on
+	// a timer so the user sees what's happening without it sticking.
+	flash string
+
+	// notifPrev is the Notifications inbox preview-pane state: the thread currently
+	// previewed, whether its content is loading, and a per-thread content cache so
+	// arrowing back to a row is instant.
+	notifPrev notifPreview
+}
+
+// notifPreview holds the inbox preview pane's state: the thread currently shown,
+// the thread whose conversation is loaded into the scroll viewport, whether a
+// fetch is in flight, and a per-thread cache of fetched PR conversations so
+// arrowing back is instant. The preview reuses the detail screen's conversation
+// renderer (read-only); enter opens the same PR in the full interactive detail.
+type notifPreview struct {
+	threadID   string // selected thread (what the pane should show)
+	renderedAs string // render key (thread|theme|width) of what's in vp — re-render when it drifts
+	loading    bool
+	focused    bool // preview pane has focus → arrows/j/k scroll it, esc returns to list
+	vp         viewport.Model
+	cache      map[string]notifConvEntry
+}
+
+type notifConvEntry struct {
+	detail gh.PRDetail
+	err    error
 }
 
 // New constructs the root model from loaded config.
 func New(cfg config.Config) Model {
-	th := theme.New(cfg.Theme)
+	mode := cfg.ThemeMode
+	if mode != theme.ModeLight {
+		mode = theme.ModeDark
+	}
+	th := theme.Resolve(mode, cfg.Theme)
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
@@ -92,9 +178,11 @@ func New(cfg config.Config) Model {
 	m := Model{
 		cfg:           cfg,
 		th:            th,
+		themeMode:     mode,
 		spinner:       sp,
 		headerLoading: true,
 		showStack:     true,
+		notifPrev:     notifPreview{vp: newVP(), cache: map[string]notifConvEntry{}},
 	}
 
 	// Read the cwd repo's git-town lineage once (fast, local) for the drift
@@ -138,6 +226,7 @@ func New(cfg config.Config) Model {
 			closedLimit: limit,
 			list:        l,
 			loading:     true,
+			collapsed:   map[string]bool{},
 		})
 	}
 	return m
@@ -167,11 +256,71 @@ func fetchViewer() tea.Msg {
 // neither the section nor the global config specifies one.
 const closedLimit = 15
 
+// syncAllCmds marks every section (and the header) loading and returns the
+// commands to reload them — the whole-board sync shared by manual refresh (r) and
+// the auto-sync after you post on a PR. It mutates the receiver via the shared
+// section slice + header fields, so callers pass the returned cmds to tea.Batch.
+func (m *Model) syncAllCmds() []tea.Cmd {
+	cmds := []tea.Cmd{fetchViewer}
+	for i := range m.sections {
+		s := &m.sections[i]
+		s.loading = true
+		s.err = nil
+		cmds = append(cmds, loadSection(i, s.typ, s.filter, s.showClosed, s.closedLimit))
+	}
+	m.headerLoading = true
+	return cmds
+}
+
+// flashClearMsg dismisses the header flash after its display window.
+type flashClearMsg struct{}
+
+// clearFlashAfter dismisses the header flash a few seconds out — long enough to
+// read "syncing…", short enough not to linger after the sync has landed.
+func clearFlashAfter() tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return flashClearMsg{} })
+}
+
+// involvedSpec is one role group of the Involved tab: a label and its search
+// sub-query. The base excludes your own PRs (the My PRs tab) and review requests
+// (the Needs my review tab) so each PR has a single home — the most-actionable
+// tab that applies. Groups are deduped in priority order: Assigned > Mentioned >
+// Participating.
+type involvedSpec struct {
+	title, filter string
+}
+
+func involvedSpecs() []involvedSpec {
+	const base = "is:open is:pr -author:@me -review-requested:@me"
+	return []involvedSpec{
+		{"ASSIGNED TO ME", "assignee:@me " + base},
+		{"MENTIONED", "mentions:@me " + base},
+		{"PARTICIPATING", "commenter:@me " + base},
+	}
+}
+
 func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cmd {
 	return func() tea.Msg {
 		if typ == config.SectionNotifications {
-			items, total, err := gh.FetchNotifications(searchLimit)
-			return sectionLoadedMsg{idx: idx, items: items, total: total, err: err}
+			feed, err := gh.FetchNotificationFeed(searchLimit)
+			if err != nil {
+				return notifFeedMsg{idx: idx, err: err}
+			}
+			var unread, read []gh.Notification
+			for _, n := range feed {
+				if n.Unread {
+					unread = append(unread, n)
+				} else {
+					read = append(read, n)
+				}
+			}
+			return notifFeedMsg{idx: idx, unread: unread, read: read}
+		}
+		if typ == config.SectionInvolved {
+			return loadInvolved(idx)
+		}
+		if typ == config.SectionOrgs {
+			return loadOrgs(idx)
 		}
 		items, total, err := gh.SearchItems(filter, searchLimit)
 		if err != nil {
@@ -185,6 +334,107 @@ func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cm
 		}
 		return sectionLoadedMsg{idx: idx, items: items, closed: closed, total: total}
 	}
+}
+
+// groupedLoadedMsg carries a grouped section's loaded role groups (Involved).
+type groupedLoadedMsg struct {
+	idx    int
+	groups []group
+	total  int
+	err    error
+}
+
+// notifFeedMsg carries the Notifications inbox feed, pre-split into unread/read.
+type notifFeedMsg struct {
+	idx            int
+	unread, read   []gh.Notification
+	err            error
+}
+
+// notifConvMsg carries a lazily-fetched PR conversation for one thread.
+type notifConvMsg struct {
+	threadID string
+	detail   gh.PRDetail
+	err      error
+}
+
+// loadInvolved runs each role sub-query in turn, deduping across groups so a PR
+// surfaces only in its highest-priority group (Assigned > Mentioned >
+// Participating). A failure on any sub-query fails the section.
+func loadInvolved(idx int) tea.Msg {
+	seen := map[string]bool{}
+	var groups []group
+	total := 0
+	for _, sp := range involvedSpecs() {
+		items, _, err := gh.SearchItems(sp.filter, searchLimit)
+		if err != nil {
+			return groupedLoadedMsg{idx: idx, err: err}
+		}
+		kept := items[:0:0]
+		for _, it := range items {
+			key := fmt.Sprintf("%s#%d", it.Repo, it.Number)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			kept = append(kept, it)
+		}
+		groups = append(groups, group{title: sp.title, items: kept})
+		total += len(kept)
+	}
+	return groupedLoadedMsg{idx: idx, groups: groups, total: total}
+}
+
+// loadOrgs powers the discovery Orgs tab: it resolves the orgs you belong to,
+// then fetches open PRs across them that you are NOT yet involved in (and that
+// aren't review-requested from you — those live in Needs my review), one group
+// per org. A single search spans all orgs; results are bucketed by owner so each
+// org reads as its own foldable list.
+func loadOrgs(idx int) tea.Msg {
+	orgs, err := gh.FetchOrgs()
+	if err != nil {
+		return groupedLoadedMsg{idx: idx, err: err}
+	}
+	if len(orgs) == 0 {
+		return groupedLoadedMsg{idx: idx} // no orgs → empty tab, not an error
+	}
+
+	// Discovery filter: open PRs I have no relationship with yet, freshest first.
+	q := "is:open is:pr -involves:@me -review-requested:@me sort:updated-desc"
+	for _, o := range orgs {
+		q += " org:" + o
+	}
+	items, _, err := gh.SearchItems(q, searchLimit)
+	if err != nil {
+		return groupedLoadedMsg{idx: idx, err: err}
+	}
+
+	groups, total := orgGroups(orgs, items)
+	return groupedLoadedMsg{idx: idx, groups: groups, total: total}
+}
+
+// orgGroups buckets items into one group per org (in the given order), keyed by
+// repo owner case-insensitively — org logins and a repo's nameWithOwner share
+// GitHub's canonical case, but we normalize defensively. An org with no matches
+// still gets an (empty) group so it reads as "checked, nothing new". Group titles
+// are uppercased to match the other section headers (OPEN, ASSIGNED TO ME, …).
+func orgGroups(orgs []string, items []gh.Item) (groups []group, total int) {
+	byOrg := map[string][]gh.Item{}
+	for _, it := range items {
+		owner := it.Repo
+		if i := strings.IndexByte(owner, '/'); i >= 0 {
+			owner = owner[:i]
+		}
+		key := strings.ToLower(owner)
+		byOrg[key] = append(byOrg[key], it)
+	}
+	groups = make([]group, 0, len(orgs))
+	for _, o := range orgs {
+		gi := byOrg[strings.ToLower(o)]
+		groups = append(groups, group{title: strings.ToUpper(o), items: gi})
+		total += len(gi)
+	}
+	return groups, total
 }
 
 // closedFilter turns a section's (open) search into its closed counterpart:
@@ -212,42 +462,160 @@ func closedFilter(filter string) string {
 }
 
 // sectionRows assembles a section's list rows: open items, then any recently
-// closed/merged items beneath a divider. The "OPEN"/"CLOSED" labels appear
-// only when both groups are present — a lone group needs no header.
-func sectionRows(open, closed []gh.Item) []list.Item {
-	rows := make([]list.Item, 0, len(open)+len(closed)+3)
-	both := len(open) > 0 && len(closed) > 0
-	if both {
-		rows = append(rows, sectionHeader{"OPEN"})
+// closed/merged items beneath a divider. Whenever a closed tail is present the
+// OPEN/CLOSED structure is shown — including when there are zero open PRs, where a
+// muted "nothing open" placeholder sits under the OPEN header — so an all-closed
+// section reads as "nothing open + N closed" rather than an unlabeled list that
+// looks miscounted. A lone open group (no closed tail) needs no header.
+//
+// The OPEN/CLOSED headers are collapsible: when openCollapsed/closedCollapsed is
+// set the group's items (and the "nothing open" note) are omitted, leaving just
+// the foldable header. The headers are only emitted when a closed tail exists —
+// a lone open group stays a flat, unfoldable list.
+func sectionRows(open, closed []gh.Item, openCollapsed, closedCollapsed bool) []list.Item {
+	rows := make([]list.Item, 0, len(open)+len(closed)+4)
+	labeled := len(closed) > 0
+	if !labeled {
+		for _, it := range open {
+			rows = append(rows, prItem{it})
+		}
+		return rows
 	}
-	for _, it := range open {
-		rows = append(rows, prItem{it})
+	rows = append(rows, sectionHeader{label: "OPEN", collapsible: true, collapsed: openCollapsed, count: len(open)})
+	if !openCollapsed {
+		if len(open) == 0 {
+			rows = append(rows, listNote{"nothing open"})
+		}
+		for _, it := range open {
+			rows = append(rows, prItem{it})
+		}
 	}
-	if both {
-		// A blank spacer sets the closed group apart from the open list.
-		rows = append(rows, sectionHeader{""}, sectionHeader{"CLOSED"})
-	}
-	for _, it := range closed {
-		rows = append(rows, prItem{it})
+	// A blank spacer sets the closed group apart from the open list.
+	rows = append(rows, sectionHeader{}, sectionHeader{label: "CLOSED", collapsible: true, collapsed: closedCollapsed, count: len(closed)})
+	if !closedCollapsed {
+		for _, it := range closed {
+			rows = append(rows, prItem{it})
+		}
 	}
 	return rows
 }
 
-// ensureSelectable nudges the cursor off a divider row onto the nearest
-// selectable item (searching forward, then wrapping). No-op when already on a
-// real item or when the list holds none.
+// groupedRows assembles a grouped section's rows: each group gets a foldable
+// header (with its count) followed by its open items, separated by a blank
+// spacer. A folded group hides its items; an empty, expanded group shows a muted
+// "none" placeholder so it doesn't read as broken. Group titles are unique, so
+// the collapsed map keys cleanly by label.
+func groupedRows(groups []group, collapsed map[string]bool) []list.Item {
+	rows := make([]list.Item, 0, len(groups)*2)
+	for i, g := range groups {
+		if i > 0 {
+			rows = append(rows, sectionHeader{}) // spacer between groups
+		}
+		folded := collapsed[g.title]
+		rows = append(rows, sectionHeader{label: g.title, collapsible: true, collapsed: folded, count: len(g.items)})
+		if folded {
+			continue
+		}
+		if len(g.items) == 0 {
+			rows = append(rows, listNote{"none"})
+		}
+		for _, it := range g.items {
+			rows = append(rows, prItem{it})
+		}
+	}
+	return rows
+}
+
+// notifRows assembles the inbox's rows: unread items beneath an UNREAD header,
+// then read items beneath a (foldable) READ header — the same collapsible split
+// as OPEN/CLOSED. The headers always show so the inbox reads as "N unread / M
+// read" even when one side is empty (a muted note fills an empty side).
+func notifRows(unread, read []gh.Notification, collapsed map[string]bool) []list.Item {
+	rows := make([]list.Item, 0, len(unread)+len(read)+4)
+	rows = append(rows, sectionHeader{label: "UNREAD", collapsible: true, collapsed: collapsed["UNREAD"], count: len(unread)})
+	if !collapsed["UNREAD"] {
+		if len(unread) == 0 {
+			rows = append(rows, listNote{"nothing unread"})
+		}
+		for _, n := range unread {
+			rows = append(rows, notifItem{n})
+		}
+	}
+	rows = append(rows, sectionHeader{}, sectionHeader{label: "READ", collapsible: true, collapsed: collapsed["READ"], count: len(read)})
+	if !collapsed["READ"] {
+		if len(read) == 0 {
+			rows = append(rows, listNote{"nothing read"})
+		}
+		for _, n := range read {
+			rows = append(rows, notifItem{n})
+		}
+	}
+	return rows
+}
+
+// contentRow reports whether a list row is a real content item (a PR or a
+// notification) as opposed to a header/spacer/note — used to rest the cursor on
+// something meaningful after a (re)load.
+func contentRow(li list.Item) bool {
+	switch li.(type) {
+	case prItem, notifItem:
+		return true
+	}
+	return false
+}
+
+// navigable reports whether the cursor may rest on this row: real items and
+// collapsible group headers (so the user can fold/unfold them with enter), but
+// not the blank spacer or muted notes.
+func navigable(li list.Item) bool {
+	switch h := li.(type) {
+	case prItem, notifItem:
+		return true
+	case sectionHeader:
+		return h.collapsible
+	}
+	return false
+}
+
+// preferItem rests the cursor on a real PR row whenever there is one, nudging
+// off any header/spacer (scanning forward, then wrapping). Used after (re)loading
+// so the cursor lands on a PR rather than the freshly-arrived OPEN header — even
+// though headers are otherwise navigable. Falls back to ensureSelectable when the
+// list has no PR rows (all groups folded, or empty).
+func preferItem(lst *list.Model) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	if contentRow(items[lst.Index()]) {
+		return
+	}
+	for i := 0; i < n; i++ {
+		idx := (lst.Index() + i) % n
+		if contentRow(items[idx]) {
+			lst.Select(idx)
+			return
+		}
+	}
+	ensureSelectable(lst)
+}
+
+// ensureSelectable nudges the cursor off a non-navigable row (the blank spacer or
+// a note) onto the nearest navigable row — a real item or a foldable header —
+// searching forward then wrapping. No-op when already navigable or list is empty.
 func ensureSelectable(lst *list.Model) {
 	items := lst.Items()
 	n := len(items)
 	if n == 0 {
 		return
 	}
-	if _, ok := items[lst.Index()].(prItem); ok {
+	if navigable(items[lst.Index()]) {
 		return
 	}
 	for i := 1; i <= n; i++ {
 		idx := (lst.Index() + i) % n
-		if _, ok := items[idx].(prItem); ok {
+		if navigable(items[idx]) {
 			lst.Select(idx)
 			return
 		}
@@ -258,16 +626,29 @@ func ensureSelectable(lst *list.Model) {
 // selectable (non-divider) rows, and the total selectable count — so the
 // position counter ignores divider headers.
 func selectablePos(lst *list.Model) (pos, total int) {
-	for i, li := range lst.Items() {
-		if _, ok := li.(prItem); !ok {
+	items := lst.Items()
+	idx := lst.Index()
+	// total counts PRs only — group headers are not items, so they don't inflate
+	// the count. nextRank is the rank of the first PR at or after the cursor, so a
+	// cursor parked on an OPEN/CLOSED header reads as the start of that group
+	// rather than 0.
+	nextRank := 0
+	for i, li := range items {
+		if !contentRow(li) {
 			continue
 		}
 		total++
-		if i <= lst.Index() {
-			pos = total
+		if nextRank == 0 && i >= idx {
+			nextRank = total
 		}
 	}
-	return pos, total
+	if total == 0 {
+		return 0, 0
+	}
+	if nextRank == 0 { // cursor sits past the last PR
+		nextRank = total
+	}
+	return nextRank, total
 }
 
 // selectAdjacent moves the cursor to the next selectable item in direction dir
@@ -281,7 +662,27 @@ func selectAdjacent(lst *list.Model, dir int) {
 	cur := lst.Index()
 	for i := 0; i < n; i++ {
 		cur = (cur + dir + n) % n
-		if _, ok := items[cur].(prItem); ok {
+		if navigable(items[cur]) {
+			lst.Select(cur)
+			return
+		}
+	}
+}
+
+// selectAdjacentHeader jumps the cursor straight to the next foldable group
+// header (OPEN/CLOSED) in direction dir, wrapping — so n/N hop between the two
+// group selectors regardless of how many PRs sit between them. A no-op when the
+// list has no headers (a lone open group with no closed tail).
+func selectAdjacentHeader(lst *list.Model, dir int) {
+	items := lst.Items()
+	n := len(items)
+	if n == 0 {
+		return
+	}
+	cur := lst.Index()
+	for i := 0; i < n; i++ {
+		cur = (cur + dir + n) % n
+		if h, ok := items[cur].(sectionHeader); ok && h.collapsible {
 			lst.Select(cur)
 			return
 		}
@@ -305,6 +706,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeLists()
+		if m.showHelp {
+			m.openHelp() // re-flow the overlay to the new size
+		}
 		if m.mode == modeDetail {
 			var cmd tea.Cmd
 			m.detail, cmd = m.detail.Update(msg) // keep the detail screen sized
@@ -329,6 +733,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailExitMsg:
 		m.mode = modeDashboard
+		// If you posted on the PR, auto-sync the whole board so it moves to its new
+		// home (e.g. Orgs → Involved) without a manual refresh — with a header flash
+		// so it's clear why every tab just reloaded.
+		if msg.posted {
+			m.flash = "↻ You posted — syncing all tabs so this PR moves to its new home…"
+			cmds := append(m.syncAllCmds(), clearFlashAfter())
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case flashClearMsg:
+		m.flash = ""
 		return m, nil
 
 	case stackExitMsg:
@@ -366,8 +782,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "?", "esc", "q":
 				m.showHelp = false
+				return m, nil
 			}
-			return m, nil
+			// Anything else scrolls the (possibly taller-than-screen) help body.
+			var cmd tea.Cmd
+			m.helpVP, cmd = m.helpVP.Update(msg)
+			return m, cmd
 		}
 		// Open help on ? — unless a text field is capturing input, where ? is a
 		// literal character.
@@ -376,7 +796,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			(m.mode == modeConflict && m.conflict.capturing())
 		if msg.String() == "?" && !capturing {
 			m.showHelp = true
+			m.openHelp() // build + size the scrollable help body for this mode/terminal
 			return m, nil
+		}
+		// Theme toggle is global — flip light/dark from any screen. ctrl+t is a
+		// control key, so it never collides with text fields (no capturing guard).
+		if msg.String() == "ctrl+t" {
+			return m.toggleTheme()
 		}
 	}
 
@@ -411,6 +837,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.login = msg.v.Login
 			m.rate = msg.v.RateRemaining
 			m.limit = msg.v.RateLimit
+			viewerLogin = msg.v.Login // so renderMarkdown can flag your own @mentions
 		}
 		return m, nil
 
@@ -424,10 +851,70 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.err = msg.err
 		s.total = msg.total
 		if msg.err == nil {
-			s.list.SetItems(sectionRows(msg.items, msg.closed))
-			ensureSelectable(&s.list)
+			// Keep the raw matches so the OPEN/CLOSED groups can be re-folded
+			// without re-fetching; fold state persists across the reload.
+			s.open = msg.items
+			s.closed = msg.closed
+			s.rebuildRows()
+			preferItem(&s.list)
 			m.rebuildStacks()
 			m.resizeLists() // sidebar visibility may have changed
+		}
+		return m, nil
+
+	case groupedLoadedMsg:
+		if msg.idx < 0 || msg.idx >= len(m.sections) {
+			return m, nil
+		}
+		s := &m.sections[msg.idx]
+		s.loading = false
+		s.loaded = true
+		s.err = msg.err
+		s.total = msg.total
+		if msg.err == nil {
+			s.groups = msg.groups
+			s.rebuildRows()
+			preferItem(&s.list)
+			m.rebuildStacks()
+			m.resizeLists()
+		}
+		return m, nil
+
+	case notifFeedMsg:
+		if msg.idx < 0 || msg.idx >= len(m.sections) {
+			return m, nil
+		}
+		s := &m.sections[msg.idx]
+		s.loading = false
+		s.loaded = true
+		s.err = msg.err
+		s.total = len(msg.unread) + len(msg.read)
+		if msg.err == nil {
+			s.notifUnread = msg.unread
+			s.notifRead = msg.read
+			s.rebuildRows()
+			preferItem(&s.list)
+			m.resizeLists()
+			// Prime the preview for whatever row we landed on.
+			if msg.idx == m.active {
+				return m, m.notifPreviewCmd()
+			}
+		}
+		return m, nil
+
+	case notifConvMsg:
+		m.notifPrev.cache[msg.threadID] = notifConvEntry{detail: msg.detail, err: msg.err}
+		if msg.threadID == m.notifPrev.threadID {
+			m.notifPrev.loading = false
+			m.loadPreviewVP() // render the freshly-loaded conversation into the scroll vp
+		}
+		return m, nil
+
+	case markReadMsg:
+		// The row was moved optimistically; only surface a failure.
+		if msg.err != nil {
+			m.flash = "couldn't mark read: " + msg.err.Error()
+			return m, clearFlashAfter()
 		}
 		return m, nil
 
@@ -436,14 +923,84 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "enter":
+			// On a foldable OPEN/CLOSED (or UNREAD/READ) header, enter folds the group.
+			if m.toggleSelectedGroup() {
+				return m, nil
+			}
+			// Inbox drill-in: enter first focuses the preview to read/scroll the
+			// conversation, then (already focused) opens the full interactive detail.
+			// esc backs out a level.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+				if n, ok := m.selectedNotif(); ok {
+					if !m.notifPrev.focused && n.Type == "PullRequest" && n.Number > 0 {
+						m.notifPrev.focused = true
+						return m, m.notifPreviewCmd()
+					}
+					return m.openSelected()
+				}
+			}
 			return m.openSelected()
-		case "tab", "l", "right":
+		case "tab", "l":
+			m.notifPrev.focused = false // leaving the inbox drops preview focus
 			m.active = (m.active + 1) % len(m.sections)
-			return m, nil
-		case "shift+tab", "h", "left":
+			return m, m.notifPreviewCmd() // prime the inbox preview if we landed there
+		case "shift+tab", "h":
+			m.notifPrev.focused = false
 			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
-			return m, nil
+			return m, m.notifPreviewCmd()
+		case "right":
+			// On the inbox, right opens (focuses) the preview for a PR, or hides it if
+			// already focused; otherwise it advances to the next section.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+				if m.notifPrev.focused {
+					m.notifPrev.focused = false
+					return m, nil
+				}
+				if n, ok := m.selectedNotif(); ok && n.Type == "PullRequest" && n.Number > 0 {
+					m.notifPrev.focused = true
+					return m, m.notifPreviewCmd()
+				}
+			}
+			m.notifPrev.focused = false
+			m.active = (m.active + 1) % len(m.sections)
+			return m, m.notifPreviewCmd()
+		case "left":
+			// Mirror: on the inbox with the preview focused, left returns to the list;
+			// otherwise it steps to the previous section.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() && m.notifPrev.focused {
+				m.notifPrev.focused = false
+				return m, nil
+			}
+			m.notifPrev.focused = false
+			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
+			return m, m.notifPreviewCmd()
+		case "n":
+			// Hop straight to the next OPEN/CLOSED (or UNREAD/READ) group header —
+			// quick travel between selectors even with many rows between them.
+			if len(m.sections) > 0 {
+				selectAdjacentHeader(&m.sections[m.active].list, +1)
+			}
+			return m, m.notifPreviewCmd()
+		case "N":
+			if len(m.sections) > 0 {
+				selectAdjacentHeader(&m.sections[m.active].list, -1)
+			}
+			return m, m.notifPreviewCmd()
+		case "x":
+			// Mark the selected notification as read (inbox only). No-op elsewhere.
+			return m.markSelectedRead()
+		case "esc":
+			// On the inbox, esc returns focus from the preview pane to the list.
+			if m.notifPrev.focused {
+				m.notifPrev.focused = false
+				return m, nil
+			}
 		case "s":
+			// The stack sidebar is a PR-list-tab feature; on the Notifications inbox
+			// it has nowhere to render, so s is a no-op there.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+				return m, nil
+			}
 			m.showStack = !m.showStack
 			m.resizeLists()
 			return m, nil
@@ -452,37 +1009,105 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stackMode = newStackModel(m.th, m.localRepo)
 			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			m.mode = modeStack
-			return m, nil
+			// Load the open-PR flags for the local tree (branch → #number).
+			return m, fetchStackPRNums(m.localRepo)
 		case "r":
-			cmds := []tea.Cmd{fetchViewer}
-			s := &m.sections[m.active]
-			s.loading = true
-			s.err = nil
-			cmds = append(cmds, loadSection(m.active, s.typ, s.filter, s.showClosed, s.closedLimit))
-			m.headerLoading = true
-			return m, tea.Batch(cmds...)
+			// Refresh is a whole-board sync, not just the active tab: re-run every
+			// section's query so a PR whose state changed (e.g. you just commented on
+			// an Orgs PR) lands in its correct home across all tabs in one press,
+			// instead of needing a separate refresh per tab.
+			return m, tea.Batch(m.syncAllCmds()...)
 		}
 		// Forward navigation to the active section's list. j/k/arrows move to the
 		// next selectable row, skipping divider headers and wrapping at the ends.
 		if len(m.sections) > 0 {
+			// Inbox preview focused: arrows/j/k scroll the conversation, not the list.
+			if m.sections[m.active].isNotif() && m.notifPrev.focused {
+				switch msg.String() {
+				case "down", "j":
+					m.notifPrev.vp.LineDown(1)
+					return m, nil
+				case "up", "k":
+					m.notifPrev.vp.LineUp(1)
+					return m, nil
+				}
+			}
 			lst := &m.sections[m.active].list
 			if len(lst.Items()) > 0 && lst.FilterState() != list.Filtering {
 				switch msg.String() {
 				case "down", "j":
 					selectAdjacent(lst, +1)
-					return m, nil
+					return m, m.notifPreviewCmd()
 				case "up", "k":
 					selectAdjacent(lst, -1)
-					return m, nil
+					return m, m.notifPreviewCmd()
 				}
 			}
 			var cmd tea.Cmd
 			m.sections[m.active].list, cmd = m.sections[m.active].list.Update(msg)
 			ensureSelectable(&m.sections[m.active].list)
-			return m, cmd
+			return m, tea.Batch(cmd, m.notifPreviewCmd())
 		}
 	}
 	return m, nil
+}
+
+// toggleTheme flips between the light and dark palettes live, threading the new
+// theme into every open screen, re-rendering cached viewport content, and
+// persisting the choice. The redraw clears first so old-palette backgrounds
+// don't ghost behind the new ones.
+func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
+	m.themeMode = theme.Toggle(m.themeMode)
+	m.th = theme.Resolve(m.themeMode, m.cfg.Theme)
+	m.spinner.Style = lipgloss.NewStyle().Foreground(m.th.Focus)
+
+	// The list-row delegate carries the theme, so rebuild it; then push the new
+	// theme into whichever sub-screen is live (detail caches rendered viewports,
+	// so it needs an explicit re-render — stack and conflict render from th).
+	m.resizeLists()
+	// The inbox preview caches its rendered conversation (themed ANSI); its render
+	// key includes the theme, so this re-renders it under the new palette — else a
+	// dark-rendered conversation would show dark colors on the light page.
+	m.loadPreviewVP()
+	switch m.mode {
+	case modeDetail:
+		m.detail.restyle(m.th)
+	case modeStack:
+		m.stackMode.th = m.th
+		m.stackMode.restyleComposer() // re-theme the textarea/title under the new palette
+	case modeConflict:
+		m.conflict.th = m.th
+	}
+
+	// Persist out-of-band; a write failure must not break the live toggle.
+	mode := m.themeMode
+	persist := func() tea.Msg { _ = config.SaveThemeMode(mode); return nil }
+	return m, tea.Batch(tea.ClearScreen, persist)
+}
+
+// toggleSelectedGroup folds or unfolds the OPEN/CLOSED group whose header is
+// highlighted, rebuilding the list in place and keeping the cursor on the header
+// so it can be toggled back. Reports whether a foldable header was acted on (so
+// the caller can fall through to opening a PR when it wasn't). It mutates the
+// active section through the shared slice backing array, so the value receiver is
+// fine — same pattern as the loading/refresh handlers.
+func (m Model) toggleSelectedGroup() bool {
+	if len(m.sections) == 0 {
+		return false
+	}
+	s := &m.sections[m.active]
+	h, ok := s.list.SelectedItem().(sectionHeader)
+	if !ok || !h.collapsible {
+		return false
+	}
+	idx := s.list.Index()
+	s.collapsed[h.label] = !s.collapsed[h.label]
+	s.rebuildRows()
+	// The toggled header keeps its index (only rows below it appear/disappear), so
+	// the cursor stays put; ensureSelectable is a safety net.
+	s.list.Select(idx)
+	ensureSelectable(&s.list)
+	return true
 }
 
 // openSelected opens the highlighted dashboard row in the detail screen, if it
@@ -493,24 +1118,58 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	sel := m.sections[m.active].list.SelectedItem()
-	it, ok := sel.(prItem)
-	if !ok || !it.IsPR || it.Number == 0 {
-		return m, nil
+	// A PR (a PR row or a PR notification) opens the in-app detail screen, where
+	// the full conversation lives and you can participate.
+	if it := selectedAsItem(sel); it.IsPR && it.Number > 0 {
+		m.detail = newDetail(m.th, it)
+		m.detail, _ = m.detail.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		m.mode = modeDetail
+		return m, m.detail.Init()
 	}
-	m.detail = newDetail(m.th, it.Item)
-	m.detail, _ = m.detail.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
-	m.mode = modeDetail
-	return m, m.detail.Init()
+	// A non-PR notification (Issue, Release, Discussion, …) has no in-app view, so
+	// open it on GitHub.
+	if n, ok := sel.(notifItem); ok {
+		return m, openBrowser(notifWebURL(n.Notification))
+	}
+	return m, nil
+}
+
+// selectedAsItem normalizes the selected row to a gh.Item the detail screen can
+// open. A PR row passes through; a PR notification is mapped to a minimal Item
+// (the detail screen re-fetches by owner/repo/number). Anything else returns a
+// zero Item (not a PR), so the caller ignores it.
+func selectedAsItem(sel list.Item) gh.Item {
+	switch it := sel.(type) {
+	case prItem:
+		return it.Item
+	case notifItem:
+		if it.Type == "PullRequest" && it.Number > 0 {
+			return gh.Item{
+				IsPR:   true,
+				Repo:   it.Repo,
+				Number: it.Number,
+				Title:  it.Title,
+				URL:    fmt.Sprintf("https://github.com/%s/pull/%d", it.Repo, it.Number),
+			}
+		}
+	}
+	return gh.Item{}
 }
 
 // chrome heights, used for both layout and list sizing. The tab strip is three
 // rows: the active tab's top border, the labels, and the body's top line. The
 // header is two rows: the brand line and the session/status line.
 const (
-	headerH = 2
-	tabsH   = 3
-	footerH = 1
+	headerH    = 2
+	tabsH      = 3
+	footerH    = 3 // legend line + rule + keybinding line
+	colHeaderH = 1 // the PR-list column-label row above each section
 )
+
+// appMarginLeft is the left gutter for body content so it clears the terminal's
+// left edge. It is applied per-region via indentBody (body content only) — the
+// full-width Surface bars (header, footer, statusline) stay flush to the edge.
+const appMarginLeft = 2
 
 // logoGlyph is Cairn's mark in the header brand line. Pulled out so it's a
 // one-line swap; ⟁ (a small triangle within a triangle) reads as a cairn/peak.
@@ -521,37 +1180,81 @@ func (m *Model) resizeLists() {
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	listW := m.width
-	listH := bodyH
+	bw := bodyWidth(m.width)
+	listW := bw
 	if m.sidebarVisible() {
-		listW = m.width - stackPaneW - 1 // sidebar + vertical separator
+		listW = bw - stackPaneW - 1 // sidebar + vertical separator
 		if listW < 20 {
 			listW = 20
 		}
-		listH = bodyH - 2 // the list pane gains a focused title + rule
-		if listH < 1 {
-			listH = 1
-		}
+	}
+	// The list pane always carries a section title + rule (the "Orgs ▴ 1/10 ▾"
+	// subheader) above the column-label row, sidebar or not.
+	listH := bodyH - 2 - colHeaderH
+	if listH < 1 {
+		listH = 1
 	}
 	delegate := itemDelegate{th: m.th, width: listW}
+	// The inbox list is a fixed, compact left pane (the preview takes the rest), so
+	// it sizes independently of the PR-list/sidebar geometry.
+	notifW := notifListW
+	if notifW > bw-30 {
+		notifW = bw / 2
+	}
+	notifDelegate := itemDelegate{th: m.th, width: notifW}
+	notifH := bodyH - 2 // title + rule
+	if notifH < 1 {
+		notifH = 1
+	}
 	for i := range m.sections {
+		if m.sections[i].isNotif() {
+			m.sections[i].list.SetDelegate(notifDelegate)
+			m.sections[i].list.SetSize(notifW, notifH)
+			continue
+		}
 		m.sections[i].list.SetDelegate(delegate)
 		m.sections[i].list.SetSize(listW, listH)
 	}
+
+	// Size the inbox preview viewport to its pane (and re-render its content at the
+	// new width, since wrapping changed).
+	_, previewW, _ := notifPaneDims(bw)
+	pvH := bodyH - notifPreviewHeaderH
+	if pvH < 1 {
+		pvH = 1
+	}
+	if m.notifPrev.vp.Width != previewW || m.notifPrev.vp.Height != pvH {
+		m.notifPrev.vp.Width = previewW
+		m.notifPrev.vp.Height = pvH
+		m.loadPreviewVP() // render key includes width → re-renders at the new size
+	}
 }
 
-// stackPaneW is the fixed width of the stack sidebar.
-const stackPaneW = 34
+// stackPaneW is the base width of the stack sidebar (dashboard) and the floor for
+// the stack-mode tree, which grows past it to fit long branch names. A compact
+// default that keeps room for the main content; toggle the dashboard sidebar off
+// with `s` on a narrow monitor.
+const stackPaneW = 36
+
+// notifListW is the fixed width of the inbox's left (list) pane; the preview pane
+// takes the remaining body width.
+const notifListW = 46
 
 // rebuildStacks reconstructs remote stacks from every loaded PR across all
 // sections (deduped), so the sidebar can follow the selected PR.
 func (m *Model) rebuildStacks() {
 	seen := map[string]bool{}
 	var refs []stack.PRRef
+	// Iterate the stored matches, not the visible list rows, so folding a group
+	// doesn't drop its PRs from the reconstructed sidebar.
 	for i := range m.sections {
-		for _, li := range m.sections[i].list.Items() {
-			it, ok := li.(prItem)
-			if !ok || !it.IsPR || it.HeadBranch == "" {
+		s := &m.sections[i]
+		items := append(append([]gh.Item{}, s.open...), s.closed...)
+		for _, g := range s.groups {
+			items = append(items, g.items...)
+		}
+		for _, it := range items {
+			if !it.IsPR || it.HeadBranch == "" {
 				continue
 			}
 			key := fmt.Sprintf("%s#%d", it.Repo, it.Number)
@@ -589,51 +1292,144 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "starting…"
 	}
-	if m.showHelp {
-		return m.renderHelp()
+	var body string
+	switch {
+	case m.showHelp:
+		body = m.renderHelp()
+	case m.mode == modeDetail:
+		body = m.detail.View(m.spinner.View())
+	case m.mode == modeStack:
+		body = m.stackMode.View(m.spinner.View(), m.viewHeader())
+	case m.mode == modeConflict:
+		body = m.conflict.View()
+	default:
+		// Header and footer are full-width bars (flush to the edges); only the
+		// tabs+body content is indented by the left gutter.
+		mid := indentBody(lipgloss.JoinVertical(lipgloss.Left, m.viewTabs(), m.viewBody()))
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			m.viewHeader(),
+			mid,
+			m.viewFooter(),
+		)
 	}
-	if m.mode == modeDetail {
-		return m.detail.View()
+	return m.paintBackground(body)
+}
+
+// paintBackground fills the whole frame with the theme's Base background and Text
+// foreground. lipgloss ends every styled run with a full reset (ESC[0m), which also
+// clears the background, so plain text following a reset on the same line falls back
+// to the terminal's own background. In dark mode that's invisible (terminal ≈ Base),
+// but in light mode the body would show the dark terminal through. We reassert the
+// document default (Text on Base) after every reset so unstyled regions keep the
+// page color, then let the outer style pad each line to full width and the frame to
+// full height.
+func (m Model) paintBackground(view string) string {
+	def := lipgloss.NewStyle().Foreground(m.th.Text).Background(m.th.Base)
+	// The opening SGR for the default: render a marker and slice off the codes
+	// before it. Empty when the color profile has no color (e.g. tests) — a no-op.
+	stamped := def.Render("\x00")
+	reassert := stamped[:strings.IndexByte(stamped, '\x00')]
+	if reassert != "" {
+		view = strings.ReplaceAll(view, "\x1b[0m", "\x1b[0m"+reassert)
+		view = reassert + view
 	}
-	if m.mode == modeStack {
-		return m.stackMode.View(m.spinner.View())
+	return def.Width(m.width).Height(m.height).Render(view)
+}
+
+// indentBody left-pads every line of a body block by appMarginLeft spaces so the
+// content clears the terminal's left edge, while full-width bars (header, footer,
+// statusline) rendered outside it stay flush to the edge. Plain spaces suffice:
+// paintBackground keeps Base asserted at the start of every line, so the gutter
+// renders in the page color. Callers must size the block to bodyWidth(width) so
+// indent + content lands back at full width.
+func indentBody(s string) string {
+	if appMarginLeft <= 0 {
+		return s
 	}
-	if m.mode == modeConflict {
-		return m.conflict.View()
+	pad := strings.Repeat(" ", appMarginLeft)
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = pad + lines[i]
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.viewHeader(),
-		m.viewTabs(),
-		m.viewBody(),
-		m.viewFooter(),
-	)
+	return strings.Join(lines, "\n")
+}
+
+// bodyWidth is the width available to indented body content: the full width minus
+// the left gutter indentBody adds back.
+func bodyWidth(width int) int {
+	w := width - appMarginLeft
+	if w < 1 {
+		w = width
+	}
+	return w
+}
+
+// surfaceBar paints content as a full-width bar in the theme's Surface color —
+// the shared primitive behind both the top header and every screen's bottom
+// footer, so the eye reads them as one matched frame around the Base body (the
+// action area "pops" from the center). Same mechanism as paintBackground but for
+// Surface: lipgloss ends every styled run with ESC[0m, which clears the
+// background, so any gap between fragments (or a fragment styled with only a
+// foreground) would fall back to whatever bg is active — Base, after
+// paintBackground's global reassert — and read as a second color on the bar.
+// We reassert Surface after every reset inside content so the whole bar stays
+// one color. Composition is order-safe: paintBackground later inserts its Base
+// reassert immediately after each ESC[0m, i.e. *before* the Surface one we
+// inject here, so Surface wins on the bar while Base still wins off it. Content
+// must already carry its own left padding; the helper sets only width + colors.
+func surfaceBar(th theme.Theme, width int, content string) string {
+	return styledBar(th.Text, th.Surface, width, content)
+}
+
+// styledBar is surfaceBar generalized to any fg/bg: it paints content as a
+// full-width bar and reasserts fg+bg after every ESC[0m inside it, so inner
+// styled fragments (a colored CI dot, a draft tag) don't punch the background
+// back to the page color after their own reset. Used for the selected list row
+// (Primary-on-Surface), whose highlight must span the whole line in both themes.
+func styledBar(fg, bg lipgloss.Color, width int, content string) string {
+	s := lipgloss.NewStyle().Foreground(fg).Background(bg)
+	stamped := s.Render("\x00")
+	reassert := stamped[:strings.IndexByte(stamped, '\x00')]
+	if reassert != "" {
+		content = strings.ReplaceAll(content, "\x1b[0m", "\x1b[0m"+reassert)
+		content = reassert + content
+	}
+	return s.Width(width).Render(content)
 }
 
 func (m Model) viewHeader() string {
-	row := lipgloss.NewStyle().Width(m.width).Background(m.th.Surface).
-		Foreground(m.th.Text).Padding(0, 1)
+	return renderBrandHeader(m.th, m.login, m.rate, m.headerLoading, m.headerErr, m.width, m.flash)
+}
 
+// renderBrandHeader draws Cairn's two-row masthead — the brand line over the
+// session/status line — as a Surface bar. It is a standalone function (not a
+// Model method) so full-screen modes that take over the dashboard, like stack
+// mode, can show the same top bar without duplicating it. headerH (2) must match
+// the line count this returns.
+func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, herr error, width int, flash string) string {
 	// Row 1 — brand. The mark + name get their own line so they read as a
 	// masthead rather than competing with the status text.
-	brand := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
-	tagline := lipgloss.NewStyle().Foreground(m.th.Muted).Render("   keyboard cockpit for GitHub")
-	brandRow := row.Render(brand + tagline)
+	brand := lipgloss.NewStyle().Foreground(th.Primary).Bold(true).Render(logoGlyph + "  Cairn")
+	tagline := lipgloss.NewStyle().Foreground(th.Muted).Render("   keyboard cockpit for GitHub")
+	brandRow := surfaceBar(th, width, " "+brand+tagline)
 
-	// Row 2 — session/status.
+	// Row 2 — session/status. A flash (e.g. the post-then-sync notice) takes the
+	// line so the user sees what's happening, overriding the usual session info.
 	var status string
 	switch {
-	case m.headerLoading:
-		status = lipgloss.NewStyle().Foreground(m.th.Focus).Render("connecting…")
-	case m.headerErr != nil:
-		status = lipgloss.NewStyle().Foreground(m.th.Danger).Render(m.headerErr.Error())
+	case flash != "":
+		status = lipgloss.NewStyle().Foreground(th.Focus).Bold(true).Render(flash)
+	case loading:
+		status = lipgloss.NewStyle().Foreground(th.Focus).Render("connecting…")
+	case herr != nil:
+		status = lipgloss.NewStyle().Foreground(th.Danger).Render(herr.Error())
 	default:
-		who := lipgloss.NewStyle().Foreground(m.th.Info).Render(m.login)
-		calls := lipgloss.NewStyle().Foreground(m.th.Muted).
-			Render(fmt.Sprintf("%d API calls remaining", m.rate))
-		status = lipgloss.NewStyle().Foreground(m.th.Text).Render("Logged in as ") + who +
-			lipgloss.NewStyle().Foreground(m.th.Muted).Render(" · ") + calls
+		who := lipgloss.NewStyle().Foreground(th.Info).Render(login)
+		calls := lipgloss.NewStyle().Foreground(th.Muted).Render(fmt.Sprintf("%d API calls remaining", rate))
+		status = lipgloss.NewStyle().Foreground(th.Text).Render("Logged in as ") + who +
+			lipgloss.NewStyle().Foreground(th.Muted).Render(" · ") + calls
 	}
-	statusRow := row.Render(status)
+	statusRow := surfaceBar(th, width, " "+status)
 
 	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
@@ -667,7 +1463,7 @@ func (m Model) viewTabs() string {
 
 	// Extend the body's top line to the full width past the last tab — the
 	// whole rule reads as one continuous focus-colored line.
-	gap := m.width - lipgloss.Width(row)
+	gap := bodyWidth(m.width) - lipgloss.Width(row)
 	if gap < 0 {
 		gap = 0
 	}
@@ -680,47 +1476,58 @@ func (m Model) viewBody() string {
 	if bodyH < 1 {
 		bodyH = 1
 	}
+	bw := bodyWidth(m.width)
 	if len(m.sections) == 0 {
-		return lipgloss.NewStyle().Width(m.width).Height(bodyH).
+		return lipgloss.NewStyle().Width(bw).Height(bodyH).
 			Foreground(m.th.Muted).Render("  no sections configured")
 	}
 
+	// The Notifications inbox owns the whole body with its own two-pane layout.
+	if m.sections[m.active].isNotif() {
+		return m.viewNotifications(bodyH, bw)
+	}
+
 	sidebar := m.sidebarVisible()
-	listW, listH := m.width, bodyH
+	listW := bw
 	if sidebar {
-		listW = m.width - stackPaneW - 1
-		listH = bodyH - 2
+		listW = bw - stackPaneW - 1
+	}
+	listH := bodyH - 2 - colHeaderH // section title + rule always sit above the list
+	if listH < 1 {
+		listH = 1
 	}
 
 	s := m.sections[m.active]
+	// Column labels above the list. The author column reads "Opened by" — at the
+	// list level GitHub gives us the PR author, not who requested the review.
+	colHead := columnHeader(m.th, listW, "Opened by")
 	box := lipgloss.NewStyle().Width(listW).Height(listH)
-	var body string
+	var listBody string
 	switch {
 	case s.loading:
-		body = box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
+		listBody = box.Render(fmt.Sprintf("  %s loading %s…", m.spinner.View(), s.title))
 	case s.err != nil:
-		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
+		listBody = box.Render(lipgloss.NewStyle().Foreground(m.th.Danger).
 			Render("  error: " + s.err.Error()))
 	case len(s.list.Items()) == 0:
-		body = box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).Render("  nothing here"))
+		listBody = box.Render(lipgloss.NewStyle().Foreground(m.th.Muted).Render("  nothing here"))
 	default:
-		body = s.list.View()
+		listBody = s.list.View()
 	}
-
-	if !sidebar {
-		return body
-	}
-
-	// The list is the focused pane: a blue title (with a position counter so
-	// it's obvious you're moving the PR list, not the stack) over a blue rule.
+	// The section subheader (a blue title with a position counter so it's obvious
+	// you're moving the PR list, not the stack) over a blue rule — always shown,
+	// whether or not the stack sidebar is open.
 	label := s.title
 	if pos, n := selectablePos(&s.list); n > 0 {
 		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
 	}
 	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
 	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
-	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, body)
+	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, colHead, listBody)
 
+	if !sidebar {
+		return listPane
+	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, m.renderStackSidebar(stackPaneW, bodyH), stackVBar(m.th, bodyH), listPane)
 }
 
@@ -832,6 +1639,22 @@ func (m Model) renderStackTree(nodes []*stack.Node, repo, selectedHead string, w
 	return b.String()
 }
 
+// themeFooterHint renders the light/dark toggle affordance for any footer: a sun
+// and moon glyph flanking the ^t key, with the active mode's glyph lit (amber sun
+// in light mode, cyan moon in dark) and the other muted. The mode is read from
+// the theme itself, so every footer can share this without tracking it.
+func themeFooterHint(th theme.Theme) string {
+	sun := lipgloss.NewStyle().Foreground(th.Muted).Render("☀")
+	moon := lipgloss.NewStyle().Foreground(th.Muted).Render("☾")
+	if theme.IsLight(th) {
+		sun = lipgloss.NewStyle().Foreground(th.Warning).Render("☀")
+	} else {
+		moon = lipgloss.NewStyle().Foreground(th.Info).Render("☾")
+	}
+	muted := lipgloss.NewStyle().Foreground(th.Muted)
+	return sun + muted.Render(" / ") + moon + muted.Render(" ctrl + t theme")
+}
+
 func (m Model) viewFooter() string {
 	dim := lipgloss.NewStyle().Foreground(m.th.Muted)
 	sep := dim.Render(" · ")
@@ -840,16 +1663,82 @@ func (m Model) viewFooter() string {
 	// accent (bold) so it pops out of the otherwise-muted utility keys.
 	stackHint := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("S stack mode")
 
-	parts := []string{
-		dim.Render("↑/↓ move"),
-		dim.Render("←/→ section"),
-		dim.Render("enter open"),
-		dim.Render("s sidebar"),
-		stackHint,
-		dim.Render("r refresh"),
-		dim.Render("? help"),
-		dim.Render("q quit"),
+	// On the inbox with the preview focused, the navigation keys change meaning:
+	// arrows scroll the conversation and ←/esc return to the list.
+	previewFocused := len(m.sections) > 0 && m.sections[m.active].isNotif() && m.notifPrev.focused
+	var parts []string
+	if previewFocused {
+		parts = []string{
+			dim.Render("↑/↓ scroll"),
+			dim.Render("enter " + m.enterHint()),
+			dim.Render("←/esc back"),
+			dim.Render("r sync all"),
+			themeFooterHint(m.th),
+			dim.Render("? help"),
+			dim.Render("q quit"),
+		}
+	} else {
+		parts = []string{
+			dim.Render("↑/↓ move"),
+			dim.Render("n/N group"),
+			dim.Render("←/→ section"),
+			dim.Render("enter " + m.enterHint()),
+		}
+		// The stack sidebar is a PR-list-tab feature; it has no place on the
+		// Notifications inbox, so don't advertise s there.
+		if !(len(m.sections) > 0 && m.sections[m.active].isNotif()) {
+			parts = append(parts, dim.Render("s sidebar"))
+		}
+		parts = append(parts,
+			stackHint,
+			dim.Render("r sync all"),
+			themeFooterHint(m.th),
+			dim.Render("? help"),
+			dim.Render("q quit"),
+		)
 	}
-	return lipgloss.NewStyle().Width(m.width).Padding(0, 1).
-		Render(strings.Join(parts, sep))
+	keys := strings.Join(parts, sep)
+
+	// Second line: a legend for the row status glyphs, grouped by the column they
+	// come from — the leading dot (checks, or lifecycle once closed) and the review
+	// mark — so the colors read at a glance. Glyphs keep their row color; labels muted.
+	mark := func(c lipgloss.Color, glyph, label string) string {
+		return lipgloss.NewStyle().Foreground(c).Render(glyph) + dim.Render(" "+label)
+	}
+	diamond := lipgloss.NewStyle().Foreground(m.th.Focus).Bold(true).Render("◆") + dim.Render(" yours")
+	group := func(name string, items ...string) string {
+		label := lipgloss.NewStyle().Foreground(m.th.Muted).Bold(true).Render(name)
+		return label + dim.Render(" — ") + strings.Join(items, dim.Render(" · "))
+	}
+	groupSep := lipgloss.NewStyle().Foreground(m.th.Overlay).Render("   │   ")
+
+	var legend string
+	if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+		// The inbox shows its own glyphs (subject type + why you got it), not the
+		// PR checks/review/state cues, which don't apply here.
+		typeMark := func(typ, label string) string {
+			return lipgloss.NewStyle().Foreground(notifColor(m.th, typ)).Render(notifGlyph(typ)) + dim.Render(" "+label)
+		}
+		whyMark := func(reason, label string) string {
+			return lipgloss.NewStyle().Foreground(reasonColor(m.th, reason)).Render(reasonGlyph(reason)) + dim.Render(" "+label)
+		}
+		legend = strings.Join([]string{
+			group("TYPE", typeMark("PullRequest", "PR"), typeMark("Issue", "issue")),
+			group("WHY", whyMark("review_requested", "review"), whyMark("mention", "mention"),
+				whyMark("comment", "comment"), whyMark("author", "authored"), whyMark("assign", "assigned")),
+		}, groupSep)
+	} else {
+		legend = strings.Join([]string{
+			group("CHECKS", mark(m.th.Success, "●", "passing"), mark(m.th.Danger, "●", "failing"), mark(m.th.Muted, "○", "none")),
+			group("REVIEW", diamond, mark(m.th.Success, "✓", "approved"), mark(m.th.Danger, "✗", "changes"), mark(m.th.Muted, "◇", "others")),
+			group("STATE", mark(m.th.Primary, "●", "merged"), mark(m.th.Muted, "●", "closed")),
+		}, groupSep)
+	}
+
+	box := lipgloss.NewStyle().Width(m.width).Padding(0, 1)
+	// Legend on top, a rule, then keybindings — the whole stack painted as one
+	// Surface bar so it matches the header and pops off the Base body.
+	rule := lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Repeat("─", m.width))
+	return surfaceBar(m.th, m.width,
+		lipgloss.JoinVertical(lipgloss.Left, box.Render(legend), rule, box.Render(keys)))
 }

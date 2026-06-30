@@ -1,6 +1,9 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -48,5 +51,70 @@ sections:
 	}
 	if c.Sections[1].ClosedLimit != 3 {
 		t.Errorf("section ClosedLimit = %d, want 3", c.Sections[1].ClosedLimit)
+	}
+}
+
+func TestSaveThemeModeRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	// No file yet: SaveThemeMode creates it, and Load reads the value back.
+	if err := SaveThemeMode("light"); err != nil {
+		t.Fatalf("SaveThemeMode (create): %v", err)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.ThemeMode != "light" {
+		t.Errorf("ThemeMode = %q, want light", c.ThemeMode)
+	}
+
+	// Toggling back updates in place.
+	if err := SaveThemeMode("dark"); err != nil {
+		t.Fatalf("SaveThemeMode (update): %v", err)
+	}
+	if c, _ = Load(); c.ThemeMode != "dark" {
+		t.Errorf("ThemeMode = %q, want dark", c.ThemeMode)
+	}
+}
+
+func TestSaveThemeModePreservesOtherKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	path := filepath.Join(dir, "cairn", "config.yml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A hand-written config with a comment and an unrelated key.
+	original := "# my cairn config\ndefaultTrunk: develop\nshowClosed: false\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SaveThemeMode("light"); err != nil {
+		t.Fatalf("SaveThemeMode: %v", err)
+	}
+
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	if !strings.Contains(got, "# my cairn config") {
+		t.Errorf("comment was dropped:\n%s", got)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DefaultTrunk != "develop" {
+		t.Errorf("DefaultTrunk = %q, want develop (preserved)", c.DefaultTrunk)
+	}
+	if c.ShowClosed {
+		t.Error("showClosed:false should be preserved")
+	}
+	if c.ThemeMode != "light" {
+		t.Errorf("ThemeMode = %q, want light", c.ThemeMode)
 	}
 }

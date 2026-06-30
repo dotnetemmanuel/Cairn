@@ -17,6 +17,16 @@ import (
 const (
 	SectionSearch        = "search"        // default: a GitHub search filter
 	SectionNotifications = "notifications" // the notifications REST feed
+	// SectionInvolved is a built-in grouped section: instead of an OPEN/CLOSED
+	// split it shows your involvement by role — Assigned, Mentioned, Participating
+	// — excluding your own PRs and review requests (those have their own tabs). Its
+	// Filter is ignored; the sub-queries are defined in the TUI.
+	SectionInvolved = "involved"
+	// SectionOrgs is a built-in grouped section for discovery: open PRs across the
+	// organizations you belong to that you are NOT yet involved in (so you can
+	// start participating), grouped by org. Its orgs are resolved at runtime and
+	// its Filter is ignored.
+	SectionOrgs = "orgs"
 )
 
 // Section is a board section. A search section is backed by a GitHub search
@@ -36,6 +46,13 @@ type Section struct {
 // repoPaths, keybindings) are declared now so the schema is stable, but only
 // Theme and DefaultTrunk are exercised in Phase 0.
 type Config struct {
+	// ThemeMode selects the built-in palette variant: "dark" (Event Horizon, the
+	// default) or "light" (Event Horizon Day, a warm-paper palette for working
+	// outdoors). Toggled live from the TUI and persisted here.
+	ThemeMode string `yaml:"themeMode"`
+	// Theme is an optional power-user override layered over the active mode's
+	// built-in palette: any token set here wins, anything omitted falls back to
+	// the mode base. Left empty by default so the mode base shows through.
 	Theme        theme.Palette     `yaml:"theme"`
 	DefaultTrunk string            `yaml:"defaultTrunk"`
 	RepoPaths    map[string]string `yaml:"repoPaths"`
@@ -50,15 +67,19 @@ type Config struct {
 // Default returns the built-in configuration used when no file exists.
 func Default() Config {
 	return Config{
-		Theme:        theme.DefaultPalette(),
+		ThemeMode: theme.ModeDark,
+		// Theme override left empty: the active mode's built-in palette is used as-is
+		// unless the user sets specific tokens under `theme:` in config.yml.
+		Theme:        theme.Palette{},
 		DefaultTrunk: "main",
 		RepoPaths:    map[string]string{},
 		ShowClosed:   true, // recently-closed tail on by default; configurable
 		ClosedLimit:  15,
 		Sections: []Section{
 			{Title: "My PRs", Filter: "is:open is:pr author:@me"},
-			{Title: "Needs Review", Filter: "is:open is:pr review-requested:@me"},
-			{Title: "Involved", Filter: "is:open is:pr involves:@me"},
+			{Title: "Needs my review", Filter: "is:open is:pr review-requested:@me"},
+			{Title: "Involved", Type: SectionInvolved},
+			{Title: "Orgs", Type: SectionOrgs},
 			{Title: "Notifications", Type: SectionNotifications},
 		},
 	}
@@ -96,4 +117,59 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// SaveThemeMode persists just the themeMode key, leaving every other key (and any
+// comments) in the file intact. A missing file or directory is created. It edits
+// the document node in place rather than re-marshalling the whole Config, so a
+// hand-written config.yml is not rewritten wholesale.
+func SaveThemeMode(mode string) error {
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+
+	var doc yaml.Node
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			return fmt.Errorf("parsing %s: %w", path, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	// Normalize an empty/whitespace-only file to an empty mapping document.
+	if doc.Kind == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("%s: top level is not a mapping", path)
+	}
+	upsertScalar(doc.Content[0], "themeMode", mode)
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+// upsertScalar sets key=val on a mapping node, replacing the value if the key
+// exists or appending a new key/value pair otherwise.
+func upsertScalar(mapping *yaml.Node, key, val string) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].Kind = yaml.ScalarNode
+			mapping.Content[i+1].Tag = "!!str"
+			mapping.Content[i+1].Value = val
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: val},
+	)
 }

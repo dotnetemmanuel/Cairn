@@ -20,6 +20,7 @@ import (
 // formatter, built once.
 var (
 	chromaStyle     *chroma.Style
+	chromaStyleKey  string // theme fingerprint the cached style was built from
 	chromaFormatter = formatters.Get("terminal16m")
 )
 
@@ -32,12 +33,15 @@ func init() {
 // ensureChromaStyle builds the syntax style from the theme palette on first use.
 // Token→role mapping mirrors the Event Horizon (Aether) editor theme: keywords
 // in primary, functions/attributes in focus, strings in success-green, types in
-// warning-peach, numbers/constants in danger, comments muted. The theme is
-// fixed per process, so building once is safe.
+// warning-peach, numbers/constants in danger, comments muted. The style is
+// rebuilt whenever the theme's colors change (e.g. a live light/dark toggle),
+// keyed off a fingerprint of the tokens it consumes.
 func ensureChromaStyle(th theme.Theme) {
-	if chromaStyle != nil {
+	key := theme.Fingerprint(th)
+	if chromaStyle != nil && key == chromaStyleKey {
 		return
 	}
+	chromaStyleKey = key
 	hx := func(c lipgloss.Color) string { return string(c) }
 	chromaStyle = chroma.MustNewStyle("cairn", chroma.StyleEntries{
 		chroma.Background:          hx(th.Text),
@@ -189,7 +193,7 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 				// directly (not through the gutter/wrap path) so the background spans the
 				// whole pane; rowAt still gets this line's entry to stay aligned.
 				bar := lipgloss.NewStyle().Foreground(th.Primary).Background(th.Surface).
-					Bold(true).Width(width).Render("▶ " + raw)
+					Bold(true).Width(width).Render(focusGlyph + " " + raw)
 				rowAt = append(rowAt, len(out))
 				out = append(out, bar)
 				continue
@@ -223,7 +227,7 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 		// then the line-number gutter (old │ new).
 		cur := " "
 		if i == cursor {
-			cur = cursorStyle.Render("▌")
+			cur = cursorStyle.Render(focusGlyph)
 		}
 		// A 💬N badge advertises inline comments; reserve its width on the first
 		// visual row so the badge always fits.

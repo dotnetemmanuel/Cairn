@@ -47,7 +47,7 @@ func loadedDetail(t *testing.T) detailModel {
 
 func TestDetailRendersDiffConversationChecks(t *testing.T) {
 	m := loadedDetail(t)
-	view := m.View()
+	view := m.View("")
 
 	wants := []string{
 		"#327", "Add a DrinkModal", "OPEN",
@@ -73,7 +73,7 @@ func TestApproveConfirmFlow(t *testing.T) {
 	if m.state != stateConfirmApprove {
 		t.Fatalf("expected stateConfirmApprove, got %d", m.state)
 	}
-	if !strings.Contains(m.View(), "Approve PR #327") {
+	if !strings.Contains(m.View(""), "Approve PR #327") {
 		t.Errorf("expected approve confirmation in footer")
 	}
 
@@ -163,7 +163,7 @@ func TestHunkNavigationAdvancesAndCycles(t *testing.T) {
 	if m.curHunk != 1 {
 		t.Fatalf("expected hunk 1 after n, got %d", m.curHunk)
 	}
-	if !strings.Contains(m.View(), "hunk 2/3") {
+	if !strings.Contains(m.View(""), "hunk 2/3") {
 		t.Errorf("expected 'hunk 2/3' in view")
 	}
 
@@ -185,7 +185,7 @@ func TestStatusLineClearsOnNextKey(t *testing.T) {
 	m := multiHunkDetail(t)
 	// Simulate a lingering error from a failed action.
 	m.status = "✗ approve failed: boom"
-	if !strings.Contains(m.View(), "approve failed") {
+	if !strings.Contains(m.View(""), "approve failed") {
 		t.Fatalf("expected error to show before dismissal")
 	}
 	// Any browsing keystroke dismisses it.
@@ -297,10 +297,10 @@ func TestSuggestPrefillsBlock(t *testing.T) {
 	m = driveDetail(m,
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
-		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")},
 	)
 	if m.state != stateLineComment {
-		t.Fatalf("expected stateLineComment after s, got %d", m.state)
+		t.Fatalf("expected stateLineComment after S, got %d", m.state)
 	}
 	val := m.composer.Value()
 	if !strings.Contains(val, "```suggestion") || !strings.Contains(val, "added1") {
@@ -322,7 +322,7 @@ func TestContextualPaneShowsLineThread(t *testing.T) {
 	if cc := m.commentCounts(); cc[3] != 1 {
 		t.Errorf("expected a comment badge on rendered line 3, got %v", cc)
 	}
-	view := m.View()
+	view := m.View("")
 	for _, w := range []string{"Line thread", "tweak this", "@octocat"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("contextual pane missing %q", w)
@@ -453,7 +453,7 @@ func TestConversationPageShowsComments(t *testing.T) {
 	if m.page != pageConversation {
 		t.Fatalf("expected conversation page")
 	}
-	view := m.View()
+	view := m.View("")
 	for _, w := range []string{"Conversation", "@octocat", "looks tasty", "@github-actions", "c comment"} {
 		if !strings.Contains(view, w) {
 			t.Errorf("conversation view missing %q", w)
@@ -493,7 +493,7 @@ func TestConversationThreadsReplyUnderAnchor(t *testing.T) {
 		prLoadedMsg{detail: detail, files: files},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")}, // open full conversation
 	)
-	view := m.View()
+	view := m.View("")
 	// The anchor, its citation, and the reply all show; the reply carries the ╰→ guide.
 	for _, w := range []string{"@daniel", "rename this var", "@emmanuel", "renamed in fixup", "╰→"} {
 		if !strings.Contains(view, w) {
@@ -529,5 +529,73 @@ func TestRenderDiffWrapsLongLinesAndMapsRows(t *testing.T) {
 		if lipgloss.Width(line) > 40 {
 			t.Errorf("row exceeds width 40 (=%d): %q", lipgloss.Width(line), line)
 		}
+	}
+}
+
+func TestCopyLinkResolvesCommentPermalink(t *testing.T) {
+	const prURL = "https://github.com/o/r/pull/7"
+	const want = "https://github.com/o/r/pull/7#discussion_r999"
+
+	// Conversation page: the selected inline thread → its discussion permalink.
+	m := inlineDetail(t, 140, true) // one inline thread, DatabaseID 999
+	m.url = prURL
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+	)
+	if url, kind := m.linkForSelection(); url != want || kind != "comment" {
+		t.Errorf("conversation: linkForSelection = %q/%q, want %q/comment", url, kind, want)
+	}
+
+	// Diff page: the inline comment on the cursor line → the same permalink.
+	d := inlineDetail(t, 140, true)
+	d.url = prURL
+	d.focus = focusDiff
+	d = driveDetail(d,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	if url, kind := d.linkForSelection(); url != want || kind != "comment" {
+		t.Errorf("diff: linkForSelection = %q/%q, want %q/comment", url, kind, want)
+	}
+
+	// Nothing comment-specific selected → fall back to the PR link.
+	f := inlineDetail(t, 140, false)
+	f.url = prURL
+	if url, kind := f.linkForSelection(); url != prURL || kind != "PR" {
+		t.Errorf("fallback: linkForSelection = %q/%q, want %q/PR", url, kind, prURL)
+	}
+}
+
+func TestFilesPaneToggle(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	if f, _, _ := m.paneWidths(); f == 0 {
+		t.Fatal("files pane should be shown by default")
+	}
+	// s hides it; the diff gets that width and focus leaves the files pane.
+	m.focus = focusFiles
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if f, _, _ := m.paneWidths(); f != 0 {
+		t.Errorf("files pane should be hidden after s, got width %d", f)
+	}
+	if m.focus == focusFiles {
+		t.Error("focus should move off the hidden files pane")
+	}
+	if m.nextFocus(1) == focusFiles {
+		t.Error("tab must not cycle into the hidden files pane")
+	}
+	// s again restores it.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if f, _, _ := m.paneWidths(); f == 0 {
+		t.Error("files pane should be shown again after a second s")
+	}
+}
+
+func TestHunkNavFocusesDiff(t *testing.T) {
+	m := inlineDetail(t, 140, true)
+	m.focus = focusFiles // start on the files pane
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if m.focus != focusDiff {
+		t.Error("n (next change) should move focus to the diff so ↑/↓ walk diff lines, not files")
 	}
 }

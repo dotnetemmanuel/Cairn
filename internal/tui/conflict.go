@@ -483,7 +483,7 @@ func (m conflictModel) paneWidths() (rail, incoming, resolution, yours int) {
 		rail = railWidth
 		used = railWidth + 1 // + the rail's right border
 	}
-	body := max(8, m.width-used)
+	body := max(8, bodyWidth(m.width)-used)
 	if layoutFor(m.width) == layoutTri {
 		avail := max(8, body-2) // two 1-col separators between the three panes
 		side := max(8, avail*5/16)
@@ -532,8 +532,9 @@ func (m conflictModel) View() string {
 		}
 	}
 	// Emit exactly m.height rows (1 header + bodyH + 1 footer) so a resize can't
-	// leave ghost lines from a taller previous frame.
-	body = padToHeight(body, bodyH)
+	// leave ghost lines from a taller previous frame. Header/footer are full-width
+	// bars (flush); the body is indented by the left gutter.
+	body = indentBody(padToHeight(body, bodyH))
 	return lipgloss.JoinVertical(lipgloss.Left, m.headerBar(), body, m.footer())
 }
 
@@ -569,7 +570,9 @@ func (m conflictModel) headerBar() string {
 	right := mutedStyle(m.th).Render("   incoming ") + infoStyle(m.th).Render(m.st.Incoming) +
 		mutedStyle(m.th).Render(" into yours ") + infoStyle(m.th).Render(m.st.Yours)
 	bar := left + mid + right
-	return lipgloss.NewStyle().Width(m.width).MaxHeight(1).Background(m.th.Surface).Padding(0, 1).Render(bar)
+	// surfaceBar so the trailing pad doesn't bleed to Base (the header "double
+	// background"); MaxHeight keeps it one row.
+	return lipgloss.NewStyle().MaxHeight(1).Render(surfaceBar(m.th, m.width, " "+bar))
 }
 
 func (m conflictModel) renderRail(w int) string {
@@ -587,7 +590,7 @@ func (m conflictModel) renderRail(w int) string {
 		name := truncate(shortRepo(f.path), max(4, w-9))
 		row := fmt.Sprintf("%s %s %d/%d", glyph, name, f.resolved(), f.conflicts())
 		if i == m.fileIdx {
-			row = lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render("▌" + row)
+			row = lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).Render(focusGlyph + row)
 		} else {
 			row = " " + row
 		}
@@ -638,7 +641,7 @@ func (m conflictModel) resolutionPane(reg *conflict.Region, res conflict.Resolut
 	// hunk has a choice (the file-rail glyph stays file-level), so the eye gets
 	// per-conflict feedback without waiting for the whole file to finish.
 	headStyle := lipgloss.NewStyle().Background(m.th.Surface).Bold(true).Width(w)
-	head := headStyle.Foreground(m.th.Primary).Render("▸ RESOLUTION")
+	head := headStyle.Foreground(m.th.Primary).Render(focusGlyph + " RESOLUTION")
 	if res.Choice != conflict.ChoiceUnresolved {
 		head = headStyle.Foreground(m.th.Success).Render("✓ RESOLVED")
 	}
@@ -680,11 +683,13 @@ func (m conflictModel) tintedCode(lines []string, hl highlighter, w int, bg stri
 	if len(lines) == 0 {
 		return mutedStyle(m.th).Render("(empty)")
 	}
-	bgStyle := lipgloss.NewStyle().Background(lipgloss.Color(bg)).Width(w)
+	// Reuse the diff pane's tintRow: it re-asserts the "R;G;B" background after each
+	// chroma per-token reset and pads to width, so the tint spans the whole line
+	// instead of bleeding to the page background between syntax tokens.
 	var out []string
 	for _, ln := range lines {
 		rendered := hl.line(expandTabs(ln))
-		out = append(out, bgStyle.Render(truncate(rendered, w)))
+		out = append(out, tintRow(truncate(rendered, w), bg, w))
 	}
 	return strings.Join(out, "\n")
 }
@@ -693,7 +698,7 @@ func (m conflictModel) tintedCode(lines []string, hl highlighter, w int, bg stri
 // git-town command flow that finished the op (rebase + remaining stack steps +
 // push), tailed to fit, with a prompt to return to the stack.
 func (m conflictModel) doneView() string {
-	w := max(8, m.width-2)
+	w := max(8, bodyWidth(m.width)-2)
 	title := okStyle(m.th).Bold(true).Render("✓ Resolved — " + opWord(m.st.Op) + " continued")
 	rule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", w))
 	out := strings.TrimRight(m.output, "\n")
@@ -735,7 +740,7 @@ func (m conflictModel) introView() string {
 	keys := okStyle(m.th).Bold(true).Render("press any key") + mutedStyle(m.th).Render(" to resolve   ·   ") +
 		warnStyle(m.th).Render("esc") + mutedStyle(m.th).Render(" to cancel (resume anytime with R)")
 	box := title + "\n" + lead + "\n" + files.String() + "\n\n" + keys
-	return lipgloss.NewStyle().Width(m.width).Border(lipgloss.RoundedBorder()).
+	return lipgloss.NewStyle().Width(bodyWidth(m.width)).Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.th.Warning).Padding(0, 1).Render(box)
 }
 
@@ -754,7 +759,7 @@ func (m conflictModel) confirmBox() string {
 		key(infoStyle(m.th), "esc", "back")
 	status := okStyle(m.th).Render(fmt.Sprintf("✓ %d conflict(s) resolved.", t))
 	box := title + "\n" + desc + "\n" + keys + "\n" + status
-	return lipgloss.NewStyle().Width(m.width).Border(lipgloss.RoundedBorder()).
+	return lipgloss.NewStyle().Width(bodyWidth(m.width)).Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.th.Success).Padding(0, 1).Render(box)
 }
 
@@ -769,14 +774,14 @@ func (m conflictModel) footer() string {
 		return base.Render("")
 	}
 	if m.status != "" {
-		return base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2)))
+		return surfaceBar(m.th, m.width, base.Foreground(m.th.Muted).Render(truncate(m.status, max(10, m.width-2))))
 	}
 	nav := "n/N conflict · [ ] file · a incoming · d yours · b both · e edit · f rail · esc back"
 	if m.allResolved() {
 		lead := okStyle(m.th).Bold(true).Render("all resolved · c continue")
-		return base.Render(lead + mutedStyle(m.th).Render(" · "+nav))
+		return surfaceBar(m.th, m.width, base.Render(lead+mutedStyle(m.th).Render(" · "+nav)))
 	}
-	return base.Foreground(m.th.Muted).Render(truncate(nav, max(10, m.width-2)))
+	return surfaceBar(m.th, m.width, base.Foreground(m.th.Muted).Render(truncate(nav, max(10, m.width-2))))
 }
 
 func opWord(op conflict.Op) string {
