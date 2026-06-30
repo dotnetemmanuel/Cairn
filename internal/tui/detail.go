@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -373,6 +375,11 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		return m, nil
 	case "o":
 		return m, openBrowser(m.url)
+	case "y":
+		// Yank the GitHub link for the comment under the cursor (a diff-line inline
+		// comment, or the selected conversation thread) to the clipboard — a one-key
+		// handoff to paste back into chat. Falls back to the PR link.
+		return m.copyLink()
 	case "c":
 		// On the diff with the diff pane focused, c comments on the cursor
 		// line (GitHub's "Add single comment"); otherwise it's a PR-level
@@ -585,6 +592,51 @@ func (m *detailModel) lineComments() []gh.ReviewComment {
 		}
 	}
 	return out
+}
+
+// commentPermalink builds the GitHub permalink for an inline review comment from
+// the PR url and the comment's REST id: <pr-url>#discussion_r<id>, the anchor
+// GitHub uses to deep-link a review-thread comment.
+func commentPermalink(prURL string, commentID int) string {
+	return prURL + "#discussion_r" + strconv.Itoa(commentID)
+}
+
+// linkForSelection returns the most specific GitHub link for what's under the
+// cursor, plus a label for the status line: the selected conversation thread or
+// the diff cursor's inline comment when there is one, otherwise the PR itself.
+func (m detailModel) linkForSelection() (url, kind string) {
+	if m.url == "" {
+		return "", ""
+	}
+	// Conversation page: the selected (n/N) inline thread.
+	if m.page == pageConversation && m.convCursor >= 0 && m.convCursor < len(m.convThreads) {
+		if id := m.convThreads[m.convCursor].id; id > 0 {
+			return commentPermalink(m.url, id), "comment"
+		}
+	}
+	// Diff page: an inline comment anchored to the cursor's line (the thread anchor).
+	if m.page == pageDiff {
+		if cs := m.lineComments(); len(cs) > 0 && cs[0].DatabaseID > 0 {
+			return commentPermalink(m.url, cs[0].DatabaseID), "comment"
+		}
+	}
+	return m.url, "PR" // nothing comment-specific selected — yank the PR link
+}
+
+// copyLink writes the selected comment's (or PR's) GitHub link to the system
+// clipboard and reports the outcome on the status line.
+func (m detailModel) copyLink() (detailModel, tea.Cmd) {
+	url, kind := m.linkForSelection()
+	if url == "" {
+		m.status = warnStyle(m.th).Render("nothing to copy yet")
+		return m, nil
+	}
+	if err := clipboard.WriteAll(url); err != nil {
+		m.status = errStyle(m.th).Render("copy failed: " + err.Error())
+		return m, nil
+	}
+	m.status = okStyle(m.th).Render("✓ copied " + kind + " link  " + url)
+	return m, nil
 }
 
 // renderDiffContent rebuilds the diff viewport content for the current file,
@@ -1461,7 +1513,7 @@ func (m detailModel) renderInfo() string {
 			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width) + "\n")
 		}
 		b.WriteString("\n")
-		b.WriteString(mutedStyle(m.th).Render("r reply · c new comment · v full conversation") + "\n")
+		b.WriteString(mutedStyle(m.th).Render("r reply · y copy link · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
 	}
@@ -1555,7 +1607,7 @@ func (m detailModel) viewFooter() string {
 		// r replies when a thread is selected, else it refreshes.
 		rk := " · r refresh"
 		if len(m.convThreads) > 0 {
-			rk = " · n/N thread · r reply"
+			rk = " · n/N thread · r reply · y copy link"
 		}
 		help = "↑/↓ scroll" + rk + " · c comment · a approve · x request-changes · o open · v/d/esc close"
 	case m.focus == focusDiff:
@@ -1563,7 +1615,7 @@ func (m detailModel) viewFooter() string {
 		// otherwise r refreshes.
 		rk := " · r refresh"
 		if len(m.lineComments()) > 0 {
-			rk = " · r reply"
+			rk = " · r reply · y copy link"
 		}
 		help = "↑/↓ line · n/N change · c comment line · s suggest" + rk +
 			" · i panel · ←/→ focus · v conversation · a approve · o open · esc back"

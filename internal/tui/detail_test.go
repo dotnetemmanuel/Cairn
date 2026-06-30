@@ -531,3 +531,38 @@ func TestRenderDiffWrapsLongLinesAndMapsRows(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyLinkResolvesCommentPermalink(t *testing.T) {
+	const prURL = "https://github.com/o/r/pull/7"
+	const want = "https://github.com/o/r/pull/7#discussion_r999"
+
+	// Conversation page: the selected inline thread → its discussion permalink.
+	m := inlineDetail(t, 140, true) // one inline thread, DatabaseID 999
+	m.url = prURL
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+	)
+	if url, kind := m.linkForSelection(); url != want || kind != "comment" {
+		t.Errorf("conversation: linkForSelection = %q/%q, want %q/comment", url, kind, want)
+	}
+
+	// Diff page: the inline comment on the cursor line → the same permalink.
+	d := inlineDetail(t, 140, true)
+	d.url = prURL
+	d.focus = focusDiff
+	d = driveDetail(d,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	if url, kind := d.linkForSelection(); url != want || kind != "comment" {
+		t.Errorf("diff: linkForSelection = %q/%q, want %q/comment", url, kind, want)
+	}
+
+	// Nothing comment-specific selected → fall back to the PR link.
+	f := inlineDetail(t, 140, false)
+	f.url = prURL
+	if url, kind := f.linkForSelection(); url != prURL || kind != "PR" {
+		t.Errorf("fallback: linkForSelection = %q/%q, want %q/PR", url, kind, prURL)
+	}
+}
