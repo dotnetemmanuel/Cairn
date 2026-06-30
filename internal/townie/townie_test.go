@@ -203,3 +203,29 @@ func TestCheckoutArgvNotInCatalog(t *testing.T) {
 		t.Errorf("checkout ran %v, want git checkout feat-mid", rr.calls)
 	}
 }
+
+func TestPushArgvNotInCatalog(t *testing.T) {
+	if got := strings.Join(argv("push", "feat-mid"), " "); got != "git push -u origin feat-mid" {
+		t.Errorf("push argv = %q, want git push -u origin feat-mid", got)
+	}
+	for _, c := range Catalog() {
+		if c.Verb == "push" {
+			t.Fatal("push must stay out of Catalog() — it's a step inside propose")
+		}
+	}
+}
+
+func TestProposeIsInCatalogButNotAGitTownVerb(t *testing.T) {
+	c := Find("p")
+	if c == nil || c.Verb != "propose" {
+		t.Fatal("propose should be in the catalog under key p")
+	}
+	// It's orchestrated (push + gh), not a single git-town call, so argv is nil but
+	// the Hint still describes the steps.
+	if argv("propose", "x") != nil {
+		t.Error("propose has no single argv")
+	}
+	if c.Hint() == "" {
+		t.Error("propose should still surface a hint for the help overlay")
+	}
+}

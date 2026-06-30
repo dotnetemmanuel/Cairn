@@ -647,6 +647,87 @@ func FindPROpenForBranch(owner, repo, branch string) (int, error) {
 	return prs[0].Number, nil
 }
 
+// CreatePR opens a pull request on GitHub (REST POST): head branch → base branch,
+// with title/body and an optional draft flag. It returns the new PR's number and
+// URL. The base is the branch the head "points at" — for a stacked PR that's the
+// branch below it, read from the local git-town lineage, not the trunk. Common
+// failures get a friendlier message than GitHub's raw 422: a head that isn't on
+// the remote yet, a base branch that hasn't been pushed, an existing PR, or a
+// head with no commits ahead of its base.
+func CreatePR(owner, repo, head, base, title, body string, draft bool) (int, string, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return 0, "", err
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"title": title,
+		"head":  head,
+		"base":  base,
+		"body":  body,
+		"draft": draft,
+	})
+	var resp struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	path := fmt.Sprintf("repos/%s/%s/pulls", owner, repo)
+	if err := client.Post(path, bytes.NewReader(payload), &resp); err != nil {
+		return 0, "", friendlyCreatePRError(err, head, base)
+	}
+	return resp.Number, resp.HTMLURL, nil
+}
+
+// friendlyCreatePRError translates GitHub's terse 422 validation errors on PR
+// creation into guidance that fits Cairn's pedagogical tone.
+func friendlyCreatePRError(err error, head, base string) error {
+	low := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(low, "no commits between"):
+		return fmt.Errorf("%s has no commits beyond %s yet — commit something first", head, base)
+	case strings.Contains(low, "field 'head'") || strings.Contains(low, "head") && strings.Contains(low, "invalid"):
+		return fmt.Errorf("%s isn't on the remote yet — push/sync it before proposing", head)
+	case strings.Contains(low, "field 'base'") || strings.Contains(low, "base") && strings.Contains(low, "invalid"):
+		return fmt.Errorf("base %s isn't on the remote yet — open its PR (or sync) first", base)
+	case strings.Contains(low, "already exist"):
+		return fmt.Errorf("a pull request for %s already exists", head)
+	default:
+		return err
+	}
+}
+
+// OpenPRNumbersByBranch lists the repo's open PRs and maps each head branch to its
+// PR number — so the local stack tree can flag which branches already have a PR.
+// It paginates up to a sane cap; identically-headed PRs keep the first seen.
+func OpenPRNumbersByBranch(owner, repo string) (map[string]int, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, err
+	}
+	const perPage = 100
+	out := map[string]int{}
+	for page := 1; page <= 5; page++ {
+		var batch []struct {
+			Number int `json:"number"`
+			Head   struct {
+				Ref string `json:"ref"`
+			} `json:"head"`
+		}
+		path := fmt.Sprintf("repos/%s/%s/pulls?state=open&per_page=%d&page=%d", owner, repo, perPage, page)
+		if err := client.Get(path, &batch); err != nil {
+			return out, err
+		}
+		for _, p := range batch {
+			if _, seen := out[p.Head.Ref]; !seen {
+				out[p.Head.Ref] = p.Number
+			}
+		}
+		if len(batch) < perPage {
+			break
+		}
+	}
+	return out, nil
+}
+
 // MergePR merges a pull request on GitHub (REST PUT). method is "squash",
 // "merge", or "rebase" (defaults to squash). This is how a stack's bottom branch
 // lands on the trunk; the rest of the stack is re-parented afterwards by sync.

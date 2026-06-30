@@ -70,6 +70,11 @@ func argv(verb, name string) []string {
 		// isn't listed as a git-town stack command, but routed through Run so the
 		// stack mode reuses one execution path.
 		return []string{"git", "checkout", name}
+	case "push":
+		// Publish a branch to origin so a PR can be opened against it. Works on a
+		// branch that isn't checked out (refs/heads/<name>). Out of Catalog() — it's
+		// a step inside propose, not a stack-authoring verb of its own.
+		return []string{"git", "push", "-u", "origin", name}
 	case "sync":
 		return []string{"git-town", "sync", "--stack"}
 	case "restack":
@@ -265,6 +270,11 @@ func (c Command) Hint() string {
 		// ship isn't a single git-town call: Cairn merges the PR via gh, then syncs.
 		return "gh: merge PR (squash)  →  git-town sync --stack"
 	}
+	if c.Verb == "propose" {
+		// propose isn't a single git-town call: Cairn pushes the branch, then opens
+		// the PR via gh with the base read from the local lineage.
+		return "git push -u origin <branch>  →  gh: create PR (base ← parent)"
+	}
 	a := argv(c.Verb, "<name>")
 	if a == nil {
 		return ""
@@ -283,6 +293,16 @@ func Catalog() []Command {
 				"the next layer of the stack. When you propose it, its PR will target " +
 				"the current branch, not main. Use this when your next change builds on " +
 				"the one you're on.",
+		},
+		{
+			Key: "p", Verb: "propose", Title: "propose", Mutates: true,
+			Short: "open a pull request for a branch",
+			Long: "Opens a GitHub pull request for the selected branch. Its base is set " +
+				"automatically to whatever the branch is stacked on — the branch below it " +
+				"in the stack, or the trunk (main) for the bottom branch — read from the " +
+				"local lineage, so a stacked PR targets the right place, not main. Cairn " +
+				"pushes the branch first, then you title it and write the description in " +
+				"Markdown (with a live preview).",
 		},
 		{
 			Key: "I", Verb: "insert", Title: "insert", NeedsName: true, Mutates: true,

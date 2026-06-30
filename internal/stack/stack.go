@@ -351,6 +351,13 @@ func DetectTrunk(dir string) string {
 	return currentBranch(dir)
 }
 
+// LatestCommitSubject returns the first line of branch's most recent commit
+// message (dir is cwd if empty), for pre-filling a proposed PR's title. Returns
+// "" when the branch has no commits or git can't be reached.
+func LatestCommitSubject(dir, branch string) string {
+	return gitOutput(dir, "log", "-1", "--format=%s", branch)
+}
+
 // trunkFromSymbolicRef turns "origin/main" (the short form of origin/HEAD) into
 // "main". Pure, so the stripping is table-testable.
 func trunkFromSymbolicRef(ref string) string {

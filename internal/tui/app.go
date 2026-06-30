@@ -995,7 +995,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stackMode = newStackModel(m.th, m.localRepo)
 			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			m.mode = modeStack
-			return m, nil
+			// Load the open-PR flags for the local tree (branch → #number).
+			return m, fetchStackPRNums(m.localRepo)
 		case "r":
 			// Refresh is a whole-board sync, not just the active tab: re-run every
 			// section's query so a PR whose state changed (e.g. you just commented on
@@ -1059,6 +1060,7 @@ func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
 		m.detail.restyle(m.th)
 	case modeStack:
 		m.stackMode.th = m.th
+		m.stackMode.restyleComposer() // re-theme the textarea/title under the new palette
 	case modeConflict:
 		m.conflict.th = m.th
 	}

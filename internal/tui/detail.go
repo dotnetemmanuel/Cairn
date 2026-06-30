@@ -117,6 +117,11 @@ func newDetail(th theme.Theme, it gh.Item) detailModel {
 	ta := textarea.New()
 	ta.Placeholder = "Write a comment (GitHub-flavored Markdown)…"
 	ta.ShowLineNumbers = false
+	// Theme the composer from the palette (not bubbles' terminal-adaptive default,
+	// which renders a black cursor-line band in a light theme on a dark terminal).
+	// Must be set on the persistent model — see styleComposer's note on the cached
+	// &FocusedStyle pointer.
+	styleComposer(&ta, th)
 	return detailModel{
 		th:       th,
 		owner:    owner,
@@ -813,6 +818,14 @@ func (m *detailModel) refreshInfo() {
 // already uses the new theme.
 func (m *detailModel) restyle(th theme.Theme) {
 	m.th = th
+	// Re-theme the composer and re-point its cached active-style pointer (via
+	// Focus/Blur) so a live toggle recolors the textarea too.
+	styleComposer(&m.composer, th)
+	if m.composing() {
+		m.composer.Focus()
+	} else {
+		m.composer.Blur()
+	}
 	if m.loading || m.err != nil {
 		return
 	}
