@@ -229,3 +229,16 @@ func TestProposeIsInCatalogButNotAGitTownVerb(t *testing.T) {
 		t.Error("propose should still surface a hint for the help overlay")
 	}
 }
+
+func TestSetParentWritesGitTownConfig(t *testing.T) {
+	rr := &recordRunner{}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	evs := drain(ops.SetParent("ui-polish", "main"))
+	if len(evs) == 0 || !evs[len(evs)-1].Done || evs[len(evs)-1].Err != nil {
+		t.Fatalf("expected a clean trailing Done, got %+v", evs)
+	}
+	if len(rr.calls) != 1 ||
+		strings.Join(rr.calls[0], " ") != "git config git-town-branch.ui-polish.parent main" {
+		t.Errorf("SetParent ran %v, want git config git-town-branch.ui-polish.parent main", rr.calls)
+	}
+}

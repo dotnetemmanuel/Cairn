@@ -210,6 +210,24 @@ func (s stackModel) onTrackedBranch() bool {
 	return s.tree != nil && s.tree.NodeByName(s.status.Branch) != nil
 }
 
+// currentUntracked reports whether git-town is configured here but the current
+// branch isn't part of the stack yet — on a real branch git-town has no recorded
+// parent for (and which isn't the trunk). This is the state where Cairn offers to
+// add the branch to the stack ("track" it).
+func (s stackModel) currentUntracked() bool {
+	return s.enabled() && s.tree.NodeByName(s.status.Branch) == nil
+}
+
+// trackParent is the parent a freshly-tracked branch is filed under: the trunk
+// (the common case for a feature branch cut from main). The user can re-parent
+// afterwards if it actually belongs higher in a stack.
+func (s stackModel) trackParent() string {
+	if s.tree != nil && s.tree.Root != nil {
+		return s.tree.Root.Name
+	}
+	return ""
+}
+
 // isBottomBranch reports whether the current branch is the bottom of its stack —
 // a direct child of the trunk. Only the bottom can be shipped (merged): its PR
 // targets the trunk, while higher branches target the branch below them.
@@ -245,8 +263,11 @@ func (s stackModel) actionEnabled(c townie.Command) bool {
 		return s.onTrackedBranch()
 	case "ship":
 		// Only the bottom of the stack can be merged: a stacked PR targets the
-		// branch below it, so lower branches must land first.
-		return s.isBottomBranch()
+		// branch below it, so lower branches must land first. And only on a clean
+		// tree — merge squash-merges the PR (irreversible) then rebases the whole
+		// stack via sync, which a dirty working tree would derail. (Untracked files
+		// are fine; they don't interfere with the rebase.)
+		return s.isBottomBranch() && !s.status.Dirty()
 	default:
 		// new / insert can start or extend a stack from any branch.
 		return true
@@ -332,6 +353,13 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		// Also refresh the PR flags so a PR opened elsewhere shows its #N.
 		s.reload()
 		return s, fetchStackPRNums(s.repo)
+	case "t":
+		// Add the current (untracked) branch to the stack under the trunk. Inert
+		// otherwise (only meaningful when the branch has no recorded parent).
+		if s.currentUntracked() {
+			return s.runTrack()
+		}
+		return s, nil
 	case "tab", "shift+tab", "h", "l", "left", "right":
 		// Toggle focus between the action list and the branch tree (only when
 		// there's a tree to check out from).
@@ -736,6 +764,48 @@ func proposeStream(owner, repo, head, base, title, body string, draft bool, ops 
 	return ch
 }
 
+// runTrack records the current branch's git-town parent (the trunk), adding it to
+// the stack tree, streaming progress through the same machinery as the other ops.
+func (s stackModel) runTrack() (stackModel, tea.Cmd) {
+	s.phase = stackRunning
+	s.pending = townie.Command{Verb: "track", Title: "track"}
+	s.opName = s.status.Branch
+	s.output = ""
+	branch := s.status.Branch
+	parent := s.trackParent()
+	ops := s.ops
+	return s, func() tea.Msg {
+		return readStream(trackStream(branch, parent, ops))
+	}
+}
+
+// trackStream records branch's parent in local git-town config and brackets the
+// (silent) git config call with a friendly before/after line.
+func trackStream(branch, parent string, ops townie.Ops) <-chan townie.StreamEvent {
+	ch := make(chan townie.StreamEvent, 8)
+	go func() {
+		defer close(ch)
+		if parent == "" {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("can't track %s: no trunk to file it under", branch)}
+			return
+		}
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("Recording %s's parent as %s…", branch, parent)}
+		for ev := range ops.SetParent(branch, parent) {
+			if ev.Done {
+				if ev.Err != nil {
+					ch <- townie.StreamEvent{Done: true, Err: ev.Err}
+					return
+				}
+				break
+			}
+			ch <- ev
+		}
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("✓ %s is now part of the stack (parent: %s).", branch, parent)}
+		ch <- townie.StreamEvent{Done: true}
+	}()
+	return ch
+}
+
 // stackPRNumsMsg carries the branch→open-PR-number map for the tree's #N flags.
 type stackPRNumsMsg struct{ nums map[string]int }
 
@@ -1009,6 +1079,16 @@ func (s stackModel) renderActions(w int) string {
 	title := lipgloss.NewStyle().Foreground(titleColor).Bold(true).Render("Stack actions")
 	rule := lipgloss.NewStyle().Foreground(ruleColor).Render(strings.Repeat("─", w))
 
+	// Peach call-to-action when you're on a branch git-town doesn't track yet — it
+	// won't appear in the stack tree and the maintenance verbs stay dim until you
+	// add it. One key (t) files it under the trunk.
+	banner := ""
+	if s.currentUntracked() {
+		msg := fmt.Sprintf("⚠ %s isn't in the stack yet — press t to add it under %s.",
+			s.status.Branch, val(s.trackParent()))
+		banner = lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain(msg, proseWidth(w), "  ")) + "\n\n"
+	}
+
 	var rows []string
 	for i, c := range s.commands {
 		on := s.actionEnabled(c)
@@ -1048,7 +1128,7 @@ func (s stackModel) renderActions(w int) string {
 	if !s.enabled() {
 		help = "\n" + mutedStyle(s.th).Render("  Stack actions need a git-town repo on a branch.\n  See the statusline above for what's missing.")
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, title, rule, strings.Join(rows, "\n"), help)
+	return lipgloss.JoinVertical(lipgloss.Left, title, rule, banner+strings.Join(rows, "\n"), help)
 }
 
 func (s stackModel) renderNaming(w int) string {
@@ -1364,6 +1444,8 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 		switch {
 		case s.needsInit():
 			help = "enter set up git-town · r refresh · esc dashboard"
+		case s.currentUntracked():
+			help = "t track this branch · ↑/↓ j/k move · enter choose · r refresh · esc dashboard"
 		case s.focus == focusTree:
 			help = "↑/↓ j/k branch · enter checkout · tab ←/→ actions · r refresh · esc dashboard"
 		default:

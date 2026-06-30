@@ -148,16 +148,26 @@ type StreamRunner interface {
 // with Run via plan, and routes execution through the Runner (so tests still
 // observe the commands). The channel is closed after the Done event.
 func (o Ops) Stream(verb, name string) <-chan StreamEvent {
+	cmds, err := plan(verb, name)
+	if err != nil {
+		ch := make(chan StreamEvent, 1)
+		ch <- StreamEvent{Done: true, Err: err}
+		close(ch)
+		return ch
+	}
+	return o.streamCmds(cmds)
+}
+
+// streamCmds runs each command in order, streaming its output line-by-line, then a
+// single {Done:true} (Err set on the first failure; remaining steps are skipped).
+// Shared by Stream (verb-driven) and the one-off ops like SetParent.
+func (o Ops) streamCmds(cmds [][]string) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 64)
 	go func() {
 		defer close(ch)
-		cmds, err := plan(verb, name)
-		if err != nil {
-			ch <- StreamEvent{Done: true, Err: err}
-			return
-		}
 		sr, live := o.Runner.(StreamRunner)
 		for _, a := range cmds {
+			var err error
 			if live {
 				err = sr.Stream(o.Dir, a[0], a[1:], func(line string) {
 					ch <- StreamEvent{Line: line}
@@ -178,6 +188,14 @@ func (o Ops) Stream(verb, name string) <-chan StreamEvent {
 		ch <- StreamEvent{Done: true}
 	}()
 	return ch
+}
+
+// SetParent records branch's git-town parent in local .git/config — the "track
+// this branch" action that adds an untracked branch to the stack tree. Nothing is
+// committed, staged, or pushed. Streamed like the other ops so the stack screen
+// reuses one execution + output path.
+func (o Ops) SetParent(branch, parent string) <-chan StreamEvent {
+	return o.streamCmds([][]string{{"git", "config", "git-town-branch." + branch + ".parent", parent}})
 }
 
 // Stream is ExecRunner's live implementation: pipe the process's combined output

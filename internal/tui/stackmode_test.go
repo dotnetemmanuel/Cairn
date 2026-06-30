@@ -88,13 +88,14 @@ func TestMaintainVerbsGatedOnTrackedBranch(t *testing.T) {
 
 func TestShipGatedToBottomBranch(t *testing.T) {
 	s := fixtureModel() // current = feat-mid (parent feat-base) — not the bottom
+	s.status.Staged = 0 // clean tree (fixture is dirty); merge needs a clean tree
 	ship := townie.Command{Verb: "ship"}
 	if s.actionEnabled(ship) {
 		t.Error("ship must be disabled on a middle branch")
 	}
 	s.status.Branch = "feat-base" // direct child of trunk = bottom
 	if !s.actionEnabled(ship) {
-		t.Error("ship should be enabled on the bottom branch")
+		t.Error("ship should be enabled on the clean bottom branch")
 	}
 	s.status.Branch = "main" // the trunk itself
 	if s.actionEnabled(ship) {
@@ -104,6 +105,33 @@ func TestShipGatedToBottomBranch(t *testing.T) {
 	s.status.Detached = true
 	if s.actionEnabled(ship) {
 		t.Error("ship must be disabled when detached")
+	}
+}
+
+func TestShipGatedOnCleanTree(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-base" // bottom of the stack
+	s.status.Staged, s.status.Unstaged, s.status.Conflicts = 0, 0, 0
+	if !s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Fatal("ship should be enabled on a clean bottom branch")
+	}
+	// Any uncommitted change to tracked files must block merge — its post-merge
+	// stack rebase would derail on a dirty tree.
+	for _, dirty := range []func(){
+		func() { s.status.Unstaged = 3 },
+		func() { s.status.Staged = 1 },
+		func() { s.status.Conflicts = 1 },
+	} {
+		s.status.Staged, s.status.Unstaged, s.status.Conflicts = 0, 0, 0
+		dirty()
+		if s.actionEnabled(townie.Command{Verb: "ship"}) {
+			t.Errorf("ship must be disabled on a dirty tree (%+v)", s.status)
+		}
+	}
+	// Untracked files alone don't block merge (they don't interfere with a rebase).
+	s.status.Staged, s.status.Unstaged, s.status.Conflicts, s.status.Untracked = 0, 0, 0, 5
+	if !s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Error("untracked files alone should not block merge")
 	}
 }
 
@@ -487,5 +515,37 @@ func TestTreeWidthFitsLongBranchAndClamps(t *testing.T) {
 	s.width = 30
 	if w := s.treeWidth(); w != stackPaneW {
 		t.Errorf("tiny terminal should clamp to the floor %d, got %d", stackPaneW, w)
+	}
+}
+
+func TestCurrentUntrackedAndTrack(t *testing.T) {
+	s := fixtureModel() // current = feat-mid, which IS tracked
+	if s.currentUntracked() {
+		t.Error("a tracked branch should not be flagged untracked")
+	}
+	// Hop onto a branch git-town doesn't know.
+	s.status.Branch = "ui-polish"
+	if !s.currentUntracked() {
+		t.Error("an off-tree branch in a git-town repo should be flagged untracked")
+	}
+	if s.trackParent() != "main" {
+		t.Errorf("trackParent = %q, want the trunk main", s.trackParent())
+	}
+	// The action list surfaces the peach call-to-action.
+	if out := s.renderActions(70); !strings.Contains(out, "ui-polish isn't in the stack") {
+		t.Errorf("expected the untracked banner; got:\n%s", out)
+	}
+	// t starts the track op (running phase + a command).
+	s2, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if s2.phase != stackRunning {
+		t.Errorf("t should start the track op (running phase), got %v", s2.phase)
+	}
+	if cmd == nil {
+		t.Error("t should return a command to run the track op")
+	}
+	// On a tracked branch, t is inert.
+	s.status.Branch = "feat-mid"
+	if _, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}); cmd != nil {
+		t.Error("t must be a no-op on a tracked branch")
 	}
 }
