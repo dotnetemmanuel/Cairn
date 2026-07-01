@@ -13,8 +13,13 @@ import (
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 )
 
-// prItem adapts a gh.Item to the bubbles list.Item interface.
-type prItem struct{ gh.Item }
+// prItem adapts a gh.Item to the bubbles list.Item interface. depth is the row's
+// indent level so it sits one step under its header (a repo subheader, or the
+// OPEN/CLOSED divider); 0 means an ungrouped flat list with no header above it.
+type prItem struct {
+	gh.Item
+	depth int
+}
 
 func (i prItem) FilterValue() string { return i.Title }
 
@@ -31,11 +36,18 @@ func (i notifItem) FilterValue() string { return i.Title }
 // the group (shown when collapsed) and collapsed is its current fold state. A
 // header with collapsible=false (notably the blank spacer, label=="") is skipped
 // by navigation; see navigable / ensureSelectable in app.go.
+//
+// key is the fold-state map key (falls back to label when empty) — repo
+// subheaders under the sort-by-repo toggle need a key distinct from their display
+// label so the same repo name under two orgs folds independently. depth indents
+// the header for nesting (0 = top-level group, 1 = a repo subheader inside it).
 type sectionHeader struct {
 	label       string
+	key         string
 	collapsible bool
 	collapsed   bool
 	count       int
+	depth       int
 }
 
 func (sectionHeader) FilterValue() string { return "" }
@@ -50,6 +62,13 @@ func (listNote) FilterValue() string { return "" }
 // isClosed reports whether an item is no longer open (CLOSED or MERGED).
 func isClosed(it gh.Item) bool {
 	return it.State != "" && !strings.EqualFold(it.State, "OPEN")
+}
+
+// isMine reports whether an author login is the authenticated viewer, so the
+// viewer's own rows can be tinted apart in mixed lists (viewerLogin is set once
+// the viewer loads; empty before then, so nothing is falsely flagged).
+func isMine(author string) bool {
+	return viewerLogin != "" && strings.EqualFold(author, viewerLogin)
 }
 
 // itemDelegate renders one item as a single colored row of columns:
@@ -126,7 +145,10 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		if selected {
 			focusCell = focusGlyph
 		}
-		text := focusCell + " " + chevron + " " + label + " "
+		// The indent (after the fixed focus cell, so the cursor column stays put)
+		// nests a repo subheader under its group when the sort-by-repo toggle is on.
+		indent := strings.Repeat("  ", h.depth)
+		text := focusCell + " " + indent + chevron + " " + label + " "
 		fill := d.width - lipgloss.Width(text)
 		if fill < 0 {
 			fill = 0
@@ -162,7 +184,12 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 		focusCell = focusGlyph
 	}
 
-	titleW := titleColW(d.width)
+	// Rows indent one level under their header so the grouping reads as a tree. The
+	// focus cursor stays in the left margin (column 0); the indent follows it, and
+	// the flexible title column gives back exactly the width the indent consumed so
+	// the row still spans d.width.
+	indent := strings.Repeat(" ", 2*it.depth)
+	titleW := titleColW(d.width - 2*it.depth)
 
 	ci := ciGlyph(d.th, it.Checks)
 	rev := reviewGlyph(d.th, it.Item)
@@ -196,7 +223,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 			titleCell = tag + title[len(draftTag):]
 		}
 		plain := strings.Join([]string{ref, rev, titleCell, author, upd}, " ")
-		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+ci+" "+plain))
+		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+indent+ci+" "+plain))
 		return
 	}
 
@@ -205,8 +232,8 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	// for plain-closed — so the two are distinguishable at a glance.
 	if isClosed(it.Item) {
 		muted := lipgloss.NewStyle().Foreground(d.th.Muted)
-		row := strings.Join([]string{
-			focusCell, stateDot(d.th, it.State),
+		row := focusCell + " " + indent + strings.Join([]string{
+			stateDot(d.th, it.State),
 			muted.Render(ref), muted.Render("–"),
 			muted.Render(title), muted.Render(author), muted.Render(upd),
 		}, " ")
@@ -216,10 +243,18 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 
 	refStyled := lipgloss.NewStyle().Foreground(d.th.Info).Render(ref)
 	titleStyled := styleTitle(d.th, title, draftTag)
-	authorStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(author)
+	// Your own rows carry the Primary accent on the author cell (the same "you are
+	// here" hue used in the stack) so they stand out in a mixed list — notably the
+	// Orgs tab, which lists the whole org's PRs, yours included. Everyone else's
+	// author stays muted like the time column.
+	authorColor := d.th.Muted
+	if isMine(it.Author) {
+		authorColor = d.th.Primary
+	}
+	authorStyled := lipgloss.NewStyle().Foreground(authorColor).Render(author)
 	updStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(upd)
 
-	row := strings.Join([]string{focusCell, ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
+	row := focusCell + " " + indent + strings.Join([]string{ci, refStyled, rev, titleStyled, authorStyled, updStyled}, " ")
 	fmt.Fprint(w, row)
 }
 

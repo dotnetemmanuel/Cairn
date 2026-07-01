@@ -132,11 +132,12 @@ func (m Model) helpBody(inner int) string {
 		b.WriteString(head("Navigation") + "\n")
 		for _, nav := range [][2]string{
 			{"↑/↓", "move within the list / stack"},
-			{"n/N", "jump to the next/prev OPEN/CLOSED group"},
+			{"n/N", "hop to the next/prev header (OPEN/CLOSED, org, repo)"},
 			{"←/→ tab", "switch section"},
-			{"enter", "open the PR — or fold/unfold an OPEN/CLOSED group"},
+			{"enter", "open the PR — or fold/unfold the header under the cursor"},
 			{"→ / enter", "Notifications: focus the conversation preview (↑/↓ scroll, ← / esc back)"},
 			{"x", "mark notification read (Notifications inbox)"},
+			{"o", "group the list by repo (toggle) — else newest-updated first"},
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
 			{"r", "sync all tabs (re-run every query)"},

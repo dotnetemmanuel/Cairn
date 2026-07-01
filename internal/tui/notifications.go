@@ -128,7 +128,7 @@ func (m Model) markSelectedRead() (tea.Model, tea.Cmd) {
 	}
 	s.notifUnread = kept
 	s.total = len(s.notifUnread) + len(s.notifRead)
-	s.rebuildRows()
+	s.rebuildRows(m.sortByRepo)
 	// Keep the cursor roughly where it was, then settle onto a real row.
 	s.list.Select(idx)
 	preferItem(&s.list)
