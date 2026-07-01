@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/dotnetemmanuel/cairn/internal/config"
 	"github.com/dotnetemmanuel/cairn/internal/gh"
@@ -44,7 +45,9 @@ func TestDashboardRendersHeaderTabsAndRows(t *testing.T) {
 	}
 
 	m = drive(m,
-		tea.WindowSizeMsg{Width: 100, Height: 30},
+		// Wide enough that the footer keybinding line fits without wrapping (it's a
+		// ~150-col strip), so the hint substrings below aren't split mid-phrase.
+		tea.WindowSizeMsg{Width: 160, Height: 30},
 		viewerMsg{v: gh.Viewer{Login: "octocat", RateRemaining: 4992, RateLimit: 5000}},
 		sectionLoadedMsg{idx: 0, items: items, total: 6},
 	)
@@ -89,7 +92,7 @@ func TestSectionRowsDividers(t *testing.T) {
 
 	// Both groups present, nothing folded → OPEN header, items, a blank spacer,
 	// CLOSED header.
-	rows := sectionRows(open, closed, false, false)
+	rows := sectionRows(open, closed, map[string]bool{}, false)
 	if len(rows) != 5 {
 		t.Fatalf("want 5 rows (OPEN + item + spacer + CLOSED + item), got %d", len(rows))
 	}
@@ -104,7 +107,7 @@ func TestSectionRowsDividers(t *testing.T) {
 	}
 
 	// A lone group needs no header.
-	if rows := sectionRows(open, nil, false, false); len(rows) != 1 {
+	if rows := sectionRows(open, nil, map[string]bool{}, false); len(rows) != 1 {
 		t.Fatalf("open-only should be a flat list of 1, got %d", len(rows))
 	} else if _, ok := rows[0].(prItem); !ok {
 		t.Errorf("open-only row should be a prItem, got %#v", rows[0])
@@ -120,7 +123,7 @@ func TestSectionRowsFolded(t *testing.T) {
 
 	// OPEN folded → its items vanish, leaving the collapsed header, spacer, CLOSED
 	// header, and the closed item.
-	rows := sectionRows(open, closed, true, false)
+	rows := sectionRows(open, closed, map[string]bool{"OPEN": true}, false)
 	if len(rows) != 4 {
 		t.Fatalf("OPEN folded: want 4 rows, got %d", len(rows))
 	}
@@ -134,7 +137,7 @@ func TestSectionRowsFolded(t *testing.T) {
 	}
 
 	// CLOSED folded → the closed item vanishes; open items stay.
-	rows = sectionRows(open, closed, false, true)
+	rows = sectionRows(open, closed, map[string]bool{"CLOSED": true}, false)
 	if len(rows) != 5 { // OPEN, item, item, spacer, CLOSED
 		t.Fatalf("CLOSED folded: want 5 rows, got %d", len(rows))
 	}
@@ -219,7 +222,7 @@ func TestGroupedRows(t *testing.T) {
 		{title: "MENTIONED", items: nil}, // empty → muted "none"
 		{title: "PARTICIPATING", items: []gh.Item{{IsPR: true, Number: 2, State: "OPEN"}}},
 	}
-	rows := groupedRows(groups, map[string]bool{})
+	rows := groupedRows(groups, map[string]bool{}, false)
 	// ASSIGNED header + item, spacer + MENTIONED header + none-note, spacer +
 	// PARTICIPATING header + item = 8 rows.
 	if len(rows) != 8 {
@@ -233,12 +236,322 @@ func TestGroupedRows(t *testing.T) {
 	}
 
 	// Folding ASSIGNED hides its item but keeps the header (with its count).
-	folded := groupedRows(groups, map[string]bool{"ASSIGNED TO ME": true})
+	folded := groupedRows(groups, map[string]bool{"ASSIGNED TO ME": true}, false)
 	if h, ok := folded[0].(sectionHeader); !ok || !h.collapsed || h.count != 1 {
 		t.Errorf("ASSIGNED header should be collapsed carrying count 1, got %#v", folded[0])
 	}
 	if _, ok := folded[1].(sectionHeader); !ok {
 		t.Errorf("folded ASSIGNED should be followed by the spacer, not its item, got %#v", folded[1])
+	}
+}
+
+func TestSectionRowsByRepo(t *testing.T) {
+	now := time.Now()
+	open := []gh.Item{
+		{IsPR: true, Repo: "o/api", Number: 1, State: "OPEN", UpdatedAt: now.Add(-3 * time.Hour)},
+		{IsPR: true, Repo: "o/cli", Number: 2, State: "OPEN", UpdatedAt: now.Add(-1 * time.Hour)},
+		{IsPR: true, Repo: "o/api", Number: 3, State: "OPEN", UpdatedAt: now.Add(-10 * time.Hour)},
+	}
+	// By repo: cli is freshest (1h) so its header leads; api follows with its two
+	// items newest-first (#1 at 3h before #3 at 10h).
+	rows := sectionRows(open, nil, map[string]bool{}, true)
+	if len(rows) != 6 { // cli header, #2, spacer, api header, #1, #3
+		t.Fatalf("want 6 rows, got %d: %#v", len(rows), rows)
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "cli" || !h.collapsible || h.count != 1 || h.key != repoKey("", "o/cli") {
+		t.Errorf("row0 should be the cli repo header (freshest, count 1, repo-scoped key), got %#v", rows[0])
+	}
+	if it, ok := rows[1].(prItem); !ok || it.Number != 2 {
+		t.Errorf("row1 should be cli #2, got %#v", rows[1])
+	}
+	if h, ok := rows[2].(sectionHeader); !ok || h.collapsible || h.label != "" {
+		t.Errorf("row2 should be the blank spacer between repo groups, got %#v", rows[2])
+	}
+	if h, ok := rows[3].(sectionHeader); !ok || h.label != "api" || h.count != 2 {
+		t.Errorf("row3 should be the api repo header (count 2), got %#v", rows[3])
+	}
+	if it, ok := rows[4].(prItem); !ok || it.Number != 1 {
+		t.Errorf("row4 should be api #1 (newest of its repo), got %#v", rows[4])
+	}
+	if it, ok := rows[5].(prItem); !ok || it.Number != 3 {
+		t.Errorf("row5 should be api #3, got %#v", rows[5])
+	}
+}
+
+func TestGroupedRowsByRepo(t *testing.T) {
+	now := time.Now()
+	groups := []group{{title: "ACME", items: []gh.Item{
+		{IsPR: true, Repo: "ACME/api", Number: 1, State: "OPEN", UpdatedAt: now.Add(-2 * time.Hour)},
+		{IsPR: true, Repo: "ACME/web", Number: 2, State: "OPEN", UpdatedAt: now.Add(-1 * time.Hour)},
+	}}}
+	// Org header stays at depth 0; repos nest under it as depth-1 subheaders, web
+	// (freshest) first.
+	rows := groupedRows(groups, map[string]bool{}, true)
+	if len(rows) != 5 { // ACME, web header, #2, api header, #1
+		t.Fatalf("want 5 rows, got %d: %#v", len(rows), rows)
+	}
+	if h, ok := rows[0].(sectionHeader); !ok || h.label != "ACME" || h.depth != 0 {
+		t.Errorf("row0 should be the ACME org header at depth 0, got %#v", rows[0])
+	}
+	if h, ok := rows[1].(sectionHeader); !ok || h.label != "web" || h.depth != 1 || h.key != repoKey("ACME", "ACME/web") {
+		t.Errorf("row1 should be the nested web repo subheader (depth 1, org-scoped key), got %#v", rows[1])
+	}
+	// Folding one repo within the org hides only that repo's PR.
+	folded := groupedRows(groups, map[string]bool{repoKey("ACME", "ACME/web"): true}, true)
+	for _, r := range folded {
+		if it, ok := r.(prItem); ok && it.Number == 2 {
+			t.Error("folding the web repo should hide its PR #2")
+		}
+	}
+}
+
+func TestSortToggleGroupsByRepo(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "x"}}}
+	m := New(cfg)
+	now := time.Now()
+	open := []gh.Item{
+		{IsPR: true, Repo: "o/api", Number: 1, Title: "a", State: "OPEN", UpdatedAt: now.Add(-2 * time.Hour)},
+		{IsPR: true, Repo: "o/cli", Number: 2, Title: "b", State: "OPEN", UpdatedAt: now.Add(-1 * time.Hour)},
+	}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		sectionLoadedMsg{idx: 0, items: open, total: 2},
+	)
+	collapsible := func() int {
+		n := 0
+		for _, li := range m.sections[0].list.Items() {
+			if h, ok := li.(sectionHeader); ok && h.collapsible {
+				n++
+			}
+		}
+		return n
+	}
+	if collapsible() != 0 {
+		t.Fatal("default order should have no group headers")
+	}
+	// o → grouped by repo: a foldable header per repo.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if !m.sortByRepo {
+		t.Fatal("o should enable sortByRepo")
+	}
+	if got := collapsible(); got != 2 {
+		t.Fatalf("by-repo should add a foldable header per repo (want 2), got %d", got)
+	}
+	// o again → back to the flat default.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if m.sortByRepo || collapsible() != 0 {
+		t.Fatalf("second o should restore the flat default (sortByRepo=%v, headers=%d)", m.sortByRepo, collapsible())
+	}
+}
+
+func TestSectionRowsByRepoGroupsClosedTail(t *testing.T) {
+	now := time.Now()
+	// Zero open, two closed in different repos — the "Needs my review" shape.
+	closed := []gh.Item{
+		{IsPR: true, Repo: "o/mpd", Number: 18, State: "CLOSED", UpdatedAt: now.Add(-100 * 24 * time.Hour)},
+		{IsPR: true, Repo: "o/ad", Number: 8, State: "MERGED", UpdatedAt: now.Add(-365 * 24 * time.Hour)},
+	}
+	rows := sectionRows(nil, closed, map[string]bool{}, true)
+	// Expect: OPEN header, "nothing open" note, spacer, CLOSED header, then a repo
+	// subheader + its item for each of the two repos.
+	var repoHeaders, closedItems int
+	sawOpen, sawClosed := false, false
+	for _, r := range rows {
+		switch it := r.(type) {
+		case sectionHeader:
+			switch {
+			case it.label == "OPEN":
+				sawOpen = true
+			case it.label == "CLOSED":
+				sawClosed = true
+			case it.depth == 1 && it.collapsible: // repo subheader nested under CLOSED
+				repoHeaders++
+			}
+		case prItem:
+			closedItems++
+		}
+	}
+	if !sawOpen {
+		t.Error("OPEN header must remain even with zero open PRs (it should not vanish in by-repo mode)")
+	}
+	if !sawClosed {
+		t.Error("closed tail should keep its CLOSED header")
+	}
+	if repoHeaders != 2 {
+		t.Errorf("closed tail should nest a repo subheader per repo (want 2), got %d", repoHeaders)
+	}
+	if closedItems != 2 {
+		t.Errorf("both closed PRs should still render, got %d", closedItems)
+	}
+	// Open and closed repo scopes are independent, so an open "api" and a closed
+	// "api" never share a fold key.
+	if repoKey("", "o/mpd") == repoKey("closed", "o/mpd") {
+		t.Error("open and closed repo fold keys must differ")
+	}
+}
+
+func TestSortToggleSurvivesListShrink(t *testing.T) {
+	// Grouping by repo adds repo subheaders (the list grows); toggling back drops
+	// them (it shrinks). With the cursor parked at the bottom, the second toggle
+	// must not panic on a now-out-of-range cursor.
+	cfg := config.Config{Sections: []config.Section{{Title: "Orgs", Type: config.SectionOrgs}}}
+	m := New(cfg)
+	now := time.Now()
+	var items []gh.Item
+	for i, repo := range []string{"o/a", "o/b", "o/c"} {
+		for j := 0; j < 3; j++ {
+			items = append(items, gh.Item{IsPR: true, Repo: repo, Number: i*10 + j, State: "OPEN",
+				UpdatedAt: now.Add(time.Duration(-(i*3 + j)) * time.Hour)})
+		}
+	}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 120, Height: 30},
+		groupedLoadedMsg{idx: 0, groups: []group{{title: "ORG", items: items}}, total: len(items)},
+	)
+	// o → grouped by repo (list grows); park the cursor on the very last row.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	m.sections[0].list.Select(len(m.sections[0].list.Items()) - 1)
+	// o → back to the flat default (list shrinks below the cursor). Must not panic.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	if m.sortByRepo {
+		t.Fatal("second o should have turned grouping off")
+	}
+	if idx := m.sections[0].list.Index(); idx >= len(m.sections[0].list.Items()) {
+		t.Fatalf("cursor %d left out of range for %d rows", idx, len(m.sections[0].list.Items()))
+	}
+}
+
+func TestPRRowIndentDepth(t *testing.T) {
+	depthOf := func(rows []list.Item, number int) int {
+		for _, r := range rows {
+			if it, ok := r.(prItem); ok && it.Number == number {
+				return it.depth
+			}
+		}
+		t.Fatalf("PR #%d not found in rows", number)
+		return -1
+	}
+	open := []gh.Item{{IsPR: true, Repo: "o/api", Number: 1, State: "OPEN"}}
+	closed := []gh.Item{{IsPR: true, Repo: "o/api", Number: 2, State: "MERGED"}}
+
+	// A lone open list has no header above it → depth 0 (no indent).
+	if d := depthOf(sectionRows(open, nil, map[string]bool{}, false), 1); d != 0 {
+		t.Errorf("lone open row should be depth 0, got %d", d)
+	}
+	// With a closed tail the OPEN/CLOSED headers appear → rows indent one step.
+	withClosed := sectionRows(open, closed, map[string]bool{}, false)
+	if d := depthOf(withClosed, 1); d != 1 {
+		t.Errorf("open row under OPEN header should be depth 1, got %d", d)
+	}
+	if d := depthOf(withClosed, 2); d != 1 {
+		t.Errorf("closed row under CLOSED header should be depth 1, got %d", d)
+	}
+	// By repo with a closed tail: OPEN and CLOSED headers stay, repos nest under
+	// each (depth 1), so their PRs are depth 2 on both sides.
+	byRepoRows := sectionRows(open, closed, map[string]bool{}, true)
+	if d := depthOf(byRepoRows, 1); d != 2 {
+		t.Errorf("open PR under OPEN→repo should be depth 2, got %d", d)
+	}
+	if d := depthOf(byRepoRows, 2); d != 2 {
+		t.Errorf("closed PR under CLOSED→repo should be depth 2, got %d", d)
+	}
+	// Grouped tabs: chronological → depth 1 under the org/role header; by repo →
+	// depth 2 (group header → repo subheader → PR).
+	groups := []group{{title: "ORG", items: []gh.Item{{IsPR: true, Repo: "o/api", Number: 3, State: "OPEN"}}}}
+	if d := depthOf(groupedRows(groups, map[string]bool{}, false), 3); d != 1 {
+		t.Errorf("grouped-chronological row should be depth 1, got %d", d)
+	}
+	if d := depthOf(groupedRows(groups, map[string]bool{}, true), 3); d != 2 {
+		t.Errorf("grouped-by-repo row should be depth 2, got %d", d)
+	}
+}
+
+func TestNotifPreviewFocusRequiresEngaging(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{
+		{Title: "My PRs", Filter: "x"},
+		{Title: "Notifications", Type: config.SectionNotifications},
+	}}
+	m := New(cfg)
+	now := time.Now()
+	unread := []gh.Notification{
+		{ThreadID: "t1", Type: "PullRequest", Repo: "o/r", Number: 5, Title: "one", Unread: true, UpdatedAt: now},
+		{ThreadID: "t2", Type: "PullRequest", Repo: "o/r", Number: 6, Title: "two", Unread: true, UpdatedAt: now.Add(-time.Hour)},
+	}
+	m = drive(m,
+		tea.WindowSizeMsg{Width: 160, Height: 30},
+		notifFeedMsg{idx: 1, unread: unread},
+	)
+
+	// Land on the inbox from My PRs. Right again (still unarmed) must navigate tabs,
+	// not reach over to the preview pane.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
+	if !m.sections[m.active].isNotif() {
+		t.Fatalf("right from My PRs should land on the inbox, active=%d", m.active)
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
+	if m.notifPrev.focused {
+		t.Error("right on a freshly-landed inbox must not focus the preview")
+	}
+	if m.sections[m.active].isNotif() {
+		t.Error("right on an unarmed inbox should navigate to the next tab")
+	}
+
+	// Re-enter the inbox, engage the list with ↓ (arms it), then right focuses the
+	// preview and stays on the inbox.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight}) // back onto the inbox
+	m = drive(m, tea.KeyMsg{Type: tea.KeyDown})
+	if !m.notifArmed {
+		t.Fatal("↓ on the inbox list should arm it")
+	}
+	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
+	if !m.notifPrev.focused {
+		t.Error("right after engaging the list should focus the preview")
+	}
+	if !m.sections[m.active].isNotif() {
+		t.Error("focusing the preview should keep us on the inbox")
+	}
+}
+
+func TestNotifLandsOnHeaderNotItem(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "Notifications", Type: config.SectionNotifications}}}
+	m := New(cfg)
+	m = drive(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Unread present → rest on the UNREAD header; nothing selected to preview.
+	m = drive(m, notifFeedMsg{idx: 0,
+		unread: []gh.Notification{{ThreadID: "u1", Title: "u", Unread: true, Type: "PullRequest", Number: 1, Repo: "o/r"}},
+		read:   []gh.Notification{{ThreadID: "r1", Title: "r", Type: "PullRequest", Number: 2, Repo: "o/r"}},
+	})
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "UNREAD" {
+		t.Fatalf("with unread present, cursor should rest on the UNREAD header, got %#v", m.sections[0].list.SelectedItem())
+	}
+	if _, ok := m.selectedNotif(); ok {
+		t.Error("a fresh inbox should not have a notification selected (it would auto-preview)")
+	}
+
+	// No unread → rest on the READ header instead.
+	m = drive(m, notifFeedMsg{idx: 0,
+		read: []gh.Notification{{ThreadID: "r1", Title: "r", Type: "PullRequest", Number: 2, Repo: "o/r"}},
+	})
+	if h, ok := m.sections[0].list.SelectedItem().(sectionHeader); !ok || h.label != "READ" {
+		t.Fatalf("with no unread, cursor should rest on the READ header, got %#v", m.sections[0].list.SelectedItem())
+	}
+}
+
+func TestIsMine(t *testing.T) {
+	old := viewerLogin
+	defer func() { viewerLogin = old }()
+
+	viewerLogin = ""
+	if isMine("octocat") {
+		t.Error("with no viewer set, nothing should read as mine")
+	}
+	viewerLogin = "OctoCat"
+	if !isMine("octocat") {
+		t.Error("author should match the viewer case-insensitively")
+	}
+	if isMine("someone-else") {
+		t.Error("a different author should not read as mine")
 	}
 }
 
@@ -346,7 +659,8 @@ func TestMarkSelectedReadMovesRow(t *testing.T) {
 		unread: []gh.Notification{{ThreadID: "1", Title: "unread one", Unread: true, Type: "PullRequest", Number: 7, Repo: "o/r"}},
 		read:   []gh.Notification{{ThreadID: "2", Title: "read one", Type: "PullRequest"}},
 	})
-	// Cursor should land on the unread item; mark it read.
+	// A fresh inbox rests on the UNREAD header; ↓ steps onto the unread item.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyDown})
 	if n, ok := m.selectedNotif(); !ok || n.ThreadID != "1" {
 		t.Fatalf("cursor should rest on the unread item, got %#v ok=%v", n, ok)
 	}
@@ -370,6 +684,9 @@ func TestNotifPreviewFocus(t *testing.T) {
 	m = drive(m, notifFeedMsg{idx: 0,
 		read: []gh.Notification{{ThreadID: "1", Title: "a", Type: "PullRequest", Number: 7, Repo: "o/r"}},
 	})
+	// A fresh inbox rests on the category header, not a notification; ↓ steps onto
+	// the (read) item so the preview-focus assertions below have one selected.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyDown})
 	if _, ok := m.selectedNotif(); !ok {
 		t.Fatal("expected a PR notification selected")
 	}
@@ -382,10 +699,13 @@ func TestNotifPreviewFocus(t *testing.T) {
 	if m.notifPrev.focused {
 		t.Fatal("esc should return focus to the list")
 	}
-	// right opens (focuses) the preview; right again hides it.
+	// right opens (focuses) the preview; right again hides it. Arm the inbox first
+	// (normally done by engaging the list with ↑/↓); this case is about the toggle,
+	// not the arming gate, which TestNotifPreviewFocusRequiresEngaging covers.
+	m.notifArmed = true
 	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
 	if !m.notifPrev.focused {
-		t.Fatal("right should focus the preview")
+		t.Fatal("right (armed) should focus the preview")
 	}
 	m = drive(m, tea.KeyMsg{Type: tea.KeyRight})
 	if m.notifPrev.focused {
@@ -414,6 +734,8 @@ func TestEnterHintContext(t *testing.T) {
 	m = drive(m, notifFeedMsg{idx: 0,
 		unread: []gh.Notification{{ThreadID: "1", Title: "a", Unread: true, Type: "PullRequest", Number: 7, Repo: "o/r"}},
 	})
+	// A fresh inbox rests on the UNREAD header; ↓ steps onto the notification.
+	m = drive(m, tea.KeyMsg{Type: tea.KeyDown})
 	// List-focused on a PR notification: enter reads (focuses the preview).
 	if got := m.enterHint(); got != "read" {
 		t.Errorf("on a PR notification (list) want %q, got %q", "read", got)

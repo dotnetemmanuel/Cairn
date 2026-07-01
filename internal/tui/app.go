@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -76,15 +77,17 @@ func (s *section) grouped() bool {
 func (s *section) isNotif() bool { return s.typ == config.SectionNotifications }
 
 // rebuildRows reassembles the section's list rows from its stored matches and
-// current fold state. Called on load and whenever a group is toggled.
-func (s *section) rebuildRows() {
+// current fold state. Called on load, whenever a group is toggled, and when the
+// sort order flips. sortByRepo groups each list by repo (the Notifications inbox
+// ignores it, keeping its unread/read split).
+func (s *section) rebuildRows(sortByRepo bool) {
 	switch {
 	case s.isNotif():
 		s.list.SetItems(notifRows(s.notifUnread, s.notifRead, s.collapsed))
 	case s.grouped():
-		s.list.SetItems(groupedRows(s.groups, s.collapsed))
+		s.list.SetItems(groupedRows(s.groups, s.collapsed, sortByRepo))
 	default:
-		s.list.SetItems(sectionRows(s.open, s.closed, s.collapsed["OPEN"], s.collapsed["CLOSED"]))
+		s.list.SetItems(sectionRows(s.open, s.closed, s.collapsed, sortByRepo))
 	}
 }
 
@@ -115,6 +118,11 @@ type Model struct {
 	sections []section
 	active   int
 
+	// sortByRepo flips every PR-list tab between the default newest-updated order
+	// and a per-repo grouping (foldable repo subheaders); toggled with `o`. Global
+	// so the ordering is consistent as you move between tabs.
+	sortByRepo bool
+
 	// Stack tree: remote stacks reconstructed from loaded PRs (any repo), plus
 	// the local git-town tree for the cwd repo (drift-aware overlay).
 	stacks     []*stack.Tree
@@ -142,6 +150,12 @@ type Model struct {
 	// previewed, whether its content is loading, and a per-thread content cache so
 	// arrowing back to a row is instant.
 	notifPrev notifPreview
+
+	// notifArmed gates the inbox's →-focuses-preview behavior: it stays false when
+	// you first land on the Notifications tab (so ←/→ keep navigating tabs) and
+	// flips true once you engage the list with ↑/↓, matching the intuition that you
+	// step into the list before → reaches over to the preview pane.
+	notifArmed bool
 }
 
 // notifPreview holds the inbox preview pane's state: the thread currently shown,
@@ -346,9 +360,9 @@ type groupedLoadedMsg struct {
 
 // notifFeedMsg carries the Notifications inbox feed, pre-split into unread/read.
 type notifFeedMsg struct {
-	idx            int
-	unread, read   []gh.Notification
-	err            error
+	idx          int
+	unread, read []gh.Notification
+	err          error
 }
 
 // notifConvMsg carries a lazily-fetched PR conversation for one thread.
@@ -385,11 +399,12 @@ func loadInvolved(idx int) tea.Msg {
 	return groupedLoadedMsg{idx: idx, groups: groups, total: total}
 }
 
-// loadOrgs powers the discovery Orgs tab: it resolves the orgs you belong to,
-// then fetches open PRs across them that you are NOT yet involved in (and that
-// aren't review-requested from you — those live in Needs my review), one group
-// per org. A single search spans all orgs; results are bucketed by owner so each
-// org reads as its own foldable list.
+// loadOrgs powers the Orgs tab: it resolves the orgs you belong to, then fetches
+// every open PR across them — the org's whole open-PR picture, for an overview of
+// the company's total in-flight work — one group per org. Your own PRs are
+// included (and tinted apart in the list); the My PRs and Involved tabs remain the
+// filtered views. A single search spans all orgs; results are bucketed by owner so
+// each org reads as its own foldable list.
 func loadOrgs(idx int) tea.Msg {
 	orgs, err := gh.FetchOrgs()
 	if err != nil {
@@ -399,8 +414,9 @@ func loadOrgs(idx int) tea.Msg {
 		return groupedLoadedMsg{idx: idx} // no orgs → empty tab, not an error
 	}
 
-	// Discovery filter: open PRs I have no relationship with yet, freshest first.
-	q := "is:open is:pr -involves:@me -review-requested:@me sort:updated-desc"
+	// Every open PR in the orgs, freshest first — no involvement filter, so the tab
+	// is the org's full picture (yours included).
+	q := "is:open is:pr sort:updated-desc"
 	for _, o := range orgs {
 		q += " org:" + o
 	}
@@ -461,40 +477,135 @@ func closedFilter(filter string) string {
 	return strings.Join(fields, " ")
 }
 
-// sectionRows assembles a section's list rows: open items, then any recently
+// byUpdatedDesc returns items ordered newest-updated first — the board's default
+// order, applied client-side so every tab sorts consistently regardless of the
+// order GitHub's search returned (some tab queries carry no sort qualifier).
+func byUpdatedDesc(items []gh.Item) []gh.Item {
+	out := append([]gh.Item(nil), items...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
+}
+
+// repoBucket is a set of items sharing one repo (owner/name), used when the sort
+// toggle groups a list by repo.
+type repoBucket struct {
+	repo  string
+	items []gh.Item
+}
+
+// byRepo groups items into per-repo buckets: within a bucket items are
+// newest-updated first, and the buckets are ordered by their freshest item so the
+// repo with the most recent activity leads — a "by repo, then chronological" order.
+func byRepo(items []gh.Item) []repoBucket {
+	idx := map[string]int{}
+	var buckets []repoBucket
+	for _, it := range items {
+		i, ok := idx[it.Repo]
+		if !ok {
+			i = len(buckets)
+			idx[it.Repo] = i
+			buckets = append(buckets, repoBucket{repo: it.Repo})
+		}
+		buckets[i].items = append(buckets[i].items, it)
+	}
+	for i := range buckets {
+		buckets[i].items = byUpdatedDesc(buckets[i].items)
+	}
+	sort.SliceStable(buckets, func(i, j int) bool {
+		return buckets[i].items[0].UpdatedAt.After(buckets[j].items[0].UpdatedAt)
+	})
+	return buckets
+}
+
+// repoKey is the fold-state key for a repo subheader. It is scoped by the parent
+// group's title (an org, in the Orgs tab; "" for a flat tab) so the same repo
+// name under two orgs folds independently, and prefixed so it never collides with
+// a group label like OPEN/CLOSED or an org title.
+func repoKey(scope, repo string) string {
+	return "repo:" + scope + "/" + repo
+}
+
+// repoGroupRows emits foldable per-repo subheaders for items (each repo's PRs
+// newest-first, repos ordered by freshest activity), at the given nesting depth.
+// scope namespaces the fold keys so the same repo under different parents (an org,
+// or the OPEN vs CLOSED split) folds independently. A blank spacer separates
+// top-level (depth 0) repo groups; nested groups stay compact.
+func repoGroupRows(items []gh.Item, collapsed map[string]bool, scope string, depth int) []list.Item {
+	var rows []list.Item
+	for i, b := range byRepo(items) {
+		if i > 0 && depth == 0 {
+			rows = append(rows, sectionHeader{}) // spacer between top-level repo groups
+		}
+		key := repoKey(scope, b.repo)
+		folded := collapsed[key]
+		rows = append(rows, sectionHeader{label: shortRepo(b.repo), key: key, collapsible: true, collapsed: folded, count: len(b.items), depth: depth})
+		if folded {
+			continue
+		}
+		for _, it := range b.items {
+			rows = append(rows, prItem{Item: it, depth: depth + 1}) // one step under the repo subheader
+		}
+	}
+	return rows
+}
+
+// sectionRows assembles a flat section's list rows: open items, then any recently
 // closed/merged items beneath a divider. Whenever a closed tail is present the
 // OPEN/CLOSED structure is shown — including when there are zero open PRs, where a
 // muted "nothing open" placeholder sits under the OPEN header — so an all-closed
 // section reads as "nothing open + N closed" rather than an unlabeled list that
 // looks miscounted. A lone open group (no closed tail) needs no header.
 //
-// The OPEN/CLOSED headers are collapsible: when openCollapsed/closedCollapsed is
-// set the group's items (and the "nothing open" note) are omitted, leaving just
-// the foldable header. The headers are only emitted when a closed tail exists —
-// a lone open group stays a flat, unfoldable list.
-func sectionRows(open, closed []gh.Item, openCollapsed, closedCollapsed bool) []list.Item {
-	rows := make([]list.Item, 0, len(open)+len(closed)+4)
+// sortByRepo keeps the same OPEN/CLOSED headers but nests foldable per-repo
+// subheaders under each (so OPEN never vanishes); open and closed use separate
+// fold scopes, so folding open "api" and closed "api" are independent. A lone open
+// group with no closed tail groups its repos at the top level (no OPEN header).
+// Otherwise items are simply newest-updated first. Fold state lives in collapsed,
+// keyed by header (OPEN/CLOSED, or repoKey for a repo subheader).
+func sectionRows(open, closed []gh.Item, collapsed map[string]bool, sortByRepo bool) []list.Item {
+	rows := make([]list.Item, 0, len(open)+len(closed)+8)
 	labeled := len(closed) > 0
+
+	// A lone open group (no closed tail) needs no OPEN/CLOSED split.
 	if !labeled {
-		for _, it := range open {
-			rows = append(rows, prItem{it})
+		if sortByRepo {
+			return repoGroupRows(open, collapsed, "", 0)
+		}
+		for _, it := range byUpdatedDesc(open) {
+			rows = append(rows, prItem{Item: it}) // no header above → no indent
 		}
 		return rows
 	}
-	rows = append(rows, sectionHeader{label: "OPEN", collapsible: true, collapsed: openCollapsed, count: len(open)})
+
+	// Closed tail present → OPEN then CLOSED, each either a flat newest-first list or
+	// nested repo subgroups.
+	openCollapsed := collapsed["OPEN"]
+	rows = append(rows, sectionHeader{label: "OPEN", key: "OPEN", collapsible: true, collapsed: openCollapsed, count: len(open)})
 	if !openCollapsed {
 		if len(open) == 0 {
 			rows = append(rows, listNote{"nothing open"})
 		}
-		for _, it := range open {
-			rows = append(rows, prItem{it})
+		if sortByRepo {
+			rows = append(rows, repoGroupRows(open, collapsed, "open", 1)...)
+		} else {
+			for _, it := range byUpdatedDesc(open) {
+				rows = append(rows, prItem{Item: it, depth: 1}) // under the OPEN header
+			}
 		}
 	}
+
 	// A blank spacer sets the closed group apart from the open list.
-	rows = append(rows, sectionHeader{}, sectionHeader{label: "CLOSED", collapsible: true, collapsed: closedCollapsed, count: len(closed)})
+	closedCollapsed := collapsed["CLOSED"]
+	rows = append(rows, sectionHeader{}, sectionHeader{label: "CLOSED", key: "CLOSED", collapsible: true, collapsed: closedCollapsed, count: len(closed)})
 	if !closedCollapsed {
-		for _, it := range closed {
-			rows = append(rows, prItem{it})
+		if sortByRepo {
+			rows = append(rows, repoGroupRows(closed, collapsed, "closed", 1)...)
+		} else {
+			for _, it := range closed {
+				rows = append(rows, prItem{Item: it, depth: 1}) // under the CLOSED header
+			}
 		}
 	}
 	return rows
@@ -505,22 +616,32 @@ func sectionRows(open, closed []gh.Item, openCollapsed, closedCollapsed bool) []
 // spacer. A folded group hides its items; an empty, expanded group shows a muted
 // "none" placeholder so it doesn't read as broken. Group titles are unique, so
 // the collapsed map keys cleanly by label.
-func groupedRows(groups []group, collapsed map[string]bool) []list.Item {
+//
+// sortByRepo nests a foldable repo subheader (depth 1) under each group, its PRs
+// newest-updated first and the repos ordered by freshest activity; the outer
+// grouping (org, or involvement role) is preserved. Otherwise a group's items are
+// listed flat, newest-updated first.
+func groupedRows(groups []group, collapsed map[string]bool, sortByRepo bool) []list.Item {
 	rows := make([]list.Item, 0, len(groups)*2)
 	for i, g := range groups {
 		if i > 0 {
 			rows = append(rows, sectionHeader{}) // spacer between groups
 		}
 		folded := collapsed[g.title]
-		rows = append(rows, sectionHeader{label: g.title, collapsible: true, collapsed: folded, count: len(g.items)})
+		rows = append(rows, sectionHeader{label: g.title, key: g.title, collapsible: true, collapsed: folded, count: len(g.items)})
 		if folded {
 			continue
 		}
 		if len(g.items) == 0 {
 			rows = append(rows, listNote{"none"})
+			continue
 		}
-		for _, it := range g.items {
-			rows = append(rows, prItem{it})
+		if sortByRepo {
+			rows = append(rows, repoGroupRows(g.items, collapsed, g.title, 1)...)
+			continue
+		}
+		for _, it := range byUpdatedDesc(g.items) {
+			rows = append(rows, prItem{Item: it, depth: 1}) // under the group (org / role) header
 		}
 	}
 	return rows
@@ -588,6 +709,12 @@ func preferItem(lst *list.Model) {
 	if n == 0 {
 		return
 	}
+	// After SetItems shrinks a list (e.g. toggling sort-by-repo off drops the repo
+	// subheaders), a cursor left below the new length would be out of range; clamp
+	// it before indexing so we never panic on items[Index()].
+	if lst.Index() >= n {
+		lst.Select(n - 1)
+	}
 	if contentRow(items[lst.Index()]) {
 		return
 	}
@@ -595,6 +722,25 @@ func preferItem(lst *list.Model) {
 		idx := (lst.Index() + i) % n
 		if contentRow(items[idx]) {
 			lst.Select(idx)
+			return
+		}
+	}
+	ensureSelectable(lst)
+}
+
+// restNotifCursor rests the inbox cursor on the top category header that has
+// content — UNREAD when there are unread items, else READ — so arriving at the
+// Notifications tab doesn't immediately preview a notification; the first ↓ then
+// steps onto a real row. Falls back to the nearest navigable row if the target
+// header isn't found.
+func restNotifCursor(lst *list.Model, unreadEmpty bool) {
+	target := "UNREAD"
+	if unreadEmpty {
+		target = "READ"
+	}
+	for i, li := range lst.Items() {
+		if h, ok := li.(sectionHeader); ok && h.label == target {
+			lst.Select(i)
 			return
 		}
 	}
@@ -609,6 +755,10 @@ func ensureSelectable(lst *list.Model) {
 	n := len(items)
 	if n == 0 {
 		return
+	}
+	// Guard against a cursor left past the end after the list shrank (see preferItem).
+	if lst.Index() >= n {
+		lst.Select(n - 1)
 	}
 	if navigable(items[lst.Index()]) {
 		return
@@ -855,7 +1005,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// without re-fetching; fold state persists across the reload.
 			s.open = msg.items
 			s.closed = msg.closed
-			s.rebuildRows()
+			s.rebuildRows(m.sortByRepo)
 			preferItem(&s.list)
 			m.rebuildStacks()
 			m.resizeLists() // sidebar visibility may have changed
@@ -873,7 +1023,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.total = msg.total
 		if msg.err == nil {
 			s.groups = msg.groups
-			s.rebuildRows()
+			s.rebuildRows(m.sortByRepo)
 			preferItem(&s.list)
 			m.rebuildStacks()
 			m.resizeLists()
@@ -892,10 +1042,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			s.notifUnread = msg.unread
 			s.notifRead = msg.read
-			s.rebuildRows()
-			preferItem(&s.list)
+			s.rebuildRows(m.sortByRepo)
+			// Rest on the top category header (not a notification) so a fresh inbox
+			// doesn't auto-preview; ↓ then steps onto the first row.
+			restNotifCursor(&s.list, len(msg.unread) == 0)
 			m.resizeLists()
-			// Prime the preview for whatever row we landed on.
+			// Prime the preview for whatever row we landed on (a no-op on a header).
 			if msg.idx == m.active {
 				return m, m.notifPreviewCmd()
 			}
@@ -942,26 +1094,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.openSelected()
 		case "tab", "l":
 			m.notifPrev.focused = false // leaving the inbox drops preview focus
+			m.notifArmed = false        // a freshly-landed inbox is not yet armed
 			m.active = (m.active + 1) % len(m.sections)
 			return m, m.notifPreviewCmd() // prime the inbox preview if we landed there
 		case "shift+tab", "h":
 			m.notifPrev.focused = false
+			m.notifArmed = false
 			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
 			return m, m.notifPreviewCmd()
 		case "right":
-			// On the inbox, right opens (focuses) the preview for a PR, or hides it if
-			// already focused; otherwise it advances to the next section.
+			// On the inbox, once you've engaged the list (↑/↓ armed it), right focuses
+			// the preview for a PR (or hides it if already focused). Before that — the
+			// moment you land on the tab — right just advances to the next section, so
+			// tab-hopping with ←/→ isn't hijacked by the preview pane.
 			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
 				if m.notifPrev.focused {
 					m.notifPrev.focused = false
 					return m, nil
 				}
-				if n, ok := m.selectedNotif(); ok && n.Type == "PullRequest" && n.Number > 0 {
-					m.notifPrev.focused = true
-					return m, m.notifPreviewCmd()
+				if m.notifArmed {
+					if n, ok := m.selectedNotif(); ok && n.Type == "PullRequest" && n.Number > 0 {
+						m.notifPrev.focused = true
+						return m, m.notifPreviewCmd()
+					}
 				}
 			}
 			m.notifPrev.focused = false
+			m.notifArmed = false
 			m.active = (m.active + 1) % len(m.sections)
 			return m, m.notifPreviewCmd()
 		case "left":
@@ -972,6 +1131,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.notifPrev.focused = false
+			m.notifArmed = false
 			m.active = (m.active - 1 + len(m.sections)) % len(m.sections)
 			return m, m.notifPreviewCmd()
 		case "n":
@@ -1011,6 +1171,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = modeStack
 			// Load the open-PR flags for the local tree (branch → #number).
 			return m, fetchStackPRNums(m.localRepo)
+		case "o":
+			// Flip the PR-list ordering: default newest-updated ↔ grouped by repo.
+			// Global (every tab reorders together, so scanning stays consistent as you
+			// tab across); no-op on the Notifications inbox, which owns its ordering.
+			if len(m.sections) > 0 && m.sections[m.active].isNotif() {
+				return m, nil
+			}
+			m.sortByRepo = !m.sortByRepo
+			for i := range m.sections {
+				m.sections[i].rebuildRows(m.sortByRepo)
+				// The inbox ignores the sort and rests on its own header — don't nudge
+				// its cursor onto a notification (which would auto-preview).
+				if !m.sections[i].isNotif() {
+					preferItem(&m.sections[i].list)
+				}
+			}
+			return m, nil
 		case "r":
 			// Refresh is a whole-board sync, not just the active tab: re-run every
 			// section's query so a PR whose state changed (e.g. you just commented on
@@ -1037,9 +1214,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch msg.String() {
 				case "down", "j":
 					selectAdjacent(lst, +1)
+					m.notifArmed = true // engaging the list arms → to reach the preview
 					return m, m.notifPreviewCmd()
 				case "up", "k":
 					selectAdjacent(lst, -1)
+					m.notifArmed = true
 					return m, m.notifPreviewCmd()
 				}
 			}
@@ -1101,8 +1280,14 @@ func (m Model) toggleSelectedGroup() bool {
 		return false
 	}
 	idx := s.list.Index()
-	s.collapsed[h.label] = !s.collapsed[h.label]
-	s.rebuildRows()
+	// A repo subheader folds by its scoped key (distinct from its display label);
+	// OPEN/CLOSED/org headers set key == label, so this is uniform.
+	key := h.key
+	if key == "" {
+		key = h.label
+	}
+	s.collapsed[key] = !s.collapsed[key]
+	s.rebuildRows(m.sortByRepo)
 	// The toggled header keeps its index (only rows below it appear/disappear), so
 	// the cursor stays put; ensureSelectable is a safety net.
 	s.list.Select(idx)
@@ -1521,6 +1706,11 @@ func (m Model) viewBody() string {
 	if pos, n := selectablePos(&s.list); n > 0 {
 		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
 	}
+	// Flag the non-default order so it's clear why the list is grouped by repo (and
+	// that `o` flips it back). The default newest-updated order needs no label.
+	if m.sortByRepo {
+		label += "  · by repo"
+	}
 	listTitle := lipgloss.NewStyle().Width(listW).Foreground(m.th.Focus).Bold(true).Render(label)
 	listRule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", listW))
 	listPane := lipgloss.JoinVertical(lipgloss.Left, listTitle, listRule, colHead, listBody)
@@ -1680,14 +1870,15 @@ func (m Model) viewFooter() string {
 	} else {
 		parts = []string{
 			dim.Render("↑/↓ move"),
-			dim.Render("n/N group"),
+			dim.Render("n/N hunk"), // hop between headers, like n/N in the conflict resolver
 			dim.Render("←/→ section"),
 			dim.Render("enter " + m.enterHint()),
 		}
-		// The stack sidebar is a PR-list-tab feature; it has no place on the
-		// Notifications inbox, so don't advertise s there.
+		// The stack sidebar and the by-repo grouping toggle are PR-list-tab features
+		// with no place on the Notifications inbox, so don't advertise them there.
+		// (o's current state also shows as "· by repo" in the section subheader.)
 		if !(len(m.sections) > 0 && m.sections[m.active].isNotif()) {
-			parts = append(parts, dim.Render("s sidebar"))
+			parts = append(parts, dim.Render("s sidebar"), dim.Render("o group"))
 		}
 		parts = append(parts,
 			stackHint,

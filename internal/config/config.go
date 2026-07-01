@@ -22,10 +22,10 @@ const (
 	// — excluding your own PRs and review requests (those have their own tabs). Its
 	// Filter is ignored; the sub-queries are defined in the TUI.
 	SectionInvolved = "involved"
-	// SectionOrgs is a built-in grouped section for discovery: open PRs across the
-	// organizations you belong to that you are NOT yet involved in (so you can
-	// start participating), grouped by org. Its orgs are resolved at runtime and
-	// its Filter is ignored.
+	// SectionOrgs is a built-in grouped section: every open PR across the
+	// organizations you belong to, grouped by org — the company's whole in-flight
+	// picture, your own PRs included (tinted apart). Its orgs are resolved at
+	// runtime and its Filter is ignored.
 	SectionOrgs = "orgs"
 )
 
