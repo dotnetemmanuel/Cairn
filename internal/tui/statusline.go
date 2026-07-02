@@ -36,7 +36,7 @@ const (
 // It is the single source of truth for the local-context gate: when cwd is not a
 // repo / has no git-town / is detached, it says so plainly. Pure given its
 // inputs so it is golden-testable.
-func renderStatusline(th theme.Theme, repo string, st stack.RepoStatus, hasGitTown bool, width int) string {
+func renderStatusline(th theme.Theme, repo string, st stack.RepoStatus, base string, hasGitTown bool, width int) string {
 	pad := func(s string) string {
 		return lipgloss.NewStyle().Width(width).Background(th.Surface).Padding(0, 1).Render(s)
 	}
@@ -57,11 +57,17 @@ func renderStatusline(th theme.Theme, repo string, st stack.RepoStatus, hasGitTo
 		lipgloss.NewStyle().Foreground(th.Success).Render(iconRepo + " " + repoName),
 	}
 
-	// branch segment.
+	// branch segment — with what it's stacked on ("→ base", the branch below it in
+	// the stack / the trunk), so the PR's target is visible without opening it.
 	if st.Detached {
 		segs = append(segs, lipgloss.NewStyle().Foreground(th.Danger).Render(iconBranch+" detached HEAD"))
 	} else {
-		segs = append(segs, lipgloss.NewStyle().Foreground(th.Info).Bold(true).Render(iconBranch+" "+st.Branch))
+		branchSeg := lipgloss.NewStyle().Foreground(th.Info).Bold(true).Render(iconBranch + " " + st.Branch)
+		if base != "" {
+			branchSeg += lipgloss.NewStyle().Foreground(th.Muted).Render(" → ") +
+				lipgloss.NewStyle().Foreground(th.Accent2).Render(base)
+		}
+		segs = append(segs, branchSeg)
 	}
 
 	// status segment — recolors by state.

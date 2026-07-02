@@ -230,6 +230,24 @@ func TestProposeIsInCatalogButNotAGitTownVerb(t *testing.T) {
 	}
 }
 
+func TestShipStackIsInCatalogButNotAGitTownVerb(t *testing.T) {
+	c := Find("G")
+	if c == nil || c.Verb != "shipstack" {
+		t.Fatal("shipstack should be in the catalog under key G")
+	}
+	// Like ship/propose it is orchestrated (looped gh merges + one sync), not a
+	// single git-town call, so it has no plain argv but still surfaces a hint.
+	if argv("shipstack", "x") != nil {
+		t.Error("shipstack has no single argv")
+	}
+	if c.Hint() == "" {
+		t.Error("shipstack should surface a hint describing the bottom-up steps")
+	}
+	if Find("M") == nil || Find("M").Verb != "ship" {
+		t.Error("single-branch merge must stay on M, distinct from shipstack")
+	}
+}
+
 func TestSetParentWritesGitTownConfig(t *testing.T) {
 	rr := &recordRunner{}
 	ops := Ops{Dir: "/repo", Runner: rr}
@@ -240,5 +258,68 @@ func TestSetParentWritesGitTownConfig(t *testing.T) {
 	if len(rr.calls) != 1 ||
 		strings.Join(rr.calls[0], " ") != "git config git-town-branch.ui-polish.parent main" {
 		t.Errorf("SetParent ran %v, want git config git-town-branch.ui-polish.parent main", rr.calls)
+	}
+}
+
+// existRunner reports selected branches as present (via git show-ref) and records
+// every call — for testing RemoveMergedLocal's "only delete what still exists".
+type existRunner struct {
+	calls  [][]string
+	exists map[string]bool
+}
+
+func (r *existRunner) Run(dir, name string, args ...string) (string, error) {
+	r.calls = append(r.calls, append([]string{name}, args...))
+	if len(args) >= 1 && args[0] == "show-ref" {
+		b := strings.TrimPrefix(args[len(args)-1], "refs/heads/")
+		if !r.exists[b] {
+			return "", errors.New("no such ref")
+		}
+	}
+	return "", nil
+}
+
+func called(calls [][]string, want ...string) bool {
+	target := strings.Join(want, " ")
+	for _, c := range calls {
+		if strings.Join(c, " ") == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRemoveMergedLocalDeletesOnlyLeftovers(t *testing.T) {
+	// sync already removed green-2 (not current); green-3 (the branch we were on)
+	// lingers and must be cleaned.
+	rr := &existRunner{exists: map[string]bool{"green-3": true, "green-2": false}}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	evs := drain(ops.RemoveMergedLocal("main", []string{"green-2", "green-3"}))
+
+	if !called(rr.calls, "git", "checkout", "main") {
+		t.Error("must hop to the trunk before deleting")
+	}
+	if !called(rr.calls, "git", "branch", "-D", "green-3") {
+		t.Error("must delete the leftover green-3")
+	}
+	if !called(rr.calls, "git", "config", "--unset", "git-town-branch.green-3.parent") {
+		t.Error("must clear green-3's git-town parent config")
+	}
+	if called(rr.calls, "git", "branch", "-D", "green-2") {
+		t.Error("must NOT try to delete green-2 (already gone)")
+	}
+	if n := len(evs); n == 0 || !evs[n-1].Done {
+		t.Errorf("stream must end with Done, got %v", evs)
+	}
+}
+
+func TestRemoveMergedLocalNoopWhenNothingLeftover(t *testing.T) {
+	// Partial ship: the branch we're on wasn't merged, so nothing lingers — and we
+	// must NOT check out the trunk (that would move the user off their branch).
+	rr := &existRunner{exists: map[string]bool{"mixed-1": false, "mixed-2": false}}
+	ops := Ops{Dir: "/repo", Runner: rr}
+	drain(ops.RemoveMergedLocal("main", []string{"mixed-1", "mixed-2"}))
+	if called(rr.calls, "git", "checkout", "main") {
+		t.Error("must NOT switch branches when there's nothing to clean up")
 	}
 }

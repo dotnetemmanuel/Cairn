@@ -1,10 +1,14 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/stack"
 	"github.com/dotnetemmanuel/cairn/internal/theme"
 	"github.com/dotnetemmanuel/cairn/internal/townie"
@@ -152,6 +156,184 @@ func TestShipConfirmNamesMergeAndReParent(t *testing.T) {
 	}
 }
 
+func TestShipChainBottomUp(t *testing.T) {
+	s := fixtureModel() // main → feat-base → feat-mid → feat-top
+	cases := []struct {
+		branch string
+		want   string
+	}{
+		{"feat-top", "feat-base,feat-mid,feat-top"},
+		{"feat-mid", "feat-base,feat-mid"},
+		{"feat-base", "feat-base"},
+		{"main", ""},           // trunk has no chain
+		{"unknown-branch", ""}, // off-stack
+	}
+	for _, tc := range cases {
+		s.status.Branch = tc.branch
+		if got := strings.Join(s.shipChain(), ","); got != tc.want {
+			t.Errorf("shipChain(%s) = %q, want %q", tc.branch, got, tc.want)
+		}
+	}
+}
+
+func TestShipStackGating(t *testing.T) {
+	s := fixtureModel()
+	s.status.Staged = 0 // clean (fixture is dirty)
+	stack := townie.Command{Verb: "shipstack"}
+	if !s.actionEnabled(stack) {
+		t.Error("shipstack should be enabled on a clean tracked non-trunk branch")
+	}
+	s.status.Branch = "main"
+	if s.actionEnabled(stack) {
+		t.Error("shipstack must be disabled on the trunk (no chain)")
+	}
+	s.status.Branch = "feat-mid"
+	s.status.Unstaged = 2
+	if s.actionEnabled(stack) {
+		t.Error("shipstack must be disabled on a dirty tree")
+	}
+	s.status.Unstaged = 0
+	// A blocked BOTTOM PR (the first to land) dims it; the chain bottom is feat-base.
+	s.prMerge = map[string]gh.PRMergeability{"feat-base": {Number: 1, Mergeable: "CONFLICTING"}}
+	if s.actionEnabled(stack) {
+		t.Error("shipstack must be disabled when the bottom PR can't merge")
+	}
+	// A blocked HIGHER PR does NOT dim it — the run lands what it can and stops.
+	// (The bottom must be a real, mergeable PR for the gate to open.)
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 1, Mergeable: "MERGEABLE"},
+		"feat-top":  {Number: 3, Draft: true},
+	}
+	if !s.actionEnabled(stack) {
+		t.Error("shipstack should stay enabled when only a higher PR is blocked")
+	}
+	// Readiness loaded but the bottom has NO open PR → dim with a clear reason.
+	s.prMerge = map[string]gh.PRMergeability{"feat-top": {Number: 3, Mergeable: "MERGEABLE"}}
+	if s.actionEnabled(stack) {
+		t.Error("shipstack must be disabled when the bottom branch has no open PR")
+	}
+}
+
+func TestShipStackAffectedIsChain(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	got := s.affectedBranches(townie.Command{Verb: "shipstack"}, "")
+	if strings.Join(got, ",") != "feat-base,feat-mid,feat-top" {
+		t.Errorf("shipstack affected = %v, want the bottom-up chain", got)
+	}
+}
+
+func TestShipMergeabilityDimsAndExplains(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-base" // bottom
+	s.status.Staged = 0
+	if !s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Fatal("ship should be enabled on a clean, unblocked bottom branch")
+	}
+	s.prMerge = map[string]gh.PRMergeability{"feat-base": {Number: 1, Draft: true, Mergeable: "MERGEABLE"}}
+	if s.actionEnabled(townie.Command{Verb: "ship"}) {
+		t.Error("ship must be disabled when the bottom PR is a draft")
+	}
+	// The action pane must explain WHY it is dim AND how to fix it.
+	view := s.renderActions(100)
+	for _, w := range []string{"feat-base", "can't be merged", "still a draft", "ready for review"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("blocked-merge banner missing %q\n%s", w, view)
+		}
+	}
+}
+
+func TestShipStackConfirmWarnsAndListsBranches(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11, "feat-top": 12}
+	s.prMerge = map[string]gh.PRMergeability{"feat-mid": {Number: 11, Mergeable: "CONFLICTING"}}
+	s.pending = *townie.Find("G") // the catalog entry (carries Long + Hint)
+	s.affected = s.shipChain()
+	view := s.renderShipStackConfirm(90)
+	for _, w := range []string{
+		"SERIOUS", "merge whole stack (3 branches)",
+		"feat-base", "feat-mid", "feat-top",
+		"#10", "conflicts with its base", "bottom-up",
+		"merge 3 branches",
+	} {
+		if !strings.Contains(view, w) {
+			t.Errorf("ship-stack confirm missing %q\n%s", w, view)
+		}
+	}
+	// A CONFLICTING branch ABOVE the bottom is a risk, not a certainty (the run
+	// rebases it onto trunk first), so it must read "may stop here", not "stops here".
+	if !strings.Contains(view, "may stop here") {
+		t.Errorf("non-bottom conflict should read \"may stop here\"\n%s", view)
+	}
+}
+
+func TestShipStackDraftStopsHereButConflictMayStop(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11, "feat-top": 12}
+	// feat-mid is a DRAFT: a certain stop regardless of base.
+	s.prMerge = map[string]gh.PRMergeability{"feat-mid": {Number: 11, Draft: true, Mergeable: "MERGEABLE"}}
+	s.pending = *townie.Find("G")
+	s.affected = s.shipChain()
+	view := s.renderShipStackConfirm(90)
+	if !strings.Contains(view, "still a draft — stops here") {
+		t.Errorf("a draft must read a definite \"stops here\"\n%s", view)
+	}
+}
+
+func TestShipStackTerminalStatusIsStoppedNotFailed(t *testing.T) {
+	s := fixtureModel()
+	s.phase = stackDone
+	s.runErr = fmt.Errorf("mixed-3 can't merge: it is still a draft")
+	// A whole-stack ship that halts is a controlled "stopped", not a red "failed".
+	s.pending = townie.Command{Verb: "shipstack", Title: "merge whole stack"}
+	if out := s.renderOutput(80); !strings.Contains(out, "stopped:") || strings.Contains(out, "failed:") {
+		t.Errorf("shipstack halt must read \"stopped:\" not \"failed:\"\n%s", out)
+	}
+	// A single ship that fails is a genuine "failed".
+	s.pending = townie.Command{Verb: "ship", Title: "merge"}
+	if out := s.renderOutput(80); !strings.Contains(out, "failed:") {
+		t.Errorf("single ship failure should still read \"failed:\"\n%s", out)
+	}
+}
+
+func TestShipStackConfirmAnnotatesCautionAndNoPR(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	// feat-base ready; feat-mid needs review (caution, not a hard block); feat-top
+	// has no open PR yet. prMerge is non-nil, so an absent branch = "no open PR".
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11}
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Mergeable: "MERGEABLE", ReviewDecision: "CHANGES_REQUESTED"},
+	}
+	s.pending = *townie.Find("G")
+	s.affected = s.shipChain()
+	view := s.renderShipStackConfirm(100)
+	for _, w := range []string{"changes were requested", "no open PR"} {
+		if !strings.Contains(view, w) {
+			t.Errorf("confirm annotation missing %q\n%s", w, view)
+		}
+	}
+}
+
+func TestShipStackConfirmEnterRuns(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	s.phase = stackConfirming
+	s.pending = *townie.Find("G")
+	s.affected = s.shipChain()
+	s2, cmd := s.updateConfirming(tea.KeyMsg{Type: tea.KeyEnter})
+	if s2.phase != stackRunning || cmd == nil {
+		t.Fatalf("enter on the ship-stack confirm should run: phase=%d cmd=%v", s2.phase, cmd != nil)
+	}
+}
+
 func TestStackAffectedBranches(t *testing.T) {
 	s := fixtureModel()
 	// amend on feat-mid rebases feat-top (its only descendant).
@@ -210,9 +392,10 @@ func TestStackNewPromptsForName(t *testing.T) {
 func TestStackCommandKeyAccelerators(t *testing.T) {
 	key := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
-	// 'n' (new) needs a name → naming phase, even from the tree pane.
+	// 'n' (new) needs a name → naming phase. Accelerators fire from the ACTION pane
+	// (the tree pane is inert — see TestTreeFocusBlocksActionAccelerators).
 	s := fixtureModel()
-	s.focus = focusTree
+	s.focus = focusActions
 	if s2, _ := s.updateBrowsing(key("n")); s2.phase != stackNaming {
 		t.Errorf("'n' should start new (naming), got phase %d", s2.phase)
 	}
@@ -291,6 +474,7 @@ func TestInitCTAAndFlow(t *testing.T) {
 	s.status = stack.RepoStatus{InRepo: true} // in a repo…
 	s.tree = nil                              // …but no git-town config
 	s.trunk = "main"                          // detected trunk for the prompt
+	s.focus = focusTree                       // real entry (newStackModel) focuses the tree
 	fr := &fakeRunner{}
 	s.ops = townie.Ops{Runner: fr}
 
@@ -495,6 +679,309 @@ func TestTreeShowsPRNumberFlag(t *testing.T) {
 	}
 }
 
+func TestActionDisabledReasonsExplain(t *testing.T) {
+	s := fixtureModel() // current = feat-mid (middle), dirty (Staged 2)
+	s.status.Staged = 0 // clean, so the reason isn't "clean tree"
+
+	// M on a middle branch: names the only branch that can merge (the bottom).
+	if r := s.actionDisabledReason(townie.Command{Verb: "ship"}); !strings.Contains(r, "bottom branch (feat-base)") {
+		t.Errorf("ship reason on a middle branch should name the bottom; got %q", r)
+	}
+	// A dirty tree changes the bottom-branch reason to the clean-tree one.
+	s.status.Branch = "feat-base"
+	s.status.Unstaged = 3
+	if r := s.actionDisabledReason(townie.Command{Verb: "ship"}); !strings.Contains(r, "clean working tree") {
+		t.Errorf("ship reason on a dirty bottom should mention a clean tree; got %q", r)
+	}
+	s.status.Unstaged = 0
+
+	// A blocked bottom PR reports the blocker + fix.
+	s.prMerge = map[string]gh.PRMergeability{"feat-base": {Number: 1, Draft: true}}
+	if r := s.actionDisabledReason(townie.Command{Verb: "ship"}); !strings.Contains(r, "draft") {
+		t.Errorf("ship reason on a draft bottom should say draft; got %q", r)
+	}
+
+	// Maintenance verbs off-stack.
+	s.status.Branch = "off-tree"
+	s.prMerge = nil
+	for _, v := range []string{"sync", "restack", "amend"} {
+		if r := s.actionDisabledReason(townie.Command{Verb: v}); !strings.Contains(r, "isn't in a stack") {
+			t.Errorf("%s reason off-stack should say isn't in a stack; got %q", v, r)
+		}
+	}
+}
+
+func TestShipStopsListsAllCertainStops(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top" // whole chain: feat-base, feat-mid, feat-top
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11}
+	// base mergeable, mid is a draft (certain stop), top has no open PR (certain stop).
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+	} // feat-top absent => no open PR
+	landsFirst, stops := s.shipStops()
+	if strings.Join(landsFirst, ",") != "feat-base" {
+		t.Errorf("landsFirst = %v, want [feat-base] (only what lands before the first stop)", landsFirst)
+	}
+	if len(stops) != 2 {
+		t.Fatalf("want 2 certain stops, got %d: %+v", len(stops), stops)
+	}
+	if stops[0].branch != "feat-mid" || !strings.Contains(stops[0].reason, "draft") || !strings.Contains(stops[0].fixAction, "Y") {
+		t.Errorf("first stop = %+v, want feat-mid draft / Y", stops[0])
+	}
+	if stops[1].branch != "feat-top" || !strings.Contains(stops[1].reason, "no open PR") || !strings.Contains(stops[1].fixAction, "p") {
+		t.Errorf("second stop = %+v, want feat-top no-PR / p", stops[1])
+	}
+	// All clear => no stops.
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Mergeable: "MERGEABLE"},
+		"feat-top":  {Number: 12, Mergeable: "MERGEABLE"},
+	}
+	s.prNums["feat-top"] = 12
+	if _, stops := s.shipStops(); len(stops) != 0 {
+		t.Errorf("a clean chain should have no stops, got %+v", stops)
+	}
+}
+
+func TestStackActionsBannerWarnsWhereGWillStop(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0 // clean, so G is enabled
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11, "feat-top": 12}
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+		"feat-top":  {Number: 12, Mergeable: "MERGEABLE"},
+	}
+	if !s.actionEnabled(townie.Command{Verb: "shipstack"}) {
+		t.Fatal("G should be enabled: the bottom is mergeable")
+	}
+	out := s.renderActions(100)
+	for _, want := range []string{"will stop at feat-mid", "Lands feat-base first"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("G stop banner missing %q\n%s", want, out)
+		}
+	}
+}
+
+func TestLooseBranchesShowInTreeAndNav(t *testing.T) {
+	s := fixtureModel()
+	s.loose = []string{"loose-branch"}
+	// navBranches appends loose after the stack nodes.
+	nav := s.navBranches()
+	if len(nav) != len(s.tree.Order)+1 || nav[len(nav)-1] != "loose-branch" {
+		t.Errorf("navBranches should end with loose-branch; got %v", nav)
+	}
+	out := s.renderLocalTree(40)
+	if !strings.Contains(out, "not in a stack") || !strings.Contains(out, "loose-branch") {
+		t.Errorf("tree should show the not-in-a-stack section with loose-branch; got:\n%s", out)
+	}
+	// The cursor can land on the loose branch, and enter checks it out.
+	s.focus = focusTree
+	s.treeCursor = len(s.tree.Order) // first loose entry
+	s2, cmd := s.updateTree(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil || s2.opName != "loose-branch" {
+		t.Errorf("enter on a loose branch should check it out; opName=%q", s2.opName)
+	}
+}
+
+func TestTreeShowsDraftAndNoPRBadges(t *testing.T) {
+	s := fixtureModel()
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11} // feat-top has no open PR
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+	}
+	out := s.renderLocalTree(50)
+	if !strings.Contains(out, "draft") {
+		t.Errorf("tree should badge the draft PR; got:\n%s", out)
+	}
+	if !strings.Contains(out, "no PR") {
+		t.Errorf("tree should badge the branch with no open PR; got:\n%s", out)
+	}
+}
+
+func TestReadyGatedToDraftUnderCursor(t *testing.T) {
+	s := fixtureModel() // main→feat-base→feat-mid→feat-top
+	ready := townie.Command{Verb: "ready"}
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11}
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+	}
+	// Cursor on the draft PR → enabled.
+	s.treeCursor = s.tree.IndexOf("feat-mid")
+	if !s.actionEnabled(ready) {
+		t.Error("ready should be enabled when the cursor is on a draft PR")
+	}
+	// Cursor on a non-draft PR → disabled, with a reason.
+	s.treeCursor = s.tree.IndexOf("feat-base")
+	if s.actionEnabled(ready) {
+		t.Error("ready must be disabled on a non-draft PR")
+	}
+	if r := s.actionDisabledReason(ready); !strings.Contains(r, "isn't a draft") {
+		t.Errorf("reason should say not a draft; got %q", r)
+	}
+	// Cursor on a branch with no PR → reason says so.
+	s.treeCursor = s.tree.IndexOf("feat-top")
+	if r := s.actionDisabledReason(ready); !strings.Contains(r, "no open PR") {
+		t.Errorf("reason should say no open PR; got %q", r)
+	}
+	// triggerAction on the draft opens a confirm targeting that branch; enter runs it.
+	s.treeCursor = s.tree.IndexOf("feat-mid")
+	s2, _ := s.triggerAction(townie.Command{Verb: "ready", Title: "mark ready"})
+	if s2.phase != stackConfirming || s2.opName != "feat-mid" {
+		t.Fatalf("ready should confirm on feat-mid; phase=%v opName=%q", s2.phase, s2.opName)
+	}
+	if !strings.Contains(s2.renderConfirm(80), "mark feat-mid ready") {
+		t.Errorf("confirm should name the branch\n%s", s2.renderConfirm(80))
+	}
+	s3, cmd := s2.updateConfirming(tea.KeyMsg{Type: tea.KeyEnter})
+	if s3.phase != stackRunning || cmd == nil {
+		t.Errorf("enter should start the ready op; phase=%v", s3.phase)
+	}
+}
+
+func TestGStopBannerPointsAtReady(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11, "feat-top": 12}
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+		"feat-top":  {Number: 12, Mergeable: "MERGEABLE"},
+	}
+	if out := s.renderActions(110); !strings.Contains(out, "press Y") {
+		t.Errorf("G stop banner should point at Y for a draft\n%s", out)
+	}
+}
+
+func TestGStopBannerBulletsMultipleFixes(t *testing.T) {
+	s := fixtureModel()
+	s.status.Branch = "feat-top"
+	s.status.Staged = 0
+	// feat-base mergeable, feat-mid draft, feat-top no open PR => TWO fixes.
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11}
+	s.prMerge = map[string]gh.PRMergeability{
+		"feat-base": {Number: 10, Mergeable: "MERGEABLE"},
+		"feat-mid":  {Number: 11, Draft: true},
+	}
+	out := s.renderActions(110)
+	for _, want := range []string{
+		"•",               // rendered as a bulleted checklist
+		"press Y",         // fix for the draft (feat-mid)
+		"press p",         // fix for the no-PR branch (feat-top)
+		"feat-top",        // the no-PR branch is now named in the banner, not just the row
+		"lands feat-base", // what still ships before the first stop
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("multi-fix G banner missing %q\n%s", want, out)
+		}
+	}
+}
+
+func TestDriftBannerNamesBranchAndFix(t *testing.T) {
+	s := fixtureModel()
+	// Rebuild the tree so feat-mid has drifted off its parent.
+	lin := stack.Lineage{Trunk: "main", Parents: map[string]string{
+		"feat-base": "main", "feat-mid": "feat-base", "feat-top": "feat-mid",
+	}, Perennial: map[string]bool{}}
+	s.tree = stack.BuildTree(lin, "feat-mid", func(b, _ string) bool { return b == "feat-mid" })
+	s.status = stack.RepoStatus{InRepo: true, Branch: "feat-mid"}
+
+	if got := s.driftedInCurrentStack(); len(got) != 1 || got[0] != "feat-mid" {
+		t.Fatalf("driftedInCurrentStack = %v, want [feat-mid]", got)
+	}
+	out := s.renderActions(90)
+	for _, w := range []string{"feat-mid has drifted", "press R to restack"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("drift banner missing %q\n%s", w, out)
+		}
+	}
+
+	// Drift in an UNRELATED stack under the same trunk must not warn here.
+	lin2 := stack.Lineage{Trunk: "main", Parents: map[string]string{
+		"green-1": "main", "cf-1": "main", "cf-2": "cf-1",
+	}, Perennial: map[string]bool{}}
+	s.tree = stack.BuildTree(lin2, "green-1", func(b, _ string) bool { return b == "cf-2" })
+	s.status.Branch = "green-1"
+	if got := s.driftedInCurrentStack(); len(got) != 0 {
+		t.Errorf("drift in an unrelated stack should not surface; got %v", got)
+	}
+}
+
+func TestColorBranchesHighlightsKnownBranchesOnly(t *testing.T) {
+	th := theme.New(theme.DefaultPalette())
+	base := lipgloss.NewStyle().Foreground(th.Warning)
+	out := colorBranches(base, th, "merge feat-base into main now", []string{"feat-base", "main"})
+	// No characters added or dropped — only styling changes.
+	if got := ansi.Strip(out); got != "merge feat-base into main now" {
+		t.Errorf("plain text changed: %q", got)
+	}
+	// Branch names carry the branch color (Accent2); surrounding text stays base.
+	wantBranch := lipgloss.NewStyle().Foreground(th.Accent2).Render("feat-base")
+	if !strings.Contains(out, wantBranch) {
+		t.Errorf("feat-base not rendered in the branch color\n%q", out)
+	}
+	if !strings.Contains(out, lipgloss.NewStyle().Foreground(th.Accent2).Render("main")) {
+		t.Errorf("main not rendered in the branch color\n%q", out)
+	}
+	if !strings.Contains(out, base.Render("merge ")) {
+		t.Errorf("non-branch text should keep the base style\n%q", out)
+	}
+	// A word that isn't a known branch is never colored as one.
+	plain := colorBranches(base, th, "nothing staged here", []string{"feat-base"})
+	if plain != base.Render("nothing staged here") {
+		t.Errorf("text with no branch should be a single base render\n%q", plain)
+	}
+
+	// Plain text is preserved even with a substring collision ("main" in "remains").
+	if got := ansi.Strip(colorBranches(base, th, "what remains re-parents onto main", []string{"main"})); got != "what remains re-parents onto main" {
+		t.Errorf("plain text changed: %q", got)
+	}
+}
+
+func TestLogBranchNamesIncludesOpBranches(t *testing.T) {
+	s := fixtureModel()
+	// Simulate a ship whose op branches (affected/opName) may already be gone from
+	// the reloaded tree — they must still be colorable in the run log.
+	s.affected = []string{"feat-base", "shipped-and-gone"}
+	s.opName = "another-gone"
+	got := map[string]bool{}
+	for _, n := range s.logBranchNames() {
+		got[n] = true
+	}
+	for _, want := range []string{"feat-mid", "feat-base", "shipped-and-gone", "another-gone"} {
+		if !got[want] {
+			t.Errorf("logBranchNames missing %q (%v)", want, s.logBranchNames())
+		}
+	}
+}
+
+func TestBranchNameAtRespectsWordBoundaries(t *testing.T) {
+	names := []string{"feat-base", "main"} // longest-first, as colorBranches sorts
+	cases := []struct {
+		line string
+		pos  int
+		want string
+	}{
+		{"onto main now", 5, "main"},              // standalone → match
+		{"what remains onto x", 7, ""},            // "main" inside "remains" → no match
+		{"rebase feat-base onto", 7, "feat-base"}, // standalone hyphenated → match
+		{"feat-base-x drift", 0, ""},              // longer word "feat-base-x" → no match
+		{"main", 0, "main"},                       // whole string → match
+		{"domain", 2, ""},                         // "main" inside "domain" → no match
+	}
+	for _, tc := range cases {
+		if got := branchNameAt(tc.line, tc.pos, names); got != tc.want {
+			t.Errorf("branchNameAt(%q,%d) = %q, want %q", tc.line, tc.pos, got, tc.want)
+		}
+	}
+}
+
 func TestTreeWidthFitsLongBranchAndClamps(t *testing.T) {
 	s := fixtureModel()
 	s.width = 200 // plenty of room
@@ -532,7 +1019,7 @@ func TestCurrentUntrackedAndTrack(t *testing.T) {
 		t.Errorf("trackParent = %q, want the trunk main", s.trackParent())
 	}
 	// The action list surfaces the peach call-to-action.
-	if out := s.renderActions(70); !strings.Contains(out, "ui-polish isn't in the stack") {
+	if out := s.renderActions(70); !strings.Contains(out, "ui-polish isn't in a stack") {
 		t.Errorf("expected the untracked banner; got:\n%s", out)
 	}
 	// t starts the track op (running phase + a command).
@@ -547,5 +1034,27 @@ func TestCurrentUntrackedAndTrack(t *testing.T) {
 	s.status.Branch = "feat-mid"
 	if _, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}); cmd != nil {
 		t.Error("t must be a no-op on a tracked branch")
+	}
+}
+
+// TestTreeFocusBlocksActionAccelerators: while the branch tree is focused (the
+// default on entry), the letter accelerators must NOT fire — so navigating can't
+// accidentally trigger a destructive action. You tab to the action list first.
+func TestTreeFocusBlocksActionAccelerators(t *testing.T) {
+	keys := []string{"n", "p", "I", "S", "R", "A", "M", "G", "Y"}
+	for _, k := range keys {
+		s := fixtureModel()
+		s.status.Staged = 0
+		s.focus = focusTree
+		s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		if s2.phase != stackBrowsing {
+			t.Errorf("key %q while the tree is focused fired something (phase=%d) — must be inert", k, s2.phase)
+		}
+	}
+	// Sanity: with the ACTION LIST focused, an accelerator still acts (n -> naming).
+	s := fixtureModel()
+	s.focus = focusActions
+	if s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); s2.phase != stackNaming {
+		t.Errorf("n with the action list focused should start naming, got phase %d", s2.phase)
 	}
 }

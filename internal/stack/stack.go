@@ -371,6 +371,38 @@ func trunkFromSymbolicRef(ref string) string {
 	return ref
 }
 
+// LocalBranches returns every local branch name (dir cwd if empty), in git's
+// default refname order. "" (no branches / git unreachable) yields nil.
+func LocalBranches(dir string) []string {
+	out := gitOutput(dir, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// LooseBranches returns the local branches that exist in git but are NOT part of
+// the git-town stack — no recorded parent, and not the trunk. Cairn calls these
+// "not in a stack": they are real, fully-tracked git branches, just not stacked
+// yet (the state where `t` can add them). Sorted; nil when tree is nil.
+func LooseBranches(dir string, tree *Tree) []string {
+	if tree == nil {
+		return nil
+	}
+	inStack := map[string]bool{}
+	for _, n := range tree.Order {
+		inStack[n.Name] = true
+	}
+	var out []string
+	for _, b := range LocalBranches(dir) {
+		if !inStack[b] {
+			out = append(out, b)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func localBranchExists(dir, branch string) bool {
 	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
 	if dir != "" {

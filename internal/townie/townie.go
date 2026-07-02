@@ -7,6 +7,7 @@ package townie
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -198,6 +199,45 @@ func (o Ops) SetParent(branch, parent string) <-chan StreamEvent {
 	return o.streamCmds([][]string{{"git", "config", "git-town-branch." + branch + ".parent", parent}})
 }
 
+// RemoveMergedLocal cleans up local branches that were just shipped (their PR
+// merged, their remote deleted) but that git-town's sync left behind because they
+// were the CHECKED-OUT branch — git can't delete HEAD. It hops to the trunk so
+// none is current, then force-deletes each leftover and clears its git-town parent
+// config (so it doesn't linger as a phantom tree node). It touches ONLY branches
+// still present locally (sync already removed the non-current ones), so on a
+// partial ship — where the branch you're on wasn't merged — it does nothing and
+// does NOT move you off it. Streamed; best-effort per branch.
+func (o Ops) RemoveMergedLocal(trunk string, merged []string) <-chan StreamEvent {
+	ch := make(chan StreamEvent, 16)
+	go func() {
+		defer close(ch)
+		var leftover []string
+		for _, b := range merged {
+			if _, err := o.Runner.Run(o.Dir, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+b); err == nil {
+				leftover = append(leftover, b)
+			}
+		}
+		if len(leftover) == 0 {
+			ch <- StreamEvent{Done: true} // nothing stranded — don't even switch branch
+			return
+		}
+		if _, err := o.Runner.Run(o.Dir, "git", "checkout", trunk); err != nil {
+			ch <- StreamEvent{Done: true, Err: fmt.Errorf("could not switch to %s to clean up: %w", trunk, err)}
+			return
+		}
+		for _, b := range leftover {
+			if _, err := o.Runner.Run(o.Dir, "git", "branch", "-D", b); err != nil {
+				ch <- StreamEvent{Line: "  (could not delete local " + b + ": " + err.Error() + ")"}
+				continue
+			}
+			o.Runner.Run(o.Dir, "git", "config", "--unset", "git-town-branch."+b+".parent")
+			ch <- StreamEvent{Line: fmt.Sprintf("Removed %s locally (it was merged; git-town can't delete the branch you were on).", b)}
+		}
+		ch <- StreamEvent{Done: true}
+	}()
+	return ch
+}
+
 // Stream is ExecRunner's live implementation: pipe the process's combined output
 // and emit each line as it is produced.
 func (ExecRunner) Stream(dir, name string, args []string, emit func(line string)) error {
@@ -288,10 +328,18 @@ func (c Command) Hint() string {
 		// ship isn't a single git-town call: Cairn merges the PR via gh, then syncs.
 		return "gh: merge PR (squash)  →  git-town sync --stack"
 	}
+	if c.Verb == "shipstack" {
+		// The whole-stack ship loops ship's remote steps bottom-up, then syncs once.
+		return "for each branch bottom-up: gh merge PR (squash) → retarget children → delete  ·  then git-town sync"
+	}
 	if c.Verb == "propose" {
 		// propose isn't a single git-town call: Cairn pushes the branch, then opens
 		// the PR via gh with the base read from the local lineage.
 		return "git push -u origin <branch>  →  gh: create PR (base ← parent)"
+	}
+	if c.Verb == "ready" {
+		// ready isn't a git-town call: Cairn marks the PR ready via the GitHub API.
+		return "gh: mark PR ready for review"
 	}
 	a := argv(c.Verb, "<name>")
 	if a == nil {
@@ -321,6 +369,15 @@ func Catalog() []Command {
 				"local lineage, so a stacked PR targets the right place, not main. Cairn " +
 				"pushes the branch first, then you title it and write the description in " +
 				"Markdown (with a live preview).",
+		},
+		{
+			Key: "Y", Verb: "ready", Title: "mark ready", Mutates: true,
+			Short: "take a draft PR out of draft (ready for review)",
+			Long: "Marks the selected branch's pull request READY for review — takes it " +
+				"out of draft on GitHub. A draft PR can't be merged, so this is how the " +
+				"author clears that block without leaving Cairn: it can notify reviewers " +
+				"and start required checks. Acts on the branch under the tree cursor, so " +
+				"you can ready a draft mid-stack without checking it out first.",
 		},
 		{
 			Key: "I", Verb: "insert", Title: "insert", NeedsName: true, Mutates: true,
@@ -362,6 +419,17 @@ func Catalog() []Command {
 				"deletes the branch, then syncs so the branches above re-parent onto the " +
 				"trunk. Only the BOTTOM of the stack can be merged: a stacked PR targets " +
 				"the branch below it, so lower branches must land first.",
+		},
+		{
+			Key: "G", Verb: "shipstack", Title: "merge whole stack", Mutates: true,
+			Short: "merge every branch from the bottom up to this one, in order",
+			Long: "Merges the WHOLE stack in one go: starting at the bottom (the branch " +
+				"that targets trunk) and working up to and including the branch you're on, " +
+				"it squash-merges each pull request into the trunk, retargets the branch " +
+				"above onto the trunk, deletes the merged branch, and finally syncs once. " +
+				"This is the most destructive action in Cairn — it lands several PRs and " +
+				"cannot be undone. If a PR along the way can't merge, the ones below it " +
+				"still land and everything above is left untouched.",
 		},
 	}
 }

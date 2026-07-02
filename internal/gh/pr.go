@@ -728,6 +728,136 @@ func OpenPRNumbersByBranch(owner, repo string) (map[string]int, error) {
 	return out, nil
 }
 
+// PRMergeability is an open PR's landing readiness, used to gate the ship / ship
+// stack actions (and annotate the ship-stack confirmation) so a merge that can't
+// succeed is caught before it runs instead of failing mid-op.
+type PRMergeability struct {
+	Number         int
+	Draft          bool
+	Mergeable      string // MERGEABLE | CONFLICTING | UNKNOWN (GitHub's mergeable state)
+	ReviewDecision string // APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | "" (repo doesn't require review)
+}
+
+// Blocked reports a HARD blocker we can see up front that WILL make a merge fail:
+// the PR is a draft, or it conflicts with its base. These are certain, so the ship
+// actions dim on them. Note GitHub's `mergeable` only reflects CONFLICTS — not
+// branch protection (failing checks, missing reviews), which we can't reliably
+// pre-check, so those are handled at merge time by FriendlyMergeError instead.
+// UNKNOWN (GitHub still computing) is deliberately NOT blocked — we allow the
+// attempt rather than dim a PR that may well be mergeable.
+func (m PRMergeability) Blocked() bool {
+	return m.Draft || m.Mergeable == "CONFLICTING"
+}
+
+// Reason is a short, human explanation of a hard blocker ("" when not blocked),
+// for the dim-and-explain gating and the ship-stack confirmation annotations.
+func (m PRMergeability) Reason() string {
+	switch {
+	case m.Draft:
+		return "still a draft"
+	case m.Mergeable == "CONFLICTING":
+		return "conflicts with its base"
+	default:
+		return ""
+	}
+}
+
+// FixHint is the concrete next step that clears a hard blocker ("" when none), so
+// the gating never just says "blocked" without telling the user what to do.
+func (m PRMergeability) FixHint() string {
+	switch {
+	case m.Draft:
+		return "mark it ready for review, then retry"
+	case m.Mergeable == "CONFLICTING":
+		// "the stack", not "it": sync --stack rebases the WHOLE stack from any branch
+		// (it checks out the conflicting one for you), so the user needn't be on it.
+		return "sync (S) to rebase the stack onto the trunk and resolve the conflict, then retry"
+	default:
+		return ""
+	}
+}
+
+// Caution is a non-blocking risk worth surfacing BEFORE a merge ("" when none):
+// review requirements GitHub may enforce via branch protection. It is not a hard
+// block — repo admins can bypass it, and whether review is actually required (and
+// required-check state) is only certain at merge time — so this warns rather than
+// dims; a real refusal is still caught and explained by FriendlyMergeError.
+func (m PRMergeability) Caution() string {
+	switch m.ReviewDecision {
+	case "CHANGES_REQUESTED":
+		return "changes were requested — may block the merge"
+	case "REVIEW_REQUIRED":
+		return "an approving review is required — may block the merge"
+	default:
+		return ""
+	}
+}
+
+const openPRsMergeQuery = `
+query($owner:String!,$repo:String!,$cursor:String){
+  repository(owner:$owner,name:$repo){
+    pullRequests(states:OPEN,first:100,after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{number headRefName isDraft mergeable reviewDecision}
+    }
+  }
+}`
+
+// OpenPRsByBranch maps each open PR's head branch to its landing readiness via
+// GraphQL (Hard Rule 3). It supersedes OpenPRNumbersByBranch for the stack screen:
+// one query yields both the #N flags AND the mergeable/draft/review state the ship
+// gating needs. Identically-headed PRs keep the first seen; it paginates fully.
+func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
+	client, err := graphQLClient()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]PRMergeability{}
+	var cursor *string
+	for {
+		var resp struct {
+			Repository struct {
+				PullRequests struct {
+					PageInfo struct {
+						HasNextPage bool
+						EndCursor   string
+					}
+					Nodes []struct {
+						Number         int
+						HeadRefName    string
+						IsDraft        bool
+						Mergeable      string
+						ReviewDecision string
+					}
+				}
+			}
+		}
+		vars := map[string]interface{}{"owner": owner, "repo": repo, "cursor": (*string)(nil)}
+		if cursor != nil {
+			vars["cursor"] = *cursor
+		}
+		if err := client.Do(openPRsMergeQuery, vars, &resp); err != nil {
+			return out, err
+		}
+		for _, n := range resp.Repository.PullRequests.Nodes {
+			if _, seen := out[n.HeadRefName]; seen {
+				continue
+			}
+			out[n.HeadRefName] = PRMergeability{
+				Number: n.Number, Draft: n.IsDraft,
+				Mergeable: n.Mergeable, ReviewDecision: n.ReviewDecision,
+			}
+		}
+		pi := resp.Repository.PullRequests.PageInfo
+		if !pi.HasNextPage {
+			break
+		}
+		end := pi.EndCursor
+		cursor = &end
+	}
+	return out, nil
+}
+
 // MergePR merges a pull request on GitHub (REST PUT). method is "squash",
 // "merge", or "rebase" (defaults to squash). This is how a stack's bottom branch
 // lands on the trunk; the rest of the stack is re-parented afterwards by sync.
@@ -742,6 +872,68 @@ func MergePR(owner, repo string, number int, method string) error {
 	payload, _ := json.Marshal(map[string]string{"merge_method": method})
 	path := fmt.Sprintf("repos/%s/%s/pulls/%d/merge", owner, repo, number)
 	return client.Put(path, bytes.NewReader(payload), nil)
+}
+
+// MarkPRReady takes an open PR out of draft — marks it ready for review — via the
+// GraphQL markPullRequestReadyForReview mutation. GitHub's REST API has no
+// draft→ready transition, so this resolves the PR's node ID from its number, then
+// runs the mutation. Clears the draft blocker that dims ship / stops a whole-stack
+// ship, so the author can unblock the merge from inside Cairn.
+func MarkPRReady(owner, repo string, number int) error {
+	client, err := graphQLClient()
+	if err != nil {
+		return err
+	}
+	var idResp struct {
+		Repository struct {
+			PullRequest struct{ ID string }
+		}
+	}
+	idQuery := `query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$num){id}}}`
+	if err := client.Do(idQuery, map[string]interface{}{"owner": owner, "repo": repo, "num": number}, &idResp); err != nil {
+		return err
+	}
+	id := idResp.Repository.PullRequest.ID
+	if id == "" {
+		return fmt.Errorf("could not find PR #%d", number)
+	}
+	var mResp struct {
+		MarkPullRequestReadyForReview struct {
+			PullRequest struct{ IsDraft bool }
+		}
+	}
+	mutation := `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}`
+	return client.Do(mutation, map[string]interface{}{"id": id}, &mResp)
+}
+
+// FriendlyMergeError translates GitHub's terse merge-endpoint failures — branch
+// protection, failing required checks, a moved head, a genuine conflict, missing
+// permission — into one actionable sentence, so a refused merge always explains
+// WHY and what to do next instead of surfacing a raw 405/409. label identifies the
+// PR in the message (its branch name). Returns nil for a nil error.
+func FriendlyMergeError(err error, label string) error {
+	if err == nil {
+		return nil
+	}
+	low := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(low, "draft"):
+		return fmt.Errorf("%s can't merge: it is still a draft — mark it ready for review, then retry", label)
+	case strings.Contains(low, "not mergeable"):
+		return fmt.Errorf("%s is not mergeable right now: clear merge conflicts (sync/restack) or satisfy the required reviews and checks, then retry", label)
+	case strings.Contains(low, "status check") || strings.Contains(low, "checks have") || strings.Contains(low, "checks are"):
+		return fmt.Errorf("%s can't merge: its required status checks haven't passed — wait for CI to go green, then retry", label)
+	case strings.Contains(low, "approv") || (strings.Contains(low, "review") && strings.Contains(low, "requir")):
+		return fmt.Errorf("%s can't merge: it needs an approving review first", label)
+	case strings.Contains(low, "protected") || strings.Contains(low, "branch protection"):
+		return fmt.Errorf("%s can't merge: branch protection isn't satisfied (reviews or checks) — resolve those, then retry", label)
+	case strings.Contains(low, "head branch was modified") || strings.Contains(low, "base branch was modified") || strings.Contains(low, "409"):
+		return fmt.Errorf("%s changed under us (a new push landed) — refresh (r), then retry", label)
+	case strings.Contains(low, "not found") || strings.Contains(low, "404"):
+		return fmt.Errorf("can't merge %s: its PR wasn't found, or you lack permission to merge it", label)
+	default:
+		return fmt.Errorf("couldn't merge %s: %w", label, err)
+	}
 }
 
 // PRsWithBase returns the numbers of open PRs that target base in owner/repo.
