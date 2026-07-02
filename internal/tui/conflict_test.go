@@ -284,3 +284,86 @@ func TestViewRendersGlyphsAndProgress(t *testing.T) {
 		}
 	}
 }
+
+// maxRowWidth returns the widest visible row (ANSI-aware) in a rendered frame.
+func maxRowWidth(s string) int {
+	mx := 0
+	for _, ln := range strings.Split(s, "\n") {
+		if w := lipgloss.Width(ln); w > mx {
+			mx = w
+		}
+	}
+	return mx
+}
+
+// TestConflictFramesFitEveryScreen guards the class of bug where a conflict-mode
+// frame has a row WIDER than the terminal: paintBackground then wraps it, the
+// fixed-height frame grows past the screen height, and the whole thing scrolls out
+// of view (a blank "empty" screen). Every phase, at laptop→4K widths (incl. the
+// tri/rail layout breakpoints at 150/160), must keep every row <= terminal width.
+func TestConflictFramesFitEveryScreen(t *testing.T) {
+	widths := []int{50, 60, 72, 80, 100, 120, 149, 150, 151, 159, 160, 161, 200, 234, 262, 320, 400, 500}
+	heights := []int{18, 20, 24, 30, 40, 50, 60, 80, 91, 100}
+	for _, w := range widths {
+		for _, h := range heights {
+			base := newTestConflict(t, w, []string{"a.go"}, map[string]string{"a.go": twoConflicts()})
+			base, _ = base.Update(tea.WindowSizeMsg{Width: w, Height: h})
+
+			phases := map[string]conflictModel{"resolver": base}
+			intro := base
+			intro.intro = true
+			phases["intro"] = intro
+			conf := base
+			for i := range conf.files {
+				for j := range conf.files[i].res {
+					conf.files[i].res[j].Choice = conflict.ChoiceBoth
+				}
+			}
+			conf.confirm = true
+			phases["confirm"] = conf
+			done := base
+			done.done = true
+			done.output = "line one\nline two\nline three"
+			phases["done"] = done
+
+			for name, cm := range phases {
+				if mx := maxRowWidth(cm.View()); mx > w {
+					t.Errorf("%s @ %dx%d: widest row %d > terminal width %d (wraps -> frame overflows -> blank screen)", name, w, h, mx, w)
+				}
+			}
+		}
+	}
+}
+
+// TestPaintBackgroundClipsOverWideRows is the systemic backstop: even if some view
+// ever emits a row wider than the terminal, paintBackground must CLIP it (not wrap
+// it), keeping the frame exactly m.height rows so it can't scroll out of view.
+func TestPaintBackgroundClipsOverWideRows(t *testing.T) {
+	m := Model{th: theme.New(theme.DefaultPalette()), width: 80, height: 24}
+	over := strings.Repeat("X", 200) // 200 columns on an 80-column screen
+	out := m.paintBackground(over + "\nsecond row")
+	if rows := strings.Count(out, "\n") + 1; rows != 24 {
+		t.Errorf("paintBackground produced %d rows, want 24 (an over-wide row must be clipped, not wrapped)", rows)
+	}
+	if mx := maxRowWidth(out); mx > 80 {
+		t.Errorf("paintBackground left a %d-wide row on an 80-col screen", mx)
+	}
+}
+
+// TestConfirmGateContinuesOnCandEnter: the confirm gate advertises "c continue"
+// (footer) alongside "[enter] continue", so BOTH keys must continue — pressing c
+// there used to be a no-op that forced the user to hit enter.
+func TestConfirmGateContinuesOnCandEnter(t *testing.T) {
+	for _, k := range []string{"enter", "c"} {
+		m := newTestConflict(t, 200, []string{"a.go"}, map[string]string{"a.go": oneConflict("x", "y")})
+		m.files[0].res[0].Choice = conflict.ChoiceIncoming // resolve the one conflict
+		m.confirm = true
+		m2, cmd := m.updateConfirm(ckey(k))
+		if m2.confirm {
+			t.Errorf("%q should leave the confirm gate", k)
+		}
+		if cmd == nil {
+			t.Errorf("%q on the confirm gate should trigger continue (non-nil cmd)", k)
+		}
+	}
+}

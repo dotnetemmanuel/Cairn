@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/charmbracelet/x/ansi"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -1517,6 +1519,17 @@ func (m Model) paintBackground(view string) string {
 	if reassert != "" {
 		view = strings.ReplaceAll(view, "\x1b[0m", "\x1b[0m"+reassert)
 		view = reassert + view
+	}
+	// Clip every row to the terminal width so an over-wide line can't WRAP: a wrapped
+	// line adds rows, pushing the fixed-height frame past the screen height, which
+	// scrolls the whole frame out of view (a blank screen). Truncating instead keeps
+	// the frame exactly m.height rows tall. Defensive — views should already fit.
+	if m.width > 0 {
+		lines := strings.Split(view, "\n")
+		for i, ln := range lines {
+			lines[i] = ansi.Truncate(ln, m.width, "")
+		}
+		view = strings.Join(lines, "\n")
 	}
 	return def.Width(m.width).Height(m.height).Render(view)
 }

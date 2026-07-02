@@ -87,6 +87,7 @@ type conflictModel struct {
 	done          bool
 	output        string // git-town/continue output, shown on the done screen
 	intro         bool   // auto-opened from a sync: show the "conflicts detected" gate first
+	continued     bool   // this is a FOLLOW-UP round (git-town resumed the rebase and hit more)
 }
 
 func newConflictModel(th theme.Theme, dir string, st conflict.State, load spanLoader) conflictModel {
@@ -327,7 +328,7 @@ func (m conflictModel) updateEditing(msg tea.KeyMsg) (conflictModel, tea.Cmd) {
 
 func (m conflictModel) updateConfirm(msg tea.KeyMsg) (conflictModel, tea.Cmd) {
 	switch msg.String() {
-	case "enter":
+	case "enter", "c": // c continues too — the footer/hint advertises "c continue"
 		m.confirm = false
 		m.status = "Staging and continuing…"
 		return m, m.continueCmd()
@@ -401,9 +402,9 @@ func (m conflictModel) handleContinue(msg conflictContinueMsg) (conflictModel, t
 		next.width, next.height, next.sized, next.railOpen, next.gitTown =
 			m.width, m.height, true, m.railOpen, m.gitTown
 		next.editor.SetWidth(m.editor.Width())
-		// Each fresh round from a sync gets the same gate (a later branch in the
-		// stack just hit conflicts of its own). The gate already announces the new
-		// round, so only fall back to a footer note when there's no gate.
+		next.continued = true // a later rebase step hit its own conflicts
+		// Each fresh round from a sync gets the gate (its own "more conflicts"
+		// heading). Without a gate, fall back to a footer note.
 		next.intro = m.gitTown
 		if !next.intro {
 			next.status = "More conflicts to resolve."
@@ -704,7 +705,7 @@ func (m conflictModel) doneView() string {
 	out := strings.TrimRight(m.output, "\n")
 	logBlock := mutedStyle(m.th).Render("(no output)")
 	if out != "" {
-		logBlock = styleRunLog(m.th, out, w)
+		logBlock = styleRunLog(m.th, out, w, nil)
 	}
 	// If the log is taller than the body, keep the tail — the push / "branch is now
 	// in sync" lines at the bottom are the ones worth seeing.
@@ -728,10 +729,21 @@ func lastLines(s string, n int) string {
 // the user commits to resolving. Any key proceeds; esc backs out (resume with R).
 func (m conflictModel) introView() string {
 	_, total := m.progress()
-	title := warnStyle(m.th).Bold(true).Render("Sync paused — conflicts to resolve")
-	lead := mutedStyle(m.th).Render(fmt.Sprintf(
+	titleText := "Sync paused — conflicts to resolve"
+	leadText := fmt.Sprintf(
 		"The same lines changed on both sides, so %s can't replay cleanly. %d conflict(s) across %d file(s) need a decision before the sync can finish.",
-		opWord(m.st.Op), total, len(m.files)))
+		opWord(m.st.Op), total, len(m.files))
+	if m.continued {
+		// A follow-up round: the previous batch was resolved, git-town resumed the
+		// rebase, and a LATER step hit its own conflicts. Say so, so it doesn't read
+		// as "didn't I just do this?".
+		titleText = "More conflicts — the rebase moved on and hit another step"
+		leadText = fmt.Sprintf(
+			"That batch is resolved; git-town continued %s and stopped again on a later commit. A stack replays one commit at a time, so it can pause more than once — this is expected. %d more conflict(s) across %d file(s) to decide.",
+			opWord(m.st.Op), total, len(m.files))
+	}
+	title := warnStyle(m.th).Bold(true).Render(titleText)
+	lead := mutedStyle(m.th).Render(leadText)
 	var files strings.Builder
 	for _, f := range m.files {
 		files.WriteString("\n  " + infoStyle(m.th).Render("• "+shortRepo(f.path)) +
@@ -740,7 +752,11 @@ func (m conflictModel) introView() string {
 	keys := okStyle(m.th).Bold(true).Render("press any key") + mutedStyle(m.th).Render(" to resolve   ·   ") +
 		warnStyle(m.th).Render("esc") + mutedStyle(m.th).Render(" to cancel (resume anytime with R)")
 	box := title + "\n" + lead + "\n" + files.String() + "\n\n" + keys
-	return lipgloss.NewStyle().Width(bodyWidth(m.width)).Border(lipgloss.RoundedBorder()).
+	// -2: the rounded border adds a column on each side. The box sits in the INDENTED
+	// body (which only has bodyWidth columns), so box+border must fit bodyWidth —
+	// otherwise it wraps, the fixed-height frame grows past the screen, and the whole
+	// thing scrolls out of view (a blank screen).
+	return lipgloss.NewStyle().Width(bodyWidth(m.width)-2).Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.th.Warning).Padding(0, 1).Render(box)
 }
 
@@ -759,7 +775,8 @@ func (m conflictModel) confirmBox() string {
 		key(infoStyle(m.th), "esc", "back")
 	status := okStyle(m.th).Render(fmt.Sprintf("✓ %d conflict(s) resolved.", t))
 	box := title + "\n" + desc + "\n" + keys + "\n" + status
-	return lipgloss.NewStyle().Width(bodyWidth(m.width)).Border(lipgloss.RoundedBorder()).
+	// -2 for the border, same reason as introView (fit the indented body, no wrap).
+	return lipgloss.NewStyle().Width(bodyWidth(m.width)-2).Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.th.Success).Padding(0, 1).Render(box)
 }
 

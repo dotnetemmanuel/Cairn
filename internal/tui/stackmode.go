@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -60,6 +61,7 @@ type stackModel struct {
 	repo   string
 	status stack.RepoStatus
 	tree   *stack.Tree // local git-town tree (drift-aware); nil when no git-town
+	loose  []string    // local branches not in the stack (no git-town parent) — "not in a stack"
 	trunk  string      // best-effort trunk guess, for the git-town init prompt
 
 	commands []townie.Command
@@ -83,6 +85,10 @@ type stackModel struct {
 	proposeBase  string         // base branch the proposed PR targets (from lineage)
 	proposeDraft bool           // open as a draft PR
 	prNums       map[string]int // branch -> open PR number, for the tree's #N flags
+	// prMerge is branch -> PR landing readiness (mergeable/draft/review), loaded
+	// alongside prNums so ship / merge-whole-stack can be dimmed-and-explained when
+	// a PR can't land, and the ship-stack confirmation can annotate each branch.
+	prMerge map[string]gh.PRMergeability
 
 	ops    townie.Ops
 	output string
@@ -139,6 +145,13 @@ func newStackModelBare(th theme.Theme, repo string) stackModel {
 func newStackModel(th theme.Theme, repo string) stackModel {
 	s := newStackModelBare(th, repo)
 	s.reload()
+	// Land on the branch tree (not the action list): the first thing you usually do
+	// is pick which branch to act on. But ONLY when there's a tree — a no-git-town
+	// repo shows the "Set up git-town" call-to-action instead, which owns the focus
+	// (there's nothing else to focus), so its enter fires the init.
+	if s.tree != nil {
+		s.focus = focusTree
+	}
 	return s
 }
 
@@ -161,12 +174,20 @@ func (s *stackModel) reload() {
 	} else {
 		s.tree = nil
 	}
-	// Park the tree cursor on the current branch so checkout starts from "here".
+	// Local branches not in the stack ("not in a stack"), shown under the tree so
+	// they're visible and can be checked out + added with t.
+	s.loose = stack.LooseBranches("", s.tree)
+	// Park the tree cursor on the current branch so checkout starts from "here" —
+	// searching the combined nav list (stack nodes THEN loose branches), so it also
+	// lands on a loose current branch.
 	if s.tree != nil {
-		if i := s.tree.IndexOf(s.status.Branch); i >= 0 {
-			s.treeCursor = i
-		} else if s.treeCursor >= len(s.tree.Order) {
-			s.treeCursor = 0
+		nav := s.navBranches()
+		s.treeCursor = 0
+		for i, name := range nav {
+			if name == s.status.Branch {
+				s.treeCursor = i
+				break
+			}
 		}
 	}
 	// When the repo lacks git-town, guess a trunk to pre-fill the init prompt.
@@ -239,6 +260,52 @@ func (s stackModel) isBottomBranch() bool {
 	return n != nil && !n.IsTrunk && n.Parent == s.tree.Root.Name
 }
 
+// shipChain returns the branches to merge for a whole-stack ship: from the bottom
+// of the stack (the trunk's child) up to and including the current branch, in
+// bottom-up merge order — the order they must land, since each targets the one
+// below it. Empty when the current branch isn't a tracked, non-trunk node.
+func (s stackModel) shipChain() []string {
+	if s.tree == nil {
+		return nil
+	}
+	n := s.tree.NodeByName(s.status.Branch)
+	if n == nil || n.IsTrunk {
+		return nil
+	}
+	var chain []string
+	for cur := n; cur != nil && !cur.IsTrunk; cur = s.tree.NodeByName(cur.Parent) {
+		chain = append(chain, cur.Name)
+	}
+	// chain is current→…→bottom (top-down); reverse to bottom-up (merge order).
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain
+}
+
+// shipBlock returns a hard reason branch's PR can't be merged, plus the concrete
+// fix, or ("", "") when it can (as far as we can tell). Blockers: a draft or a
+// conflict (from the readiness map), or — once the map has loaded — no open PR at
+// all. It stays permissive on missing data: if the readiness fetch hasn't landed
+// (map nil), we allow the attempt and let the merge itself report any problem, so
+// a slow/failed fetch never wrongly dims a shippable branch.
+func (s stackModel) shipBlock(branch string) (reason, hint string) {
+	m, ok := s.prMerge[branch]
+	if !ok {
+		if s.prMerge != nil { // readiness loaded, and this branch has no open PR
+			return "no open PR yet", "propose it (p) first"
+		}
+		return "", "" // not loaded — don't dim on incomplete info
+	}
+	return m.Reason(), m.FixHint()
+}
+
+// branchMergeable reports no known hard blocker for branch's PR — the ship gate.
+func (s stackModel) branchMergeable(branch string) bool {
+	reason, _ := s.shipBlock(branch)
+	return reason == ""
+}
+
 // actionEnabled reports whether a specific command is currently actionable.
 func (s stackModel) actionEnabled(c townie.Command) bool {
 	if !s.enabled() {
@@ -254,6 +321,19 @@ func (s stackModel) actionEnabled(c townie.Command) bool {
 		}
 		n := s.tree.NodeByName(t)
 		return n != nil && !n.IsTrunk && s.prNums[t] == 0
+	case "ready":
+		// Mark the tree-cursor branch's PR ready — only when it's a tracked, non-trunk
+		// node whose open PR is currently a DRAFT (nothing to do otherwise).
+		t := s.proposeTarget()
+		if t == "" || s.tree == nil {
+			return false
+		}
+		n := s.tree.NodeByName(t)
+		if n == nil || n.IsTrunk {
+			return false
+		}
+		m, ok := s.prMerge[t]
+		return ok && m.Draft
 	case "amend":
 		// Folds STAGED changes (nudge `git add` first) into a tracked branch.
 		return s.onTrackedBranch() && s.status.Staged > 0
@@ -266,12 +346,189 @@ func (s stackModel) actionEnabled(c townie.Command) bool {
 		// branch below it, so lower branches must land first. And only on a clean
 		// tree — merge squash-merges the PR (irreversible) then rebases the whole
 		// stack via sync, which a dirty working tree would derail. (Untracked files
-		// are fine; they don't interfere with the rebase.)
-		return s.isBottomBranch() && !s.status.Dirty()
+		// are fine; they don't interfere with the rebase.) Finally, dim when we know
+		// the PR can't land (draft / conflicting) so it fails up front, not mid-op.
+		return s.isBottomBranch() && !s.status.Dirty() && s.branchMergeable(s.status.Branch)
+	case "shipstack":
+		// Merge the whole stack bottom-up. Needs a chain to ship (a tracked,
+		// non-trunk branch), a clean tree (same rebase reason as ship), and the
+		// bottom-most PR — the first to merge — must be landable. Higher blockers
+		// don't dim it: the run lands what it can and stops, which the confirmation
+		// spells out per branch.
+		chain := s.shipChain()
+		return len(chain) > 0 && !s.status.Dirty() && s.branchMergeable(chain[0])
 	default:
 		// new / insert can start or extend a stack from any branch.
 		return true
 	}
+}
+
+// currentBase is what the current branch is stacked on — its recorded parent (the
+// branch below it, or the trunk for a bottom branch), which is also its PR's base.
+// "" when on the trunk, off-tree, or without a git-town tree — nothing to point at.
+func (s stackModel) currentBase() string {
+	if s.tree == nil {
+		return ""
+	}
+	n := s.tree.NodeByName(s.status.Branch)
+	if n == nil || n.IsTrunk {
+		return ""
+	}
+	return n.Parent
+}
+
+// driftedInCurrentStack returns the branches in the CURRENT branch's stack (its
+// trunk→current chain plus its descendants) that have drifted off their parent —
+// the ones a restack would rebase back on top. Scoped to the current stack so a
+// drift in an unrelated stack under the same trunk doesn't warn here. Empty when
+// on the trunk, off-tree, or nothing has drifted.
+func (s stackModel) driftedInCurrentStack() []string {
+	if s.tree == nil {
+		return nil
+	}
+	cur := s.tree.NodeByName(s.status.Branch)
+	if cur == nil || cur.IsTrunk {
+		return nil
+	}
+	var out []string
+	for _, n := range s.tree.Focused(s.status.Branch) {
+		if n.Drifted {
+			out = append(out, n.Name)
+		}
+	}
+	return out
+}
+
+// mergeBottom returns the bottom branch of the current branch's stack — the only
+// branch M can merge (its PR targets the trunk). "" when the current branch isn't
+// a tracked, non-trunk node.
+func (s stackModel) mergeBottom() string {
+	if chain := s.shipChain(); len(chain) > 0 {
+		return chain[0]
+	}
+	return ""
+}
+
+// actionDisabledReason returns a short, human reason a mutating command is
+// currently unavailable — rendered dim in place of the command's description so
+// the action list explains ITSELF ("why is this one dim?") instead of just
+// greying out. "" when the command is enabled, or when git-town isn't set up at
+// all (that whole-pane case is covered by the help line below the list).
+func (s stackModel) actionDisabledReason(c townie.Command) string {
+	if !s.enabled() || s.actionEnabled(c) {
+		return ""
+	}
+	switch c.Verb {
+	case "propose":
+		t := s.proposeTarget()
+		if t == "" || s.tree == nil {
+			return ""
+		}
+		if n := s.tree.NodeByName(t); n == nil {
+			return fmt.Sprintf("%s isn't in a stack — check it out, then t", t)
+		} else if n.IsTrunk {
+			return "the trunk can't have a PR"
+		}
+		if num := s.prNums[t]; num > 0 {
+			return fmt.Sprintf("%s already has PR #%d", t, num)
+		}
+		return ""
+	case "ready":
+		t := s.proposeTarget()
+		if t == "" || s.tree == nil {
+			return ""
+		}
+		n := s.tree.NodeByName(t)
+		if n == nil {
+			return fmt.Sprintf("%s isn't in a stack", t)
+		}
+		if n.IsTrunk {
+			return "the trunk has no PR"
+		}
+		if s.prNums[t] == 0 {
+			return fmt.Sprintf("%s has no open PR", t)
+		}
+		return fmt.Sprintf("%s isn't a draft", t)
+	case "amend":
+		if !s.onTrackedBranch() {
+			return "this branch isn't in a stack"
+		}
+		if s.status.Staged == 0 {
+			return "nothing staged — git add your changes first"
+		}
+		return ""
+	case "restack", "sync":
+		if !s.onTrackedBranch() {
+			return "this branch isn't in a stack"
+		}
+		return ""
+	case "ship":
+		if !s.onTrackedBranch() {
+			return "this branch isn't in a stack"
+		}
+		if !s.isBottomBranch() {
+			if b := s.mergeBottom(); b != "" {
+				return fmt.Sprintf("only the bottom branch (%s) can merge", b)
+			}
+			return "only the bottom branch can merge"
+		}
+		if s.status.Dirty() {
+			return "needs a clean working tree"
+		}
+		if reason, hint := s.shipBlock(s.status.Branch); reason != "" {
+			return fmt.Sprintf("%s — %s", reason, hint)
+		}
+		return ""
+	case "shipstack":
+		chain := s.shipChain()
+		if len(chain) == 0 {
+			return "this branch isn't in a stack"
+		}
+		if s.status.Dirty() {
+			return "needs a clean working tree"
+		}
+		if reason, hint := s.shipBlock(chain[0]); reason != "" {
+			return fmt.Sprintf("bottom branch %s %s — %s", chain[0], reason, hint)
+		}
+		return ""
+	}
+	return ""
+}
+
+// shipStop is one predictable halt in a whole-stack ship: a branch that certainly
+// can't merge — a draft, or no open PR — with the concrete fix the author applies.
+type shipStop struct {
+	branch    string
+	reason    string // "still a draft" / "no open PR"
+	fixAction string // "press Y to mark it ready" / "press p to propose it"
+}
+
+// shipStops walks the merge chain and returns EVERY certain halt (draft / no open
+// PR), plus the branches that would land before the FIRST one (all G actually
+// ships before it stops). A conflict above the bottom is only a risk — the run
+// retargets each branch onto the trunk before merging — so it isn't listed here.
+// Meaningful while G is enabled (a blocked bottom dims G and is explained apart).
+func (s stackModel) shipStops() (landsFirst []string, stops []shipStop) {
+	hit := false
+	for _, b := range s.shipChain() {
+		reason, fix := "", ""
+		if m, ok := s.prMerge[b]; ok {
+			if m.Draft {
+				reason, fix = "still a draft", "press Y to mark it ready"
+			}
+		} else if s.prMerge != nil {
+			reason, fix = "no open PR", "press p to propose it"
+		}
+		if reason == "" {
+			if !hit {
+				landsFirst = append(landsFirst, b)
+			}
+			continue
+		}
+		hit = true
+		stops = append(stops, shipStop{branch: b, reason: reason, fixAction: fix})
+	}
+	return landsFirst, stops
 }
 
 // capturing reports whether a text field should receive raw keys (so global
@@ -290,6 +547,9 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 	case stackPRNumsMsg:
 		if msg.nums != nil {
 			s.prNums = msg.nums
+		}
+		if msg.merge != nil {
+			s.prMerge = msg.merge
 		}
 		return s, nil
 
@@ -373,18 +633,20 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		return s, nil
 	}
 
-	// Direct command-key accelerators (n/I/S/R/A) — the keys the help and footer
-	// advertise. They work from either pane: a mutation always acts on the
-	// checked-out branch (the HEAD model), independent of the tree cursor. Guard
+	// Direct command-key accelerators (n/p/I/S/R/A/M/G/Y) — but ONLY when the action
+	// list is focused, so navigating the branch tree can never accidentally fire a
+	// stack action (a stray M/G is destructive). Tab to the actions first. Guarded
 	// with !needsInit so they stay inert until git-town is set up.
-	if !s.needsInit() {
+	if !s.needsInit() && s.focus == focusActions {
 		if c := townie.Find(msg.String()); c != nil {
 			s.cursor = s.commandIndex(c.Key)
 			return s.triggerAction(*c)
 		}
 	}
 
-	if s.focus == focusTree {
+	// Tree navigation only when there's a tree to navigate; otherwise (no git-town)
+	// keys must fall through to the init call-to-action below, not be swallowed here.
+	if s.focus == focusTree && s.tree != nil {
 		return s.updateTree(msg)
 	}
 
@@ -435,6 +697,15 @@ func (s stackModel) triggerAction(c townie.Command) (stackModel, tea.Cmd) {
 	if c.Verb == "propose" {
 		return s.startPropose()
 	}
+	if c.Verb == "ready" {
+		// Acts on the tree-cursor branch (like propose), not HEAD — record it for the
+		// confirmation and the run.
+		s.opName = s.proposeTarget()
+		s.name.SetValue("")
+		s.affected = nil
+		s.phase = stackConfirming
+		return s, nil
+	}
 	if c.NeedsName {
 		s.name.SetValue("")
 		s.name.Focus()
@@ -449,25 +720,45 @@ func (s stackModel) triggerAction(c townie.Command) (stackModel, tea.Cmd) {
 	return s, nil
 }
 
+// navBranches is the combined, ordered list the tree cursor moves over: the
+// stack nodes (DFS order) first, then the loose "not in a stack" branches. Every
+// entry is a checkout target; the loose ones just can't take stack actions until
+// they're added to a stack (t). nil when there's no git-town tree.
+func (s stackModel) navBranches() []string {
+	if s.tree == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.tree.Order)+len(s.loose))
+	for _, n := range s.tree.Order {
+		out = append(out, n.Name)
+	}
+	out = append(out, s.loose...)
+	return out
+}
+
 // updateTree handles navigation in the branch tree: j/k move the cursor, enter
 // checks out the cursored branch. Checkout is cheap and reversible, so it skips
 // the confirmation dialog — it just runs and reloads.
 func (s stackModel) updateTree(msg tea.KeyMsg) (stackModel, tea.Cmd) {
-	if s.tree == nil || len(s.tree.Order) == 0 {
+	nav := s.navBranches()
+	if len(nav) == 0 {
 		return s, nil
 	}
-	n := len(s.tree.Order)
+	n := len(nav)
+	if s.treeCursor >= n {
+		s.treeCursor = 0
+	}
 	switch msg.String() {
 	case "j", "down":
 		s.treeCursor = (s.treeCursor + 1) % n
 	case "k", "up":
 		s.treeCursor = (s.treeCursor - 1 + n) % n
 	case "enter":
-		target := s.tree.Order[s.treeCursor]
-		if target.Name == s.status.Branch {
+		target := nav[s.treeCursor]
+		if target == s.status.Branch {
 			return s, nil // already here
 		}
-		return s.runOp("checkout", target.Name, "checkout")
+		return s.runOp("checkout", target, "checkout")
 	}
 	return s, nil
 }
@@ -501,6 +792,46 @@ func readStream(ch <-chan townie.StreamEvent) stackStreamMsg {
 		ev = townie.StreamEvent{Done: true}
 	}
 	return stackStreamMsg{ch: ch, ev: ev}
+}
+
+// runReady marks branch's draft PR ready for review (via gh), streaming progress
+// through the same machinery as the other ops. branch is the tree-cursor target.
+func (s stackModel) runReady(branch string) (stackModel, tea.Cmd) {
+	s.phase = stackRunning
+	s.pending = townie.Command{Verb: "ready", Title: "mark ready"}
+	s.opName = branch
+	s.output = ""
+	owner, repo, _ := gh.SplitRepo(s.repo)
+	num := s.prNums[branch]
+	return s, func() tea.Msg {
+		return readStream(readyStream(owner, repo, branch, num))
+	}
+}
+
+// readyStream marks PR #num (branch's) ready for review, forwarding a friendly
+// before/after line around the API call. Stops with the error if the repo or PR
+// number is unknown, or the mutation fails.
+func readyStream(owner, repo, branch string, num int) <-chan townie.StreamEvent {
+	ch := make(chan townie.StreamEvent, 8)
+	go func() {
+		defer close(ch)
+		if owner == "" || repo == "" {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("can't mark ready: unknown repo")}
+			return
+		}
+		if num == 0 {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("no open PR found for %s", branch)}
+			return
+		}
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("Marking PR #%d (%s) ready for review…", num, branch)}
+		if err := gh.MarkPRReady(owner, repo, num); err != nil {
+			ch <- townie.StreamEvent{Done: true, Err: err}
+			return
+		}
+		ch <- townie.StreamEvent{Line: fmt.Sprintf("✓ PR #%d is ready for review.", num)}
+		ch <- townie.StreamEvent{Done: true}
+	}()
+	return ch
 }
 
 // runShip merges branch's PR (via gh) then syncs the stack (via git-town),
@@ -547,7 +878,7 @@ func shipStream(owner, repo, branch, trunk string, ops townie.Ops) <-chan townie
 		}
 		ch <- townie.StreamEvent{Line: fmt.Sprintf("Merging PR #%d (%s) on GitHub…", num, branch)}
 		if err := gh.MergePR(owner, repo, num, "squash"); err != nil {
-			ch <- townie.StreamEvent{Done: true, Err: err}
+			ch <- townie.StreamEvent{Done: true, Err: gh.FriendlyMergeError(err, branch)}
 			return
 		}
 		// Retarget the PRs that pointed at this branch onto the trunk BEFORE
@@ -581,7 +912,163 @@ func shipStream(owner, repo, branch, trunk string, ops townie.Ops) <-chan townie
 			}
 			ch <- ev
 		}
+		// git-town's sync can't delete the branch we were ON (the one just shipped),
+		// so it lingers as an orphan. Hop to the trunk and remove it so we truly land
+		// clean on the trunk.
+		for ev := range ops.RemoveMergedLocal(trunk, []string{branch}) {
+			if ev.Done {
+				if ev.Err != nil {
+					ch <- townie.StreamEvent{Line: "  (cleanup: " + ev.Err.Error() + ")"}
+				}
+				break
+			}
+			ch <- ev
+		}
 		ch <- townie.StreamEvent{Done: true}
+	}()
+	return ch
+}
+
+// runShipStack merges a whole stack bottom-up: it loops ship's remote steps for
+// each branch in the chain (lowest first), then syncs once at the end. Like
+// runShip it's orchestrated here (gh merges + one git-town sync), not a townie
+// verb. branches must already be in bottom-up merge order (from shipChain).
+func (s stackModel) runShipStack(branches []string) (stackModel, tea.Cmd) {
+	s.phase = stackRunning
+	s.pending = townie.Command{Verb: "shipstack", Title: "merge whole stack"}
+	s.opName = ""
+	s.output = ""
+	owner, repo, _ := gh.SplitRepo(s.repo)
+	trunk := ""
+	if s.tree != nil && s.tree.Root != nil {
+		trunk = s.tree.Root.Name
+	}
+	ops := s.ops
+	chain := append([]string(nil), branches...) // snapshot; the model is a value copy
+	return s, func() tea.Msg {
+		return readStream(shipStackStream(owner, repo, chain, trunk, ops))
+	}
+}
+
+// shipStackStream lands a whole stack bottom-up. For each branch it merges the PR
+// (squash), retargets that branch's child PRs onto the trunk, and deletes the
+// merged branch — exactly the per-branch steps shipStream runs, looped in order.
+// It STOPS at the first branch that can't merge (leaving the ones below landed and
+// everything above untouched), then runs ONE git town sync so the local stack
+// reflects whatever shipped. The Done event carries the blocking error, if any.
+func shipStackStream(owner, repo string, branches []string, trunk string, ops townie.Ops) <-chan townie.StreamEvent {
+	ch := make(chan townie.StreamEvent, 64)
+	go func() {
+		defer close(ch)
+		if owner == "" || repo == "" {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("can't ship: unknown repo")}
+			return
+		}
+		if len(branches) == 0 {
+			ch <- townie.StreamEvent{Done: true, Err: fmt.Errorf("nothing to ship")}
+			return
+		}
+		mergedAny := false
+		var merged []string   // branches whose PR actually merged (for local cleanup)
+		var stopReason string // the branch we couldn't merge/retarget; the run halts here
+		skipSync := false     // set when we halt with a just-merged branch still undeleted
+		for i, branch := range branches {
+			ch <- townie.StreamEvent{Line: fmt.Sprintf("[%d/%d] %s", i+1, len(branches), branch)}
+			num, err := gh.FindPROpenForBranch(owner, repo, branch)
+			if err != nil {
+				stopReason = err.Error()
+				break
+			}
+			if num == 0 {
+				stopReason = "no open PR found for " + branch
+				break
+			}
+			ch <- townie.StreamEvent{Line: fmt.Sprintf("  Merging PR #%d…", num)}
+			if err := gh.MergePR(owner, repo, num, "squash"); err != nil {
+				stopReason = gh.FriendlyMergeError(err, branch).Error()
+				break
+			}
+			mergedAny = true
+			merged = append(merged, branch)
+			// Retarget the PRs that pointed at this branch onto the trunk BEFORE
+			// deleting it — deleting a branch that still has a child PR pointing at it
+			// CLOSES that PR. So if listing or any retarget fails, halt WITHOUT deleting
+			// (and skip the sync, since this just-merged branch is still around): a
+			// clean stop the user can finish by hand beats a silently-closed child PR.
+			retargetOK := true
+			if trunk != "" {
+				kids, err := gh.PRsWithBase(owner, repo, branch)
+				if err != nil {
+					retargetOK = false
+					ch <- townie.StreamEvent{Line: "    (could not list child PRs: " + err.Error() + ")"}
+				}
+				for _, kid := range kids {
+					ch <- townie.StreamEvent{Line: fmt.Sprintf("  Retargeting PR #%d onto %s…", kid, trunk)}
+					if err := gh.RetargetPR(owner, repo, kid, trunk); err != nil {
+						retargetOK = false
+						ch <- townie.StreamEvent{Line: "    (could not retarget #" + fmt.Sprint(kid) + ": " + err.Error() + ")"}
+					}
+				}
+			}
+			if !retargetOK {
+				stopReason = fmt.Sprintf("couldn't retarget %s's child PR(s) onto %s — stopped before deleting %s so no child PR is closed; retarget it on GitHub, then re-run", branch, trunk, branch)
+				skipSync = true
+				break
+			}
+			ch <- townie.StreamEvent{Line: fmt.Sprintf("  Merged PR #%d. Removing the branch…", num)}
+			if err := gh.DeleteRemoteBranch(owner, repo, branch); err != nil {
+				ch <- townie.StreamEvent{Line: "    (could not delete remote branch: " + err.Error() + ")"}
+			}
+		}
+		if stopReason != "" {
+			ch <- townie.StreamEvent{Line: "Stopped: " + stopReason}
+			if mergedAny {
+				ch <- townie.StreamEvent{Line: "The branches below it were merged; the rest are untouched."}
+			}
+		}
+		// Sync once so the local tree reflects whatever landed — even on a partial
+		// ship, the merged branches must drop out and their children re-parent. Skip
+		// only after a retarget halt, where a just-merged branch is still undeleted and
+		// sync would try to rebase its squashed commits and conflict.
+		var syncErr error
+		if mergedAny && !skipSync {
+			ch <- townie.StreamEvent{Line: "Syncing the stack…"}
+			for ev := range ops.Stream("sync", "") {
+				if ev.Done {
+					syncErr = ev.Err
+					break
+				}
+				ch <- ev
+			}
+			// If we shipped the branch we were ON (the top — whole-stack always includes
+			// current), git-town's sync couldn't delete it (can't delete HEAD). Hop to
+			// the trunk and remove the leftover so a complete ship lands clean on the
+			// trunk. No-op (and no branch switch) on a partial ship, where the current
+			// branch wasn't merged.
+			if syncErr == nil {
+				for ev := range ops.RemoveMergedLocal(trunk, merged) {
+					if ev.Done {
+						if ev.Err != nil {
+							ch <- townie.StreamEvent{Line: "  (cleanup: " + ev.Err.Error() + ")"}
+						}
+						break
+					}
+					ch <- ev
+				}
+			}
+		}
+		// Terminal status. A halt AFTER landing something is a PARTIAL ship — real work
+		// succeeded, so it is surfaced as "stopped" (amber), not "failed" (red); the log
+		// carries the reason and what landed. A sync failure, or a halt with nothing
+		// merged, is the error to show (a sync conflict also routes to the resolver).
+		var finalErr error
+		switch {
+		case syncErr != nil:
+			finalErr = syncErr
+		case stopReason != "":
+			finalErr = fmt.Errorf("%s", stopReason)
+		}
+		ch <- townie.StreamEvent{Done: true, Err: finalErr}
 	}()
 	return ch
 }
@@ -592,8 +1079,9 @@ func shipStream(owner, repo, branch, trunk string, ops townie.Ops) <-chan townie
 // cursor (so you can propose any branch in the stack, not just HEAD), falling
 // back to the current branch.
 func (s stackModel) proposeTarget() string {
-	if s.tree != nil && s.treeCursor >= 0 && s.treeCursor < len(s.tree.Order) {
-		return s.tree.Order[s.treeCursor].Name
+	nav := s.navBranches()
+	if s.treeCursor >= 0 && s.treeCursor < len(nav) {
+		return nav[s.treeCursor]
 	}
 	return s.status.Branch
 }
@@ -806,20 +1294,34 @@ func trackStream(branch, parent string, ops townie.Ops) <-chan townie.StreamEven
 	return ch
 }
 
-// stackPRNumsMsg carries the branch→open-PR-number map for the tree's #N flags.
-type stackPRNumsMsg struct{ nums map[string]int }
+// stackPRNumsMsg carries the branch→open-PR-number map for the tree's #N flags
+// and the branch→landing-readiness map for the ship gating/confirmation.
+type stackPRNumsMsg struct {
+	nums  map[string]int
+	merge map[string]gh.PRMergeability
+}
 
-// fetchStackPRNums loads the repo's open PRs (branch → number) so the local tree
-// can flag which branches already have a PR. Best-effort: a failure leaves the
-// flags as they were.
+// fetchStackPRNums loads the repo's open PRs so the local tree can flag which
+// branches already have a PR (#N) and the ship actions can tell whether each PR
+// can actually land. One GraphQL call yields both maps; on failure it falls back
+// to the REST numbers-only lookup so the #N flags still work. Best-effort: a
+// failure leaves the flags as they were.
 func fetchStackPRNums(repo string) tea.Cmd {
 	return func() tea.Msg {
 		owner, name, ok := gh.SplitRepo(repo)
 		if !ok {
 			return stackPRNumsMsg{}
 		}
-		nums, _ := gh.OpenPRNumbersByBranch(owner, name)
-		return stackPRNumsMsg{nums: nums}
+		merge, err := gh.OpenPRsByBranch(owner, name)
+		if err != nil {
+			nums, _ := gh.OpenPRNumbersByBranch(owner, name)
+			return stackPRNumsMsg{nums: nums}
+		}
+		nums := make(map[string]int, len(merge))
+		for b, m := range merge {
+			nums[b] = m.Number
+		}
+		return stackPRNumsMsg{nums: nums, merge: merge}
 	}
 }
 
@@ -872,6 +1374,14 @@ func (s stackModel) updateConfirming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		if s.pending.Verb == "ship" {
 			return s.runShip(s.status.Branch)
 		}
+		// shipstack merges the whole chain bottom-up (s.affected = shipChain).
+		if s.pending.Verb == "shipstack" {
+			return s.runShipStack(s.affected)
+		}
+		// ready marks the tree-cursor branch's draft PR ready (via gh).
+		if s.pending.Verb == "ready" {
+			return s.runReady(s.opName)
+		}
 		return s.runOp(s.pending.Verb, strings.TrimSpace(s.name.Value()), s.pending.Title)
 	}
 	return s, nil
@@ -904,6 +1414,9 @@ func (s stackModel) affectedBranches(c townie.Command, name string) []string {
 	case "ship":
 		// Merging cur re-parents the branches above it onto the trunk.
 		return s.descendants(cur)
+	case "shipstack":
+		// The bottom-up list of branches this ships (what the confirmation lists).
+		return s.shipChain()
 	default: // new — creates a leaf, rebases nothing
 		return nil
 	}
@@ -914,7 +1427,7 @@ func (s stackModel) affectedBranches(c townie.Command, name string) []string {
 // header is the app's brand masthead (rendered by the root model, which owns the
 // login/rate it shows) so stack mode keeps the same top bar as the dashboard.
 func (s stackModel) View(spinnerFrame, header string) string {
-	statusline := renderStatusline(s.th, s.repo, s.status, s.hasGitTown(), s.width)
+	statusline := renderStatusline(s.th, s.repo, s.status, s.currentBase(), s.hasGitTown(), s.width)
 
 	bodyH := s.height - headerH /*brand*/ - 1 /*statusline*/ - 1 /*footer*/
 	if bodyH < 1 {
@@ -953,8 +1466,24 @@ func (s stackModel) treeWidth() int {
 			if num := s.prNums[n.Name]; num > 0 {
 				need += len(fmt.Sprintf(" #%d", num))
 			}
+			if !n.IsTrunk {
+				if m, ok := s.prMerge[n.Name]; ok && m.Draft {
+					need += len(" draft")
+				} else if s.prNums != nil && s.prNums[n.Name] == 0 {
+					need += len(" no PR")
+				}
+			}
 			if n.Drifted {
 				need += 2
+			}
+			if need > w {
+				w = need
+			}
+		}
+		for _, name := range s.loose {
+			need := 4 + lipgloss.Width(name) + 1 // marker + indent + name + slack
+			if num := s.prNums[name]; num > 0 {
+				need += len(fmt.Sprintf(" #%d", num))
 			}
 			if need > w {
 				w = need
@@ -1013,14 +1542,60 @@ func (s stackModel) renderLocalTree(w int) string {
 		suffix := ""
 		// Flag branches that already have an open PR with its #number, so you can
 		// see at a glance what's proposed and cross-reference it on GitHub.
-		if num := s.prNums[n.Name]; num > 0 {
+		num := s.prNums[n.Name]
+		if num > 0 {
 			suffix += " " + lipgloss.NewStyle().Foreground(s.th.Accent2).Render(fmt.Sprintf("#%d", num))
+		}
+		// Landing readiness at a glance (once the PR data has loaded): a draft PR is
+		// what silently stops a whole-stack ship; a non-trunk branch with no open PR
+		// can't be merged/shipped yet.
+		if !n.IsTrunk {
+			if m, ok := s.prMerge[n.Name]; ok && m.Draft {
+				suffix += " " + lipgloss.NewStyle().Foreground(s.th.Warning).Render("draft")
+			} else if s.prNums != nil && num == 0 {
+				suffix += " " + lipgloss.NewStyle().Foreground(s.th.Muted).Render("no PR")
+			}
 		}
 		if n.Drifted {
 			suffix += " " + lipgloss.NewStyle().Foreground(s.th.Warning).Render("⚠")
 		}
 		used := 2 + len(indent) + lipgloss.Width(suffix)
 		b.WriteString(marker + indent + nameStyle.Render(truncate(n.Name, w-used-1)) + suffix + "\n")
+	}
+
+	// Loose branches: real git branches that aren't part of a stack yet (no
+	// git-town parent). Shown under a divider so they're visible and can be checked
+	// out + added with t. They continue the same cursor index space as the tree.
+	if len(s.loose) > 0 {
+		lbl := "not in a stack"
+		dashN := w - lipgloss.Width(lbl) - 3 // "─ " before + " " after
+		if dashN < 0 {
+			dashN = 0
+		}
+		// The dashes stay muted-divider faint, but the LABEL is Muted (readable text)
+		// so "not in a stack" doesn't disappear on a dark background.
+		dashStyle := lipgloss.NewStyle().Foreground(s.th.Overlay)
+		divider := dashStyle.Render("─ ") + mutedStyle(s.th).Render(lbl) + dashStyle.Render(" "+strings.Repeat("─", dashN))
+		b.WriteString(divider + "\n")
+		base := len(s.tree.Order)
+		for j, name := range s.loose {
+			idx := base + j
+			nameStyle := lipgloss.NewStyle().Foreground(s.th.Muted)
+			marker := "  "
+			switch {
+			case focused && idx == s.treeCursor:
+				marker = lipgloss.NewStyle().Foreground(s.th.Focus).Bold(true).Render(focusGlyph + " ")
+			case name == s.status.Branch:
+				marker = lipgloss.NewStyle().Foreground(s.th.Primary).Render("▌ ")
+				nameStyle = lipgloss.NewStyle().Foreground(s.th.Primary).Bold(true)
+			}
+			suffix := ""
+			if num := s.prNums[name]; num > 0 {
+				suffix += " " + lipgloss.NewStyle().Foreground(s.th.Accent2).Render(fmt.Sprintf("#%d", num))
+			}
+			used := 4 + lipgloss.Width(suffix)
+			b.WriteString(marker + "  " + nameStyle.Render(truncate(name, w-used-1)) + suffix + "\n")
+		}
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, rule, b.String())
 }
@@ -1079,14 +1654,75 @@ func (s stackModel) renderActions(w int) string {
 	title := lipgloss.NewStyle().Foreground(titleColor).Bold(true).Render("Stack actions")
 	rule := lipgloss.NewStyle().Foreground(ruleColor).Render(strings.Repeat("─", w))
 
-	// Peach call-to-action when you're on a branch git-town doesn't track yet — it
-	// won't appear in the stack tree and the maintenance verbs stay dim until you
-	// add it. One key (t) files it under the trunk.
-	banner := ""
+	// Warning lines above the list explain predictable failures BEFORE you try:
+	// a not-in-a-stack branch, a merge that can't run, or a whole-stack ship that
+	// will halt partway. Each names the fix so the user is never left guessing.
+	warn := func(msg string) string {
+		return colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, wrapPlain(msg, proseWidth(w), "  "), s.allBranchNames())
+	}
+	// warnList renders a header + a bulleted checklist of fixes + an optional footer
+	// (wrapPlain flattens newlines, so each line is wrapped on its own and joined).
+	// Used when one warning carries MORE THAN ONE fix, so they read as a checklist.
+	warnList := func(header string, bullets []string, footer string) string {
+		tw := proseWidth(w)
+		lines := []string{wrapPlain(header, tw, "  ")}
+		for _, bl := range bullets {
+			lines = append(lines, "  • "+wrapPlain(bl, tw-4, "    "))
+		}
+		if footer != "" {
+			lines = append(lines, wrapPlain(footer, tw, "  "))
+		}
+		return colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, strings.Join(lines, "\n"), s.allBranchNames())
+	}
+	var banners []string
 	if s.currentUntracked() {
-		msg := fmt.Sprintf("⚠ %s isn't in the stack yet — press t to add it under %s.",
-			s.status.Branch, val(s.trackParent()))
-		banner = lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain(msg, proseWidth(w), "  ")) + "\n\n"
+		banners = append(banners, warn(fmt.Sprintf("⚠ %s isn't in a stack yet — press t to add it under %s.",
+			s.status.Branch, val(s.trackParent()))))
+	} else if chain := s.shipChain(); len(chain) > 0 && !s.status.Dirty() {
+		if reason, hint := s.shipBlock(chain[0]); reason != "" {
+			// The bottom PR (first to land) can't merge → M and G are dim. Name the
+			// blocker AND the fix — the "dim and explain" half of the gating.
+			banners = append(banners, warn(fmt.Sprintf("⚠ %s can't be merged: %s. %s.", chain[0], reason, capFirst(hint))))
+		} else if landsFirst, stops := s.shipStops(); len(stops) == 1 {
+			// One predictable halt: a single sentence with where it stops + the fix.
+			st := stops[0]
+			msg := fmt.Sprintf("⚠ merge whole stack (G) will stop at %s: %s.", st.branch, st.reason)
+			if len(landsFirst) > 0 {
+				msg += fmt.Sprintf(" Lands %s first; %s and above are left untouched.", humanList(landsFirst), st.branch)
+			} else {
+				msg += fmt.Sprintf(" Nothing lands; %s and above are left untouched.", st.branch)
+			}
+			msg += fmt.Sprintf(" Select %s in the tree, then %s.", st.branch, st.fixAction)
+			banners = append(banners, warn(msg))
+		} else if len(stops) > 1 {
+			// Several predictable blockers → a bulleted checklist, one fix per line.
+			header := fmt.Sprintf("⚠ merge whole stack (G) can't land the whole stack yet — %d branches need a fix first:", len(stops))
+			bullets := make([]string, 0, len(stops))
+			for _, st := range stops {
+				bullets = append(bullets, fmt.Sprintf("%s — %s; select it, then %s", st.branch, st.reason, st.fixAction))
+			}
+			footer := fmt.Sprintf("For now G stops at %s with nothing landed.", stops[0].branch)
+			if len(landsFirst) > 0 {
+				footer = fmt.Sprintf("For now G lands %s, then stops at %s; the rest stay untouched.", humanList(landsFirst), stops[0].branch)
+			}
+			banners = append(banners, warnList(header, bullets, footer))
+		}
+	}
+	// Drift: a branch in this stack sits on an out-of-date parent (the parent was
+	// amended/rewritten under it). The tree marks it ⚠, but that alone doesn't say
+	// what to do — restack (R) rebases it back on top. Surface it independently of
+	// the merge banners (drift and mergeability are orthogonal).
+	if drifted := s.driftedInCurrentStack(); len(drifted) > 0 {
+		have, whose := "has", "its parent"
+		if len(drifted) > 1 {
+			have, whose = "have", "their parents"
+		}
+		banners = append(banners, warn(fmt.Sprintf("⚠ %s %s drifted from %s — press R to restack (rebase back on top).",
+			humanList(drifted), have, whose)))
+	}
+	banner := ""
+	if len(banners) > 0 {
+		banner = strings.Join(banners, "\n") + "\n\n"
 	}
 
 	var rows []string
@@ -1102,16 +1738,27 @@ func (s stackModel) renderActions(w int) string {
 				short = "open a PR for " + t
 			}
 		}
+		if c.Verb == "ready" {
+			if t := s.proposeTarget(); t != "" {
+				short = "mark " + t + " ready for review"
+			}
+		}
 		labelStyle := lipgloss.NewStyle().Foreground(s.th.Text).Bold(true)
 		shortStyle := lipgloss.NewStyle().Foreground(s.th.Muted)
 		if !on {
 			// Disabled rows: use Muted (inactive TEXT), not Overlay (divider color),
-			// which was too faint to read in both light and dark.
+			// which was too faint to read in both light and dark. Replace the generic
+			// description with the concrete reason it's dim, so the row explains itself.
+			if reason := s.actionDisabledReason(c); reason != "" {
+				short = reason
+			}
 			key = lipgloss.NewStyle().Foreground(s.th.Muted).Render(c.Key)
 			labelStyle = lipgloss.NewStyle().Foreground(s.th.Muted)
 			shortStyle = lipgloss.NewStyle().Foreground(s.th.Muted)
 		}
-		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), shortStyle.Render(short))
+		// Color any branch NAMED in the description/reason (e.g. the merge bottom, the
+		// propose target) so it stands out the same as in the tree.
+		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), colorBranches(shortStyle, s.th, short, s.allBranchNames()))
 		if i == s.cursor && s.focus == focusActions {
 			// Same full-width Surface highlight as the focused PR row: styledBar
 			// reasserts the background after each fragment's reset so the bar spans
@@ -1148,6 +1795,9 @@ func (s stackModel) renderConfirm(w int) string {
 	if s.pending.Verb == "propose" {
 		return s.renderProposeConfirm(w)
 	}
+	if s.pending.Verb == "shipstack" {
+		return s.renderShipStackConfirm(w)
+	}
 	c := s.pending
 	name := strings.TrimSpace(s.name.Value())
 	headline := c.Title
@@ -1155,6 +1805,10 @@ func (s stackModel) renderConfirm(w int) string {
 	// keep its headline clean ("set up git-town — confirm").
 	if name != "" && c.Verb != "init" {
 		headline += " " + name
+	}
+	// ready acts on the tree-cursor branch (s.opName), not a typed name — name it.
+	if c.Verb == "ready" {
+		headline = "mark " + val(s.opName) + " ready"
 	}
 	title := lipgloss.NewStyle().Foreground(s.th.Primary).Bold(true).Render(headline + " — confirm")
 	rule := lipgloss.NewStyle().Foreground(s.th.Focus).Render(strings.Repeat("─", w))
@@ -1203,18 +1857,119 @@ func (s stackModel) renderConfirm(w int) string {
 		}
 	case "init":
 		effect = fmt.Sprintf("Marks %s as the trunk and sets rebase syncing — writes local .git/config only, nothing committed or pushed.", val(name))
+	case "ready":
+		effect = fmt.Sprintf("Marks %s's pull request ready for review on GitHub (takes it out of draft). This can notify reviewers and start required checks; nothing merges.", val(s.opName))
 	default:
 		effect = "Affects " + cur + "."
 	}
-	effectLine := lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain("• "+effect, textW, "  "))
+	effectLine := colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, wrapPlain("• "+effect, textW, "  "), s.allBranchNames())
+
+	// A ship isn't dimmed for a review requirement (repo admins can bypass it, and
+	// required-check state is only certain at merge time), so surface it here as a
+	// caution — a merge that GitHub then refuses is explained by FriendlyMergeError.
+	cautionLine := ""
+	if c.Verb == "ship" {
+		if m, ok := s.prMerge[s.status.Branch]; ok {
+			if cau := m.Caution(); cau != "" {
+				cautionLine = lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain("⚠ "+cau, textW, "  "))
+			}
+		}
+	}
 
 	cmdLine := lipgloss.NewStyle().Foreground(s.th.Muted).Render("runs:  " + commandLine(c, name))
 	confirm := lipgloss.NewStyle().Foreground(s.th.Success).Render("[enter] do it") +
 		mutedStyle(s.th).Render("    [esc] cancel")
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, rule, "",
+	parts := []string{title, rule, "",
 		lipgloss.NewStyle().Foreground(s.th.Muted).Render("What this does:"),
-		what, "", effectLine, "", cmdLine, "", confirm)
+		what, "", effectLine}
+	if cautionLine != "" {
+		parts = append(parts, "", cautionLine)
+	}
+	parts = append(parts, "", cmdLine, "", confirm)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// renderShipStackConfirm is the gate before merging a whole stack — the most
+// destructive action in Cairn. It leads with a loud danger warning, then lists
+// every branch to be merged in bottom-up order, each annotated with its PR number
+// and landing readiness (✓ ready, ⚠ blocked/no PR, ? still computing), so there is
+// no ambiguity about what lands and where it might stop.
+func (s stackModel) renderShipStackConfirm(w int) string {
+	trunk := "main"
+	if s.tree != nil && s.tree.Root != nil {
+		trunk = s.tree.Root.Name
+	}
+	branches := s.affected
+	textW := proseWidth(w)
+
+	warn := lipgloss.NewStyle().Foreground(s.th.Danger).Bold(true).
+		Render(wrapPlain("⚠ SERIOUS — this merges the ENTIRE stack and cannot be undone.", textW, "  "))
+	title := lipgloss.NewStyle().Foreground(s.th.Primary).Bold(true).
+		Render(fmt.Sprintf("merge whole stack (%d branches) — confirm", len(branches)))
+	rule := lipgloss.NewStyle().Foreground(s.th.Danger).Render(strings.Repeat("─", w))
+	what := lipgloss.NewStyle().Foreground(s.th.Text).Render(wrapPlain(s.pending.Long, textW, ""))
+
+	// The ordered, annotated merge list.
+	var rows []string
+	for i, b := range branches {
+		numStr := "no PR"
+		if n := s.prNums[b]; n > 0 {
+			numStr = fmt.Sprintf("#%d", n)
+		}
+		mark, markColor, note := "✓", s.th.Success, ""
+		if m, ok := s.prMerge[b]; ok {
+			switch {
+			case m.Draft:
+				// Draft state is independent of the base, so this is a certain stop.
+				mark, markColor, note = "⚠", s.th.Danger, "still a draft — stops here"
+			case m.Mergeable == "CONFLICTING":
+				// GitHub computes this against the PR's CURRENT base (the branch below
+				// it), but the run retargets each branch onto the trunk before merging —
+				// so above the bottom it is a risk, not a certainty. (The bottom already
+				// targets trunk and the gate dims it, so a conflict here is always higher.)
+				if i == 0 {
+					mark, markColor, note = "⚠", s.th.Danger, "conflicts with the trunk — stops here"
+				} else {
+					mark, markColor, note = "⚠", s.th.Warning, "conflicts with its base — may stop here"
+				}
+			case m.Mergeable == "UNKNOWN":
+				mark, markColor, note = "?", s.th.Warning, "mergeability still computing"
+			case m.Caution() != "":
+				// Not a certain block (repo admins bypass, checks unknown here), so it
+				// still tries — but flag the risk up front.
+				mark, markColor, note = "?", s.th.Warning, m.Caution()
+			}
+		} else if s.prMerge != nil {
+			mark, markColor, note = "⚠", s.th.Danger, "no open PR — stops here"
+		} else {
+			mark, markColor, note = "?", s.th.Warning, "readiness not loaded"
+		}
+		line := fmt.Sprintf("%2d. %s %s  %s",
+			i+1,
+			lipgloss.NewStyle().Foreground(markColor).Render(mark),
+			lipgloss.NewStyle().Foreground(s.th.Accent2).Render(b),
+			lipgloss.NewStyle().Foreground(s.th.Muted).Render(numStr))
+		if note != "" {
+			line += "  " + lipgloss.NewStyle().Foreground(markColor).Render(note)
+		}
+		rows = append(rows, line)
+	}
+	list := strings.Join(rows, "\n")
+
+	orderNote := mutedStyle(s.th).Render(wrapPlain(
+		"Merged bottom-up, in this order. If one can't merge, the branches below it "+
+			"still land and everything above is left untouched.", textW, ""))
+	effect := fmt.Sprintf("Squash-merges each PR into %s, deletes each merged branch, then syncs once so what remains re-parents onto %s.", trunk, trunk)
+	effectLine := colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, wrapPlain("• "+effect, textW, "  "), s.allBranchNames())
+	cmdLine := lipgloss.NewStyle().Foreground(s.th.Muted).Render("runs:  " + s.pending.Hint())
+	confirm := lipgloss.NewStyle().Foreground(s.th.Danger).Bold(true).Render(fmt.Sprintf("[enter] merge %d branches", len(branches))) +
+		mutedStyle(s.th).Render("    [esc] cancel")
+
+	return lipgloss.JoinVertical(lipgloss.Left, warn, "", title, rule, "",
+		what, "",
+		lipgloss.NewStyle().Foreground(s.th.Muted).Render("Merge order (bottom-up) — readiness:"),
+		list, "", orderNote, "", effectLine, "", cmdLine, "", confirm)
 }
 
 // composeWidths splits the body width into the editor pane and the preview pane.
@@ -1336,7 +2091,9 @@ func (s stackModel) renderProposeConfirm(w int) string {
 
 	label := lipgloss.NewStyle().Foreground(s.th.Muted)
 	value := lipgloss.NewStyle().Foreground(s.th.Text)
+	branch := lipgloss.NewStyle().Foreground(s.th.Accent2)
 	row := func(k, v string) string { return label.Render(pad(k, 8)) + value.Render(v) }
+	branchRow := func(k, v string) string { return label.Render(pad(k, 8)) + branch.Render(v) }
 
 	draftState := "no (ready for review)"
 	if s.proposeDraft {
@@ -1348,15 +2105,15 @@ func (s stackModel) renderProposeConfirm(w int) string {
 
 	textW := proseWidth(w)
 	effect := fmt.Sprintf("Pushes %s to origin, then opens a pull request targeting %s.", s.opName, val(s.proposeBase))
-	effectLine := lipgloss.NewStyle().Foreground(s.th.Warning).Render(wrapPlain("• "+effect, textW, "  "))
+	effectLine := colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, wrapPlain("• "+effect, textW, "  "), s.allBranchNames())
 
 	cmdLine := lipgloss.NewStyle().Foreground(s.th.Muted).Render("runs:  " + commandLine(s.pending, s.opName))
 	confirm := lipgloss.NewStyle().Foreground(s.th.Success).Render("[enter] open PR") +
 		mutedStyle(s.th).Render("    [esc] back to edit")
 
 	return lipgloss.JoinVertical(lipgloss.Left, title, rule, "",
-		row("head", s.opName),
-		row("base", val(s.proposeBase)),
+		branchRow("head", s.opName),
+		branchRow("base", val(s.proposeBase)),
 		row("title", truncate(strings.TrimSpace(s.titleInput.Value()), w-9)),
 		draftLine, "",
 		effectLine, "", cmdLine, "", confirm)
@@ -1371,8 +2128,13 @@ func (s stackModel) renderOutput(w int) string {
 	switch {
 	case s.phase == stackRunning:
 		status = lipgloss.NewStyle().Foreground(s.th.Focus).Render("running…")
+	case s.runErr != nil && s.pending.Verb == "shipstack":
+		// A whole-stack ship that ends with an error is a controlled halt ("lands what
+		// it can, stops with a reason") — amber "stopped", not a red "failed", since
+		// earlier branches may well have merged. The log carries what landed.
+		status = colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, "stopped: "+s.runErr.Error(), s.allBranchNames())
 	case s.runErr != nil:
-		status = lipgloss.NewStyle().Foreground(s.th.Danger).Render("failed: " + s.runErr.Error())
+		status = colorBranches(lipgloss.NewStyle().Foreground(s.th.Danger), s.th, "failed: "+s.runErr.Error(), s.allBranchNames())
 	default:
 		status = lipgloss.NewStyle().Foreground(s.th.Success).Render("done ✓")
 	}
@@ -1397,7 +2159,29 @@ func (s stackModel) renderOutput(w int) string {
 // step, while the results below them stay plain text. Carriage returns are
 // sanitized and long lines hard-wrapped to the pane first.
 func (s stackModel) renderRunLog(out string, w int) string {
-	return styleRunLog(s.th, out, w)
+	return styleRunLog(s.th, out, w, s.logBranchNames())
+}
+
+// logBranchNames is the set of branch names to highlight in the run log: the tree
+// plus the op's own branches (s.affected / s.opName), so branches that the op just
+// deleted — gone from the tree after the reload — are still colored in the output.
+func (s stackModel) logBranchNames() []string {
+	set := map[string]bool{}
+	var out []string
+	add := func(n string) {
+		if n != "" && !set[n] {
+			set[n] = true
+			out = append(out, n)
+		}
+	}
+	for _, n := range s.allBranchNames() {
+		add(n)
+	}
+	for _, n := range s.affected {
+		add(n)
+	}
+	add(s.opName)
+	return out
 }
 
 // styleRunLog is the shared run-log styler used by the stack run screen and the
@@ -1405,7 +2189,7 @@ func (s stackModel) renderRunLog(out string, w int) string {
 // command echoes wrapped in \x1b[1m…\x1b[0m), so strip that first — then Cairn
 // fully controls styling and the "[branch] …" command detection sees plain text,
 // not an escape prefix.
-func styleRunLog(th theme.Theme, out string, w int) string {
+func styleRunLog(th theme.Theme, out string, w int, branches []string) string {
 	cmd := lipgloss.NewStyle().Foreground(th.Focus).Bold(true)
 	res := lipgloss.NewStyle().Foreground(th.Text)
 	var b strings.Builder
@@ -1415,10 +2199,11 @@ func styleRunLog(th theme.Theme, out string, w int) string {
 		}
 		if isCommandEcho(ln) {
 			// Structural marker (color-independent) + accent so command rows stand
-			// out even where a terminal flattens truecolor.
-			b.WriteString(cmd.Render("❯ " + ansi.Wrap(ln, w-2, "")))
+			// out even where a terminal flattens truecolor. Branch names inside still
+			// get the branch color (colorBranches re-asserts cmd after each).
+			b.WriteString(colorBranches(cmd, th, "❯ "+ansi.Wrap(ln, w-2, ""), branches))
 		} else {
-			b.WriteString(res.Render(ansi.Wrap(ln, w, "")))
+			b.WriteString(colorBranches(res, th, ansi.Wrap(ln, w, ""), branches))
 		}
 	}
 	return b.String()
@@ -1540,6 +2325,101 @@ func val(s string) string {
 		return "(?)"
 	}
 	return s
+}
+
+// allBranchNames is every branch Cairn knows locally — the stack nodes plus the
+// loose "not in a stack" branches. It's the set colorBranches highlights so a
+// branch NAMED in a message (a warning, a reason, a confirmation) is colored the
+// same way it is in the tree, wherever it appears.
+func (s stackModel) allBranchNames() []string {
+	var out []string
+	if s.tree != nil {
+		for _, n := range s.tree.Order {
+			out = append(out, n.Name)
+		}
+	}
+	out = append(out, s.loose...)
+	return out
+}
+
+// isNameByte reports whether b can appear inside a git branch name (letters,
+// digits, and - _ / .). Used for the word-boundary test when highlighting names.
+func isNameByte(b byte) bool {
+	return b == '-' || b == '_' || b == '/' || b == '.' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// branchNameAt returns the branch name (from names, which must be sorted
+// longest-first) that begins at line[pos] on a WORD BOUNDARY, or "" if none — so
+// "main" isn't matched inside "remains" and "base" not inside "feat-base".
+func branchNameAt(line string, pos int, names []string) string {
+	if pos > 0 && isNameByte(line[pos-1]) {
+		return "" // mid-word — not the start of a branch name
+	}
+	for _, n := range names {
+		if strings.HasPrefix(line[pos:], n) {
+			if end := pos + len(n); end < len(line) && isNameByte(line[end]) {
+				continue // name is only a prefix of a longer word (main → remains)
+			}
+			return n
+		}
+	}
+	return ""
+}
+
+// colorBranches renders text with every occurrence of a known branch name in the
+// branch color (Accent2, the same identifier color the tree uses for #N), and all
+// other text in base — re-asserting base after each branch so the run color is
+// preserved across the inner style's reset. Longest names match first so a name
+// that is a prefix of another (feat vs feat-base) doesn't mis-highlight. Cut
+// points are always at branch-name starts (ASCII), so multi-byte glyphs in the
+// surrounding text are never split.
+func colorBranches(base lipgloss.Style, th theme.Theme, text string, branches []string) string {
+	names := make([]string, 0, len(branches))
+	for _, n := range branches {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	branchStyle := lipgloss.NewStyle().Foreground(th.Accent2)
+	// Colorize per line: lipgloss.Render pads a MULTI-line string into a rectangular
+	// block, so a segment that spanned a newline would inject stray spaces. Rendering
+	// one line at a time keeps every Render single-line.
+	colorLine := func(line string) string {
+		if line == "" || len(names) == 0 {
+			return base.Render(line)
+		}
+		var b strings.Builder
+		for i := 0; i < len(line); {
+			if m := branchNameAt(line, i, names); m != "" {
+				b.WriteString(branchStyle.Render(m))
+				i += len(m)
+				continue
+			}
+			j := i + 1
+			for j < len(line) && branchNameAt(line, j, names) == "" {
+				j++
+			}
+			b.WriteString(base.Render(line[i:j]))
+			i = j
+		}
+		return b.String()
+	}
+	lines := strings.Split(text, "\n")
+	for i, ln := range lines {
+		lines[i] = colorLine(ln)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// capFirst upper-cases the first rune of s (for starting a sentence with a hint
+// that is otherwise written lower-case). ASCII-first is enough for our hints.
+func capFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // humanList renders ["a","b","c"] as "a, b and c".
