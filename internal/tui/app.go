@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 	"time"
 
@@ -1190,6 +1191,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "y":
+			// Copy the highlighted row's GitHub link to the clipboard — mirrors y in
+			// the detail view. Works on any PR row, and on a PR/issue/other
+			// notification (via its web URL) in the inbox.
+			return m.copySelectedLink()
 		case "r":
 			// Refresh is a whole-board sync, not just the active tab: re-run every
 			// section's query so a PR whose state changed (e.g. you just commented on
@@ -1784,6 +1790,31 @@ func (m Model) selectedItem() (gh.Item, bool) {
 	return gh.Item{}, false
 }
 
+// copySelectedLink writes the highlighted row's GitHub link to the system
+// clipboard and reports the outcome in the header flash. It resolves a PR row to
+// its URL, and an inbox notification to its web URL, so y copies a link from any
+// dashboard row; a no-op (with a hint) on a group header or empty row.
+func (m Model) copySelectedLink() (tea.Model, tea.Cmd) {
+	var url string
+	if it, ok := m.selectedItem(); ok {
+		url = it.URL
+	} else if len(m.sections) > 0 {
+		if n, ok := m.sections[m.active].list.SelectedItem().(notifItem); ok {
+			url = notifWebURL(n.Notification)
+		}
+	}
+	if url == "" {
+		m.flash = "nothing to copy here"
+		return m, clearFlashAfter()
+	}
+	if err := clipboard.WriteAll(url); err != nil {
+		m.flash = "copy failed: " + err.Error()
+		return m, clearFlashAfter()
+	}
+	m.flash = "✓ copied link  " + url
+	return m, clearFlashAfter()
+}
+
 // renderStackSidebar draws the stack of the currently-selected PR — its chain
 // reconstructed from PR bases (remote), with local git-town drift overlaid where
 // the cwd repo matches.
@@ -1901,6 +1932,7 @@ func (m Model) viewFooter() string {
 			dim.Render("enter " + m.enterHint()),
 			dim.Render("←/esc back"),
 			dim.Render("x mark read"),
+			dim.Render("y copy link"),
 			dim.Render("r sync all"),
 			themeFooterHint(m.th),
 			dim.Render("? help"),
@@ -1912,6 +1944,7 @@ func (m Model) viewFooter() string {
 			dim.Render("n/N hunk"), // hop between headers, like n/N in the conflict resolver
 			dim.Render("←/→ section"),
 			dim.Render("enter " + m.enterHint()),
+			dim.Render("y copy link"),
 		}
 		// x marks the selected notification read — an inbox-only action, so only
 		// advertise it there.
