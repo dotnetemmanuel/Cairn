@@ -1632,6 +1632,33 @@ func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, her
 	return lipgloss.JoinVertical(lipgloss.Left, brandRow, statusRow)
 }
 
+// tabLabel builds a tab's fully-styled label. Every tab shows its total in
+// parentheses once loaded; the Notifications tab additionally shows its unread
+// count in green inside a nested paren, e.g. "Notifications (13 (1))". The label
+// is returned pre-colored so viewTabs can drop it into a border/padding cell
+// without an outer foreground clobbering the green segment.
+func (m Model) tabLabel(s section, isActive bool) string {
+	base := m.th.Muted
+	if isActive {
+		base = m.th.Focus
+	}
+	baseStyle := lipgloss.NewStyle().Foreground(base).Bold(isActive)
+	if !(s.loaded && s.err == nil) {
+		return baseStyle.Render(s.title)
+	}
+	if s.isNotif() {
+		if unread := len(s.notifUnread); unread > 0 {
+			// Magenta-pink (Primary) is the complementary accent to the teal-blue tab
+			// color, so the unread count pops rather than blending like green did.
+			badge := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(isActive)
+			return baseStyle.Render(fmt.Sprintf("%s (%d (", s.title, s.total)) +
+				badge.Render(fmt.Sprintf("%d", unread)) +
+				baseStyle.Render("))")
+		}
+	}
+	return baseStyle.Render(fmt.Sprintf("%s (%d)", s.title, s.total))
+}
+
 func (m Model) viewTabs() string {
 	// The active tab is a box whose bottom opens (┘ … └) into the body's top
 	// line; inactive tabs are plain labels sitting on that same line.
@@ -1640,20 +1667,17 @@ func (m Model) viewTabs() string {
 
 	var cells []string
 	for i, s := range m.sections {
-		label := s.title
-		if s.loaded && s.err == nil {
-			label = fmt.Sprintf("%s (%d)", s.title, s.total)
-		}
+		// The label is pre-colored (so the notif tab can tint its unread count green),
+		// so the cell only owns the border + padding, not the text foreground.
+		label := m.tabLabel(s, i == m.active)
 		if i == m.active {
 			cells = append(cells, lipgloss.NewStyle().
 				Border(active, true).BorderForeground(m.th.Focus).
-				Foreground(m.th.Focus).Bold(true).
 				Padding(0, 1).Render(label))
 		} else {
 			cells = append(cells, lipgloss.NewStyle().
 				Border(lipgloss.Border{Bottom: "─"}, false, false, true, false).
 				BorderForeground(m.th.Focus).
-				Foreground(m.th.Muted).
 				Padding(0, 1).Render(label))
 		}
 	}
@@ -1868,13 +1892,15 @@ func (m Model) viewFooter() string {
 
 	// On the inbox with the preview focused, the navigation keys change meaning:
 	// arrows scroll the conversation and ←/esc return to the list.
-	previewFocused := len(m.sections) > 0 && m.sections[m.active].isNotif() && m.notifPrev.focused
+	onNotif := len(m.sections) > 0 && m.sections[m.active].isNotif()
+	previewFocused := onNotif && m.notifPrev.focused
 	var parts []string
 	if previewFocused {
 		parts = []string{
 			dim.Render("↑/↓ scroll"),
 			dim.Render("enter " + m.enterHint()),
 			dim.Render("←/esc back"),
+			dim.Render("x mark read"),
 			dim.Render("r sync all"),
 			themeFooterHint(m.th),
 			dim.Render("? help"),
@@ -1887,10 +1913,15 @@ func (m Model) viewFooter() string {
 			dim.Render("←/→ section"),
 			dim.Render("enter " + m.enterHint()),
 		}
+		// x marks the selected notification read — an inbox-only action, so only
+		// advertise it there.
+		if onNotif {
+			parts = append(parts, dim.Render("x mark read"))
+		}
 		// The stack sidebar and the by-repo grouping toggle are PR-list-tab features
 		// with no place on the Notifications inbox, so don't advertise them there.
 		// (o's current state also shows as "· by repo" in the section subheader.)
-		if !(len(m.sections) > 0 && m.sections[m.active].isNotif()) {
+		if !onNotif {
 			parts = append(parts, dim.Render("s sidebar"), dim.Render("o group"))
 		}
 		parts = append(parts,
