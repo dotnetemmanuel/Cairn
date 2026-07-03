@@ -486,6 +486,18 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		case "up", "k":
 			m.moveCursor(-1)
 			return m, nil
+		case "ctrl+d", "pgdown":
+			m.jumpCursor(diffPageStep)
+			return m, nil
+		case "ctrl+u", "pgup":
+			m.jumpCursor(-diffPageStep)
+			return m, nil
+		case "g", "home":
+			m.jumpToEdge(false)
+			return m, nil
+		case "G", "end":
+			m.jumpToEdge(true)
+			return m, nil
 		default:
 			var cmd tea.Cmd
 			m.diffVP, cmd = m.diffVP.Update(msg)
@@ -696,6 +708,47 @@ func (m *detailModel) moveCursor(dir int) {
 		m.diffCursor = m.diffNLines - 1
 	}
 	m.renderDiffContent()
+	m.ensureCursorVisible()
+	m.refreshInfo()
+}
+
+// diffPageStep is how many patch lines ctrl+d/ctrl+u (and pgdn/pgup) jump — a
+// chunky step for long, hunk-less diffs (e.g. a whole new file) where line-by-line
+// scrolling is tedious.
+const diffPageStep = 10
+
+// jumpCursor moves the diff cursor by delta lines and pages the viewport by the
+// same visual distance, so content actually scrolls on every press (not only once
+// the cursor runs off the edge). ensureCursorVisible then corrects the offset near
+// the ends where the paged distance clamps short.
+func (m *detailModel) jumpCursor(delta int) {
+	if m.diffNLines == 0 {
+		return
+	}
+	old := m.diffCursor
+	m.diffCursor = clamp(m.diffCursor+delta, 0, m.diffNLines-1)
+	m.diffVP.SetYOffset(m.diffVP.YOffset + m.visualRow(m.diffCursor) - m.visualRow(old))
+	m.renderDiffContent()
+	m.ensureCursorVisible()
+	m.refreshInfo()
+}
+
+// jumpToEdge parks the diff cursor on the first (toEnd=false) or last line of the
+// file and snaps the viewport to that edge — for long diffs where scrolling all the
+// way is painful.
+func (m *detailModel) jumpToEdge(toEnd bool) {
+	if m.diffNLines == 0 {
+		return
+	}
+	if toEnd {
+		m.diffCursor = m.diffNLines - 1
+		m.renderDiffContent()
+		m.diffVP.GotoBottom()
+	} else {
+		m.diffCursor = 0
+		m.renderDiffContent()
+		m.diffVP.GotoTop()
+	}
 	m.ensureCursorVisible()
 	m.refreshInfo()
 }
@@ -1649,7 +1702,7 @@ func (m detailModel) viewFooter() string {
 		if len(m.lineComments()) > 0 {
 			rk = " · r reply · y copy link"
 		}
-		help = "↑/↓ line · n/N change · c comment line · S suggest" + rk +
+		help = "↑/↓ line · ^d/^u page · g/G top/end · n/N change · c comment line · S suggest" + rk +
 			" · s/i files/panel · ←/→ focus · v conversation · a approve · o open · esc back"
 	default:
 		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · s/i files/panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
