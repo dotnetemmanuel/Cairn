@@ -243,13 +243,13 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 
 	refStyled := lipgloss.NewStyle().Foreground(d.th.Info).Render(ref)
 	titleStyled := styleTitle(d.th, title, draftTag)
-	// Your own rows carry the Primary accent on the author cell (the same "you are
-	// here" hue used in the stack) so they stand out in a mixed list — notably the
-	// Orgs tab, which lists the whole org's PRs, yours included. Everyone else's
-	// author stays muted like the time column.
+	// Your own rows tint the author cell green (Success) so they stand out in a mixed
+	// list — notably the Orgs tab, which lists the whole org's PRs, yours included.
+	// Green (not Primary) so it doesn't read like the pink selection bar or the pink
+	// "merged" state dot. Everyone else's author stays muted like the time column.
 	authorColor := d.th.Muted
 	if isMine(it.Author) {
-		authorColor = d.th.Primary
+		authorColor = d.th.Success
 	}
 	authorStyled := lipgloss.NewStyle().Foreground(authorColor).Render(author)
 	updStyled := lipgloss.NewStyle().Foreground(d.th.Muted).Render(upd)

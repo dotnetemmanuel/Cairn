@@ -208,9 +208,14 @@ func (m Model) viewNotifications(bodyH, bw int) string {
 		listH = 1
 	}
 
+	// The position counter only makes sense on a real notification row; parked on a
+	// UNREAD/READ header (where the cursor lands on entry) it would read "1/N"
+	// before any notification is actually focused, so drop it there.
 	label := s.title
-	if pos, n := selectablePos(&s.list); n > 0 {
-		label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
+	if _, onHeader := s.list.SelectedItem().(sectionHeader); !onHeader {
+		if pos, n := selectablePos(&s.list); n > 0 {
+			label = fmt.Sprintf("%s  ▴ %d/%d ▾", s.title, pos, n)
+		}
 	}
 	// The focused pane wears the accent; the other recedes to muted, so it's clear
 	// whether arrows move the list or scroll the preview.

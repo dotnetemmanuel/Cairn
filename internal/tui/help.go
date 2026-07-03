@@ -137,6 +137,7 @@ func (m Model) helpBody(inner int) string {
 			{"enter", "open the PR — or fold/unfold the header under the cursor"},
 			{"→ / enter", "Notifications: focus the conversation preview (↑/↓ scroll, ← / esc back)"},
 			{"x", "mark notification read (Notifications inbox)"},
+			{"y", "copy the highlighted PR / notification link to the clipboard"},
 			{"o", "group the list by repo (toggle) — else newest-updated first"},
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},

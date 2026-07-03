@@ -361,10 +361,15 @@ func TestConversationThreadReply(t *testing.T) {
 	if m.page != pageConversation {
 		t.Fatalf("expected conversation page")
 	}
-	if len(m.convThreads) != 1 || m.convThreads[0].id != 999 {
-		t.Fatalf("expected 1 conv thread with id 999, got %+v", m.convThreads)
+	// Anchors now cover the description plus the one inline thread; the inline
+	// anchor is repliable via its REST id.
+	if len(m.convAnchors) != 2 {
+		t.Fatalf("expected description + 1 inline anchor, got %+v", m.convAnchors)
 	}
-	// n keeps the cursor on the (only) thread; r replies to it.
+	if m.convAnchors[1].replyID != 999 {
+		t.Fatalf("expected inline anchor replyID 999, got %+v", m.convAnchors[1])
+	}
+	// n moves off the description onto the inline thread; r replies to it.
 	m = driveDetail(m,
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
@@ -384,8 +389,168 @@ func TestConversationThreadReply(t *testing.T) {
 func TestConversationThreadNavFooter(t *testing.T) {
 	m := inlineDetail(t, 140, true)
 	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
-	if !strings.Contains(m.viewFooter(), "n/N thread") {
-		t.Errorf("conversation footer should advertise thread nav; got %q", m.viewFooter())
+	if !strings.Contains(m.viewFooter(), "n/N block") {
+		t.Errorf("conversation footer should advertise block nav; got %q", m.viewFooter())
+	}
+	// On an inline thread (n off the description), the footer offers reply.
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if !strings.Contains(m.viewFooter(), "r reply") {
+		t.Errorf("on an inline thread the footer should offer reply; got %q", m.viewFooter())
+	}
+}
+
+// editDetail builds a loaded conversation authored by "octocat" with a top-level
+// comment from octocat and one from someone else, for exercising the edit gate.
+func editDetail(t *testing.T, viewer string) detailModel {
+	t.Helper()
+	old := viewerLogin
+	t.Cleanup(func() { viewerLogin = old })
+	viewerLogin = viewer
+
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 7})
+	detail := gh.PRDetail{
+		Number: 7, State: "OPEN", HeadSHA: "deadbeef", Author: "octocat", Body: "the original description",
+		Comments: []gh.Comment{
+			{Author: "octocat", Body: "my own comment", DatabaseID: 111, CreatedAt: time.Now()},
+			{Author: "somebody", Body: "not yours", DatabaseID: 222, CreatedAt: time.Now()},
+		},
+	}
+	files := []gh.FileDiff{{Filename: "f.py", Status: "modified", Patch: "@@ -1 +1 @@\n-a\n+b"}}
+	m = driveDetail(m, tea.WindowSizeMsg{Width: 140, Height: 40}, prLoadedMsg{detail: detail, files: files})
+	// Open the conversation; the cursor rests on the description (block 0).
+	return driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+}
+
+func TestEditDescriptionOpensFullScreenEditor(t *testing.T) {
+	m := editDetail(t, "octocat") // cursor on the description, which is ours
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if m.state != stateEditDesc {
+		t.Fatalf("e on your own description should open the full-screen editor, got state %d", m.state)
+	}
+	if got := m.composer.Value(); got != "the original description" {
+		t.Errorf("editor should be seeded with the current body, got %q", got)
+	}
+	if !strings.Contains(m.View(""), "edit description") {
+		t.Errorf("description editor should render its headline")
+	}
+}
+
+func TestEditOwnCommentOpensComposer(t *testing.T) {
+	m := editDetail(t, "octocat")
+	// n off the description → our own comment (block 1).
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")},
+	)
+	if m.state != stateEditComment {
+		t.Fatalf("e on your own comment should open the composer, got state %d", m.state)
+	}
+	if got := m.composer.Value(); got != "my own comment" {
+		t.Errorf("composer should be seeded with the comment body, got %q", got)
+	}
+	if m.editAnchor.editID != 111 {
+		t.Errorf("edit target should be comment 111, got %d", m.editAnchor.editID)
+	}
+}
+
+func TestEditOthersCommentRefused(t *testing.T) {
+	m := editDetail(t, "octocat")
+	// Steps to the third block: description → own comment → someone else's comment.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")},
+	)
+	if m.state == stateEditComment || m.state == stateEditDesc {
+		t.Fatalf("e on someone else's comment must not open an editor, got state %d", m.state)
+	}
+	if !strings.Contains(m.viewFooter(), "only edit your own") {
+		t.Errorf("expected a refusal message, got footer %q", m.viewFooter())
+	}
+}
+
+func TestReplyToOwnTopLevelComment(t *testing.T) {
+	m := editDetail(t, "octocat")
+	// n off the description onto our own top-level comment; r should open a new
+	// conversation comment (top-level comments have no threaded reply on GitHub).
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")},
+	)
+	if m.state != stateComment {
+		t.Fatalf("r on a top-level comment should open the comment composer, got state %d", m.state)
+	}
+	if !strings.Contains(m.viewComposer(), "Reply to octocat") {
+		t.Errorf("composer should frame it as a reply; got %q", m.viewComposer())
+	}
+}
+
+func TestThreadReplyIsNavigableAndEditable(t *testing.T) {
+	old := viewerLogin
+	t.Cleanup(func() { viewerLogin = old })
+	viewerLogin = "octocat"
+
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 7})
+	// One inline thread: an anchor by somebody, a reply by us — both in thread 1.
+	detail := gh.PRDetail{Number: 7, State: "OPEN", HeadSHA: "deadbeef", Author: "octocat",
+		ReviewComments: []gh.ReviewComment{
+			{Author: "somebody", Body: "anchor comment", Path: "f.py", Line: 2, Side: "RIGHT", ThreadID: 1, DatabaseID: 500, CreatedAt: time.Now()},
+			{Author: "octocat", Body: "my reply", Path: "f.py", Line: 2, Side: "RIGHT", ThreadID: 1, DatabaseID: 501, CreatedAt: time.Now()},
+		}}
+	files := []gh.FileDiff{{Filename: "f.py", Status: "modified", Patch: "@@ -1,2 +1,3 @@\n ctx\n-x\n+y\n+z"}}
+	m = driveDetail(m, tea.WindowSizeMsg{Width: 140, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+
+	// Anchors: description, thread anchor, our reply.
+	if len(m.convAnchors) != 3 {
+		t.Fatalf("expected description + anchor + reply, got %d anchors", len(m.convAnchors))
+	}
+	if m.convAnchors[2].editID != 501 || !m.convAnchors[2].mine {
+		t.Fatalf("reply anchor should be editable id 501 and ours, got %+v", m.convAnchors[2])
+	}
+	// Hunk onto the reply (2 steps) and edit it.
+	m = driveDetail(m,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")},
+	)
+	if m.state != stateEditComment || m.composer.Value() != "my reply" {
+		t.Fatalf("e on our reply should edit it; state %d value %q", m.state, m.composer.Value())
+	}
+	if m.editAnchor.editID != 501 {
+		t.Errorf("edit target should be reply 501, got %d", m.editAnchor.editID)
+	}
+}
+
+func TestOwnPRBlocksReviewActions(t *testing.T) {
+	m := editDetail(t, "octocat") // the PR is authored by octocat, who is the viewer
+	// x (request changes) must warn, not open the composer.
+	mx := driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if mx.state == stateReject {
+		t.Error("x on your own PR must not open the request-changes composer")
+	}
+	if !strings.Contains(mx.viewFooter(), "can't request changes on your own PR") {
+		t.Errorf("expected a self-review warning, got %q", mx.viewFooter())
+	}
+	// a (approve) must warn too, not enter the confirm state.
+	ma := driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if ma.state == stateConfirmApprove {
+		t.Error("a on your own PR must not open the approve confirm")
+	}
+	// The footer must not advertise the review actions on your own PR.
+	if strings.Contains(m.viewFooter(), "approve") {
+		t.Errorf("own-PR footer should not advertise approve; got %q", m.viewFooter())
+	}
+}
+
+func TestOtherPRAllowsReviewActions(t *testing.T) {
+	m := editDetail(t, "somebody-else") // viewer is not the author
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.state != stateReject {
+		t.Fatalf("x on someone else's PR should open the request-changes composer, got %d", m.state)
 	}
 }
 
