@@ -23,9 +23,10 @@ type FileDiff struct {
 
 // Comment is an issue-level comment on the PR conversation.
 type Comment struct {
-	Author    string
-	Body      string
-	CreatedAt time.Time
+	Author     string
+	Body       string
+	DatabaseID int // REST comment id, for editing your own comment
+	CreatedAt  time.Time
 }
 
 // Review is a submitted PR review.
@@ -130,7 +131,8 @@ type TimelineEntry struct {
 	Line       int             // for KindInline
 	Side       string          // for KindInline: RIGHT (new) or LEFT (old)
 	DiffHunk   string          // for KindInline: the cited code context
-	DatabaseID int             // for KindInline: REST comment id, for threaded replies
+	DatabaseID int             // KindInline/KindComment: REST comment id (reply/edit target)
+	ReviewID   string          // for KindReview: GraphQL review node id, to edit its body
 	Children   []TimelineEntry // for KindReview: its thread anchors
 	Replies    []TimelineEntry // for KindInline: the thread's replies, beneath the anchor
 	SHA        string          // for KindCommit: the commit sha
@@ -167,14 +169,14 @@ func (d PRDetail) Timeline() []TimelineEntry {
 	byReview := map[string]*TimelineEntry{} // review id -> its entry, for nesting
 
 	for _, r := range d.Reviews {
-		e := &TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, CreatedAt: r.CreatedAt}
+		e := &TimelineEntry{Kind: KindReview, Author: r.Author, Body: r.Body, State: r.State, ReviewID: r.ID, CreatedAt: r.CreatedAt}
 		if r.ID != "" {
 			byReview[r.ID] = e
 		}
 		top = append(top, e)
 	}
 	for _, c := range d.Comments {
-		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
+		top = append(top, &TimelineEntry{Kind: KindComment, Author: c.Author, Body: c.Body, DatabaseID: c.DatabaseID, CreatedAt: c.CreatedAt})
 	}
 	for _, c := range d.Commits {
 		top = append(top, &TimelineEntry{Kind: KindCommit, Author: c.Author, Body: c.Message, SHA: c.SHA, CreatedAt: c.CreatedAt})
@@ -278,7 +280,7 @@ query($owner:String!,$repo:String!,$number:Int!){
       baseRefName headRefName headRefOid
       author{login}
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug}}}}
-      comments(first:50){nodes{author{login} body createdAt}}
+      comments(first:50){nodes{databaseId author{login} body createdAt}}
       reviews(first:50){nodes{id author{login} state body createdAt}}
       reviewThreads(first:50){nodes{path line originalLine diffSide comments(first:20){nodes{databaseId author{login} body createdAt diffHunk pullRequestReview{id}}}}}
       commits(first:100){nodes{commit{oid messageHeadline committedDate author{user{login} name}}}}
@@ -336,9 +338,10 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 				}
 				Comments struct {
 					Nodes []struct {
-						Author    struct{ Login string }
-						Body      string
-						CreatedAt time.Time
+						DatabaseID int `json:"databaseId"`
+						Author     struct{ Login string }
+						Body       string
+						CreatedAt  time.Time
 					}
 				}
 				Reviews struct {
@@ -453,7 +456,7 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 		}
 	}
 	for _, c := range pr.Comments.Nodes {
-		d.Comments = append(d.Comments, Comment{Author: c.Author.Login, Body: c.Body, CreatedAt: c.CreatedAt})
+		d.Comments = append(d.Comments, Comment{Author: c.Author.Login, Body: c.Body, DatabaseID: c.DatabaseID, CreatedAt: c.CreatedAt})
 	}
 	for ti, th := range pr.ReviewThreads.Nodes {
 		side := th.DiffSide
@@ -626,6 +629,62 @@ func ReplyToReviewComment(owner, repo string, number, commentID int, body string
 	payload, _ := json.Marshal(map[string]string{"body": body})
 	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%d/replies", owner, repo, number, commentID)
 	return client.Post(endpoint, bytes.NewReader(payload), nil)
+}
+
+// UpdatePRBody edits a pull request's description (REST PATCH). Allowed only for
+// the PR author; GitHub returns 403 otherwise, surfaced to the caller.
+func UpdatePRBody(owner, repo string, number int, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	return client.Patch(path, bytes.NewReader(payload), nil)
+}
+
+// UpdateIssueComment edits one of your top-level PR conversation comments (REST
+// PATCH). commentID is the comment's REST database id.
+func UpdateIssueComment(owner, repo string, commentID int, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	path := fmt.Sprintf("repos/%s/%s/issues/comments/%d", owner, repo, commentID)
+	return client.Patch(path, bytes.NewReader(payload), nil)
+}
+
+// UpdateReviewComment edits one of your inline code-review comments (REST PATCH).
+// commentID is the review comment's REST database id.
+func UpdateReviewComment(owner, repo string, commentID int, body string) error {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	path := fmt.Sprintf("repos/%s/%s/pulls/comments/%d", owner, repo, commentID)
+	return client.Patch(path, bytes.NewReader(payload), nil)
+}
+
+// UpdateReview edits the top-level body of a review you submitted. Reviews aren't
+// PATCHable over REST, so this uses the GraphQL updatePullRequestReview mutation;
+// reviewID is the review's GraphQL node id (Review.ID).
+func UpdateReview(reviewID, body string) error {
+	client, err := graphQLClient()
+	if err != nil {
+		return err
+	}
+	if reviewID == "" {
+		return fmt.Errorf("this review can't be edited")
+	}
+	var resp struct {
+		UpdatePullRequestReview struct {
+			PullRequestReview struct{ ID string }
+		}
+	}
+	mutation := `mutation($id:ID!,$body:String!){updatePullRequestReview(input:{pullRequestReviewId:$id,body:$body}){pullRequestReview{id}}}`
+	return client.Do(mutation, map[string]interface{}{"id": reviewID, "body": body}, &resp)
 }
 
 // FindPROpenForBranch returns the number of the open PR whose head is branch in

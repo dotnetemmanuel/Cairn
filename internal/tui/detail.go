@@ -49,6 +49,8 @@ const (
 	stateReject      // request-changes reason
 	stateLineComment // inline comment anchored to a diff line
 	stateReply       // reply threaded under an existing inline comment
+	stateEditComment // editing your own comment/review (bottom composer)
+	stateEditDesc    // editing the PR description (full-screen editor + preview)
 	stateConfirmApprove
 	stateSubmitting
 )
@@ -100,19 +102,42 @@ type detailModel struct {
 	replyTo     int
 	replyAuthor string // whose comment we're replying to (for the composer title)
 
-	// Conversation-page thread cursor: repliable inline threads in render order,
-	// and the selected one (-1 = none). Lets you n/N to any thread and reply.
-	convThreads []convThread
+	// Conversation-page cursor: every navigable block (description, top-level
+	// comments, reviews, inline threads) in render order, and the selected one
+	// (-1 = none). Lets you n/N to any block to reply to it or edit your own.
+	convAnchors []convAnchor
 	convCursor  int
+
+	// editAnchor is the block a pending edit targets (set when e opens the editor),
+	// so ctrl+s knows which update mutation to fire.
+	editAnchor convAnchor
+
+	// statusSeq tags each transient status so a delayed auto-dismiss only clears the
+	// message it was scheduled for, never a newer one.
+	statusSeq int
 }
 
-// convThread is a repliable inline-comment thread located in the rendered
-// conversation: its starting visual row (for scrolling) and the anchor comment's
-// REST id + author (for the reply).
-type convThread struct {
-	row    int
-	id     int
-	author string
+// convAnchor is one navigable block in the rendered conversation: its starting
+// visual row (for scrolling), who wrote it, and the ids needed to act on it.
+// replyID > 0 marks a repliable inline thread; mine marks a block you can edit;
+// the edit target is editID (REST comment id) or reviewID (a review's node id),
+// or neither for the PR description (edited by PR number).
+type convAnchor struct {
+	row      int
+	author   string
+	kind     gh.TimelineKind
+	mine     bool
+	replyID  int    // review-comment REST id, for reply (inline threads only)
+	editID   int    // REST id for editing an issue/inline comment
+	reviewID string // GraphQL node id for editing a review body
+	body     string // current body text, to seed the editor
+}
+
+// repliable reports whether r acts on this block: an inline thread threads a
+// reply, while a top-level comment or review adds a new conversation comment
+// (GitHub has no threaded reply for those).
+func (a convAnchor) repliable() bool {
+	return a.replyID > 0 || a.kind == gh.KindComment || a.kind == gh.KindReview
 }
 
 func newDetail(th theme.Theme, it gh.Item) detailModel {
@@ -168,6 +193,24 @@ type actionDoneMsg struct {
 // submitted something this session, so the dashboard can auto-sync all tabs.
 type detailExitMsg struct{ posted bool }
 
+// statusClearMsg auto-dismisses a transient status line a few seconds after it
+// was shown; seq guards against clearing a message that has since been replaced.
+type statusClearMsg struct{ seq int }
+
+// statusFlashFor is how long a transient status (a confirmation or a warning)
+// lingers before it auto-dismisses without a keypress.
+const statusFlashFor = 4 * time.Second
+
+// flashStatus sets a transient status and returns a command that auto-clears it
+// after statusFlashFor. Incrementing statusSeq also invalidates any earlier
+// pending auto-clear, so overlapping messages don't cut each other short.
+func (m *detailModel) flashStatus(s string) tea.Cmd {
+	m.status = s
+	m.statusSeq++
+	seq := m.statusSeq
+	return tea.Tick(statusFlashFor, func(time.Time) tea.Msg { return statusClearMsg{seq: seq} })
+}
+
 func loadPR(owner, repo string, number int, keep bool) tea.Cmd {
 	return func() tea.Msg {
 		detail, derr := gh.FetchPRDetail(owner, repo, number)
@@ -204,6 +247,30 @@ func doReply(owner, repo string, number, commentID int, body string) tea.Cmd {
 	return func() tea.Msg {
 		err := gh.ReplyToReviewComment(owner, repo, number, commentID, body)
 		return actionDoneMsg{verb: "reply", err: err}
+	}
+}
+
+// doUpdatePRBody saves an edited PR description off the main loop.
+func doUpdatePRBody(owner, repo string, number int, body string) tea.Cmd {
+	return func() tea.Msg {
+		return actionDoneMsg{verb: "description edit", err: gh.UpdatePRBody(owner, repo, number, body)}
+	}
+}
+
+// doEditComment saves an edited comment/review, dispatching to the right API by
+// the anchor's kind (issue comment, inline review comment, or review body).
+func doEditComment(owner, repo string, a convAnchor, body string) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		switch a.kind {
+		case gh.KindComment:
+			err = gh.UpdateIssueComment(owner, repo, a.editID, body)
+		case gh.KindInline:
+			err = gh.UpdateReviewComment(owner, repo, a.editID, body)
+		case gh.KindReview:
+			err = gh.UpdateReview(a.reviewID, body)
+		}
+		return actionDoneMsg{verb: "edit", err: err}
 	}
 }
 
@@ -264,16 +331,21 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 	case actionDoneMsg:
 		m.state = stateBrowsing
 		if msg.err != nil {
-			m.status = errStyle(m.th).Render("✗ " + msg.verb + " failed: " + msg.err.Error())
-			return m, nil
+			return m, m.flashStatus(errStyle(m.th).Render("✗ " + msg.verb + " failed: " + msg.err.Error()))
 		}
-		m.status = okStyle(m.th).Render("✓ " + msg.verb + " submitted")
+		clear := m.flashStatus(okStyle(m.th).Render("✓ " + msg.verb + " submitted"))
 		// Remember the user changed their involvement so the dashboard syncs every
 		// tab on exit (e.g. an Orgs PR you just commented on moves into Involved).
 		m.posted = true
 		// Reload conversation/checks so the new review/comment shows — but stay
 		// on the current file, line, and scroll position.
-		return m, loadPR(m.owner, m.repo, m.number, true)
+		return m, tea.Batch(loadPR(m.owner, m.repo, m.number, true), clear)
+
+	case statusClearMsg:
+		if msg.seq == m.statusSeq {
+			m.status = ""
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -285,10 +357,58 @@ func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 // keystrokes (so global shortcuts like ? must not steal them).
 func (m detailModel) composing() bool {
 	return m.state == stateComment || m.state == stateReject ||
-		m.state == stateLineComment || m.state == stateReply
+		m.state == stateLineComment || m.state == stateReply ||
+		m.state == stateEditComment
 }
 
+// editingDesc reports whether the full-screen description editor is open (its own
+// layout, so it's kept out of composing()'s bottom-composer path).
+func (m detailModel) editingDesc() bool { return m.state == stateEditDesc }
+
+// ownPR reports whether the viewer authored this PR. GitHub forbids approving or
+// requesting changes on your own PR, so those actions are gated (and not
+// advertised) when this is true.
+func (m detailModel) ownPR() bool { return isMine(m.detail.Author) }
+
+// reviewKeys returns the footer fragment for the approve / request-changes review
+// actions — empty on your own PR, where GitHub disallows them.
+func (m detailModel) reviewKeys() string {
+	if m.ownPR() {
+		return ""
+	}
+	return " · a approve · x request-changes"
+}
+
+// capturingText reports whether raw keystrokes should reach a text field (either
+// the bottom composer or the full-screen description editor), so global shortcuts
+// like ? don't steal them.
+func (m detailModel) capturingText() bool { return m.composing() || m.editingDesc() }
+
 func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
+	// The full-screen description editor owns the whole screen and its own keys.
+	if m.editingDesc() {
+		switch msg.String() {
+		case "esc":
+			m.state = stateBrowsing
+			m.composer.Reset()
+			m.composer.Blur()
+			m.relayout() // restore the bottom composer's normal size
+			return m, nil
+		case "ctrl+s":
+			body := strings.TrimSpace(m.composer.Value())
+			m.composer.Reset()
+			m.composer.Blur()
+			m.relayout()
+			m.state = stateSubmitting
+			m.status = mutedStyle(m.th).Render("saving description…")
+			return m, doUpdatePRBody(m.owner, m.repo, m.number, body)
+		default:
+			var cmd tea.Cmd
+			m.composer, cmd = m.composer.Update(msg)
+			return m, cmd
+		}
+	}
+
 	// Composer states capture most keys.
 	if m.composing() {
 		switch msg.String() {
@@ -300,6 +420,7 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		case "ctrl+s":
 			body := strings.TrimSpace(m.composer.Value())
 			st := m.state
+			edit := m.editAnchor
 			m.composer.Reset()
 			m.composer.Blur()
 			m.state = stateSubmitting
@@ -312,6 +433,8 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 					m.anchorPath, m.anchorLine, m.anchorSide, body)
 			case stateReply:
 				return m, doReply(m.owner, m.repo, m.number, m.replyTo, body)
+			case stateEditComment:
+				return m, doEditComment(m.owner, m.repo, edit, body)
 			default:
 				return m, doReview(m.owner, m.repo, m.number, "REQUEST_CHANGES", body)
 			}
@@ -414,24 +537,46 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			return m.startLineComment("suggest")
 		}
 	case "r":
-		// Reply when a thread is in focus (conversation thread, or the cursor's
-		// diff line); otherwise refresh the PR — r=refresh, matching the dashboard.
-		if m.page == pageConversation && len(m.convThreads) > 0 {
-			return m.startConvReply()
+		// Reply to the block in focus: an inline thread threads a reply, a top-level
+		// comment/review adds a new conversation comment. Off a repliable block (or on
+		// the diff without a thread) r refreshes — matching the dashboard.
+		if a, ok := m.selectedAnchor(); ok && m.page == pageConversation && a.repliable() {
+			if a.replyID > 0 {
+				return m.startConvReply()
+			}
+			return m.startConvComment(a.author)
 		}
 		if m.page == pageDiff && m.focus == focusDiff && len(m.lineComments()) > 0 {
 			return m.startReply()
 		}
 		m.loading, m.refreshing = true, true
 		return m, loadPR(m.owner, m.repo, m.number, true)
+	case "e":
+		// Edit the block under the conversation cursor — your own only. The
+		// description opens a full-screen editor + preview; comments/reviews reuse the
+		// bottom composer.
+		if m.page == pageConversation {
+			return m.startEdit()
+		}
 	case "x":
+		// GitHub forbids reviewing your own PR, so don't even open the composer —
+		// warn instead of letting the submit fail after you have typed a reason.
+		if m.ownPR() {
+			return m, m.flashStatus(warnStyle(m.th).Render("you can't request changes on your own PR"))
+		}
 		m.state = stateReject
 		m.composer.Reset()
 		m.composer.Placeholder = "Reason for requesting changes…"
 		m.composer.Focus()
 		return m, textarea.Blink
 	case "a":
+		if m.ownPR() {
+			return m, m.flashStatus(warnStyle(m.th).Render("you can't approve your own PR"))
+		}
 		m.state = stateConfirmApprove
+		// A live confirm prompt (not auto-cleared); bump the seq so any pending
+		// auto-dismiss can't wipe it out from under the confirmation.
+		m.statusSeq++
 		m.status = warnStyle(m.th).Render(fmt.Sprintf("Approve PR #%d? y to confirm · any key cancels", m.number))
 		return m, nil
 	case "[", "p":
@@ -643,10 +788,8 @@ func (m detailModel) linkForSelection() (url, kind string) {
 		return "", ""
 	}
 	// Conversation page: the selected (n/N) inline thread.
-	if m.page == pageConversation && m.convCursor >= 0 && m.convCursor < len(m.convThreads) {
-		if id := m.convThreads[m.convCursor].id; id > 0 {
-			return commentPermalink(m.url, id), "comment"
-		}
+	if a, ok := m.selectedAnchor(); ok && m.page == pageConversation && a.replyID > 0 {
+		return commentPermalink(m.url, a.replyID), "comment"
 	}
 	// Diff page: an inline comment anchored to the cursor's line (the thread anchor).
 	if m.page == pageDiff {
@@ -798,15 +941,71 @@ func (m detailModel) startReply() (detailModel, tea.Cmd) {
 	return m, textarea.Blink
 }
 
-// startConvReply opens the composer to reply to the conversation thread under the
-// thread cursor (full-conversation view). No-op when nothing is selected.
-func (m detailModel) startConvReply() (detailModel, tea.Cmd) {
-	if m.convCursor < 0 || m.convCursor >= len(m.convThreads) {
-		m.status = mutedStyle(m.th).Render("no thread selected — press n/N to pick one")
-		return m, nil
+// startEdit opens an editor for the block under the conversation cursor — your
+// own only. The PR description gets the full-screen editor + live preview; a
+// comment or review body reuses the bottom composer, seeded with its current text.
+func (m detailModel) startEdit() (detailModel, tea.Cmd) {
+	a, ok := m.selectedAnchor()
+	if !ok {
+		return m, m.flashStatus(mutedStyle(m.th).Render("nothing selected — press n/N to pick a block"))
 	}
-	t := m.convThreads[m.convCursor]
-	m.replyTo = t.id
+	if !a.mine {
+		return m, m.flashStatus(warnStyle(m.th).Render("you can only edit your own " + editKindLabel(a.kind)))
+	}
+	m.editAnchor = a
+	if a.kind == gh.KindDescription {
+		m.state = stateEditDesc
+		m.composer.SetValue(a.body)
+		m.composer.Focus()
+		m.sizeDescEditor()
+		return m, textarea.Blink
+	}
+	m.state = stateEditComment
+	m.composer.SetValue(a.body)
+	m.composer.Placeholder = "Edit your " + editKindLabel(a.kind) + " (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
+}
+
+// editKindLabel names a block kind for edit prompts and messages.
+func editKindLabel(k gh.TimelineKind) string {
+	switch k {
+	case gh.KindDescription:
+		return "description"
+	case gh.KindReview:
+		return "review"
+	default:
+		return "comment"
+	}
+}
+
+// selectedAnchor returns the conversation block under the cursor, if any.
+func (m detailModel) selectedAnchor() (convAnchor, bool) {
+	if m.convCursor < 0 || m.convCursor >= len(m.convAnchors) {
+		return convAnchor{}, false
+	}
+	return m.convAnchors[m.convCursor], true
+}
+
+// startConvComment opens the composer to add a new top-level conversation comment,
+// framed as a reply to the selected block's author (GitHub has no threaded reply
+// for top-level comments, so this is just a new comment).
+func (m detailModel) startConvComment(author string) (detailModel, tea.Cmd) {
+	m.state = stateComment
+	m.composer.Reset()
+	m.composer.Placeholder = "Reply to " + author + " in the conversation (GitHub-flavored Markdown)…"
+	m.composer.Focus()
+	return m, textarea.Blink
+}
+
+// startConvReply opens the composer to reply to the inline thread under the
+// cursor (full-conversation view). Only inline threads are repliable.
+func (m detailModel) startConvReply() (detailModel, tea.Cmd) {
+	t, ok := m.selectedAnchor()
+	if !ok || t.replyID == 0 {
+		return m, m.flashStatus(mutedStyle(m.th).Render("that block isn't a repliable thread — pick an inline comment with n/N"))
+	}
+	m.replyTo = t.replyID
 	m.replyAuthor = t.author
 	m.state = stateReply
 	m.composer.Reset()
@@ -847,13 +1046,17 @@ const (
 	detailHeaderH = 3 // two info lines + a focus-colored rule
 	detailFooterH = 1
 	composerH     = 8 // textarea rows when the comment composer is open
+
+	// descEditorChromeH is the non-textarea rows in the description editor's left
+	// pane: headline, rule, blank, and the field label.
+	descEditorChromeH = 4
 )
 
 // bottomReserve is how many lines the bottom strip needs: a one-line footer
 // while browsing, or the taller composer (textarea + its title) while writing.
 func (m detailModel) bottomReserve() int {
 	switch m.state {
-	case stateComment, stateReject, stateLineComment, stateReply:
+	case stateComment, stateReject, stateLineComment, stateReply, stateEditComment:
 		return composerH + 1
 	}
 	return detailFooterH
@@ -918,6 +1121,22 @@ func (m *detailModel) relayout() {
 	m.convVP.Height = vpH
 	m.composer.SetWidth(m.width - 4)
 	m.composer.SetHeight(composerH)
+	if m.state == stateEditDesc {
+		m.sizeDescEditor() // the full-screen editor overrides the bottom-composer size
+	}
+}
+
+// sizeDescEditor sizes the shared composer to fill the left editor pane of the
+// full-screen description editor (the right pane is the live preview).
+func (m *detailModel) sizeDescEditor() {
+	editorW, _ := composeWidths(bodyWidth(m.width))
+	bodyH := m.height - detailHeaderH - 1 // header chrome + one-line footer hint
+	h := bodyH - descEditorChromeH        // editor headline + rule + blank + field label
+	if h < 3 {
+		h = 3
+	}
+	m.composer.SetWidth(editorW)
+	m.composer.SetHeight(h)
 }
 
 func (m *detailModel) refreshDiff() {
@@ -955,7 +1174,7 @@ func (m *detailModel) restyle(th theme.Theme) {
 	// Re-theme the composer and re-point its cached active-style pointer (via
 	// Focus/Blur) so a live toggle recolors the textarea too.
 	styleComposer(&m.composer, th)
-	if m.composing() {
+	if m.capturingText() {
 		m.composer.Focus()
 	} else {
 		m.composer.Blur()
@@ -972,34 +1191,34 @@ func (m *detailModel) restyle(th theme.Theme) {
 	m.renderConvContent()
 }
 
-// refreshConv re-renders the conversation, places the thread cursor on the first
-// repliable thread (if any), and scrolls to the top — a full reload.
+// refreshConv re-renders the conversation, places the cursor on the first block
+// (the description) if it isn't already on one, and scrolls to the top.
 func (m *detailModel) refreshConv() {
-	_, threads := m.renderConversation()
+	_, anchors := m.renderConversation()
 	switch {
-	case len(threads) == 0:
+	case len(anchors) == 0:
 		m.convCursor = -1
-	case m.convCursor < 0 || m.convCursor >= len(threads):
+	case m.convCursor < 0 || m.convCursor >= len(anchors):
 		m.convCursor = 0
 	}
 	m.renderConvContent()
 	m.convVP.GotoTop()
 }
 
-// renderConvContent rebuilds the conversation viewport content + thread index for
+// renderConvContent rebuilds the conversation viewport content + anchor index for
 // the current cursor, leaving scroll position untouched.
 func (m *detailModel) renderConvContent() {
-	content, threads := m.renderConversation()
-	m.convThreads = threads
+	content, anchors := m.renderConversation()
+	m.convAnchors = anchors
 	m.convVP.SetContent(content)
 }
 
-// moveConvThread steps the conversation thread cursor (dir +1/-1), re-renders to
-// move the highlight, and scrolls the selected thread into view.
+// moveConvThread steps the conversation cursor (dir +1/-1) across navigable blocks,
+// re-renders to move the highlight, and scrolls the selected block into view.
 func (m *detailModel) moveConvThread(dir int) {
-	n := len(m.convThreads)
+	n := len(m.convAnchors)
 	if n == 0 {
-		m.status = mutedStyle(m.th).Render("no inline threads to navigate")
+		m.status = mutedStyle(m.th).Render("nothing to navigate")
 		return
 	}
 	if m.convCursor < 0 {
@@ -1008,9 +1227,9 @@ func (m *detailModel) moveConvThread(dir int) {
 		m.convCursor = (m.convCursor + dir + n) % n
 	}
 	m.renderConvContent()
-	// Only scroll when the selected thread's header is outside the viewport —
+	// Only scroll when the selected block's header is outside the viewport —
 	// staying put when it's already visible (no jolt on a short hop).
-	row := m.convThreads[m.convCursor].row
+	row := m.convAnchors[m.convCursor].row
 	top := m.convVP.YOffset
 	bottom := top + m.convVP.Height - 1
 	if row < top || row > bottom {
@@ -1045,6 +1264,18 @@ func (m detailModel) View(spinner string) string {
 		return errStyle(m.th).Render(fmt.Sprintf("\n  failed to load PR #%d: %v\n\n  esc to go back", m.number, m.err))
 	}
 
+	// The description editor takes the whole body: editor left, live preview right.
+	if m.editingDesc() {
+		bodyH := m.height - detailHeaderH - 1
+		if bodyH < 3 {
+			bodyH = 3
+		}
+		hint := surfaceBar(m.th, m.width, lipgloss.NewStyle().Foreground(m.th.Muted).Padding(0, 1).
+			Render("ctrl+s save · esc cancel · GitHub-flavored Markdown"))
+		return lipgloss.JoinVertical(lipgloss.Left,
+			m.viewHeader(), indentBody(m.viewDescEditor(bodyH)), hint)
+	}
+
 	header := m.viewHeader()
 	var body string
 	if m.page == pageConversation {
@@ -1074,7 +1305,7 @@ func (m detailModel) viewConversation() string {
 // renderConversation builds the full-width thread. Reviews lead with their
 // summary; the inline comments left as part of that review are rendered indented
 // beneath it, each with the cited code shown above the comment.
-func (m detailModel) renderConversation() (string, []convThread) {
+func (m detailModel) renderConversation() (string, []convAnchor) {
 	w := m.convVP.Width
 	if w < 8 {
 		w = 8
@@ -1088,18 +1319,43 @@ func (m detailModel) renderConversation() (string, []convThread) {
 
 	entries := m.detail.Timeline()
 	var b strings.Builder
-	var threads []convThread
+	var anchors []convAnchor
 	row := 0
 	write := func(s string) { b.WriteString(s); row += strings.Count(s, "\n") }
-	// anchor records a repliable inline thread at the current row and reports
-	// whether it is the selected one (so its header gets the cursor bar).
-	anchor := func(e gh.TimelineEntry, startRow int) bool {
-		if e.DatabaseID == 0 {
-			return false
-		}
-		sel := len(threads) == m.convCursor
-		threads = append(threads, convThread{row: startRow, id: e.DatabaseID, author: e.Author})
+	// add records a navigable block at the current row and reports whether it is the
+	// selected one (so its header gets the cursor bar). The anchor's index is its
+	// position in the list, which is what n/N cycles through.
+	add := func(a convAnchor) bool {
+		a.row = row
+		a.mine = isMine(a.author)
+		sel := len(anchors) == m.convCursor
+		anchors = append(anchors, a)
 		return sel
+	}
+	// inlineAnchor is the anchor for a repliable inline comment (standalone or a
+	// review child): repliable and editable via its REST id.
+	inlineAnchor := func(e gh.TimelineEntry) convAnchor {
+		return convAnchor{author: e.Author, kind: e.Kind, replyID: e.DatabaseID, editID: e.DatabaseID, body: e.Body}
+	}
+	// writeThread renders an inline thread — its anchor comment then each threaded
+	// reply — registering every one as its own navigable anchor (so you can hunk
+	// onto and edit your own reply, not just the anchor). prefix indents the whole
+	// thread when it sits under a review.
+	writeThread := func(e gh.TimelineEntry, width int, prefix string) {
+		sel := add(inlineAnchor(e))
+		block := m.renderInlineComment(e, width, sel)
+		if prefix != "" {
+			block = indentBlock(block, prefix)
+		}
+		write(block + "\n")
+		for _, r := range e.Replies {
+			selR := add(convAnchor{author: r.Author, kind: gh.KindInline, replyID: r.DatabaseID, editID: r.DatabaseID, body: r.Body})
+			rblock := m.renderThreadReply(r.Author, r.Body, r.CreatedAt, width, selR)
+			if prefix != "" {
+				rblock = indentBlock(rblock, prefix)
+			}
+			write("\n" + rblock)
+		}
 	}
 
 	rule := mutedStyle(m.th).Render(strings.Repeat("─", tw))
@@ -1124,14 +1380,24 @@ func (m detailModel) renderConversation() (string, []convThread) {
 		}
 
 		// A standalone inline comment (not surfaced under a review) renders its own
-		// header + cited code + body.
+		// header + cited code + body, plus any threaded replies.
 		if e.Kind == gh.KindInline {
-			sel := anchor(e, row)
-			write(m.renderInlineComment(e, tw, sel) + "\n")
+			writeThread(e, tw, "")
 			continue
 		}
 
-		write(m.conversationHeader(e) + "\n")
+		// Description / top-level comment / review summary — each a navigable block.
+		var a convAnchor
+		switch e.Kind {
+		case gh.KindComment:
+			a = convAnchor{author: e.Author, kind: e.Kind, editID: e.DatabaseID, body: e.Body}
+		case gh.KindReview:
+			a = convAnchor{author: e.Author, kind: e.Kind, reviewID: e.ReviewID, body: e.Body}
+		default: // KindDescription
+			a = convAnchor{author: e.Author, kind: e.Kind, body: e.Body}
+		}
+		sel := add(a)
+		write(m.conversationHeader(e, sel, tw) + "\n")
 		body := strings.TrimSpace(e.Body)
 		switch {
 		case body != "":
@@ -1155,15 +1421,14 @@ func (m detailModel) renderConversation() (string, []convThread) {
 			rule := mutedStyle(m.th).Render(strings.Repeat("─", tw))
 			for _, ch := range e.Children {
 				write("\n" + rule + "\n\n")
-				sel := anchor(ch, row)
-				write(indentBlock(m.renderInlineComment(ch, childW, sel), prefix) + "\n")
+				writeThread(ch, childW, prefix)
 			}
 		}
 	}
 	if len(entries) <= 1 && strings.TrimSpace(m.detail.Body) == "" {
 		return mutedStyle(m.th).Render("No conversation yet. Press c to comment."), nil
 	}
-	return b.String(), threads
+	return b.String(), anchors
 }
 
 // renderCommitRow is the compact one-line timeline row for a pushed commit:
@@ -1236,12 +1501,8 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 	} else {
 		b.WriteString(renderMarkdown(body, w, m.th))
 	}
-
-	// Threaded replies render beneath the anchor with a deeper guide and no
-	// citation — they share the anchor's code location, so re-citing it is noise.
-	for _, r := range e.Replies {
-		b.WriteString("\n" + m.renderThreadReply(r.Author, r.Body, r.CreatedAt, w))
-	}
+	// Threaded replies are rendered (and anchored) by the caller so each is its own
+	// navigable block; the anchor here is just its head comment.
 	return b.String()
 }
 
@@ -1255,7 +1516,7 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 // guide pipe lands exactly on it (│ and ╰ are both centered in their cell, where an
 // arrow glyph's stem sits left-of-centre and never quite lines up). The guide sits
 // one row above each reply, threading it to the comment above.
-func (m detailModel) renderThreadReply(author, body string, when time.Time, w int) string {
+func (m detailModel) renderThreadReply(author, body string, when time.Time, w int, selected bool) string {
 	marker := mutedStyle(m.th).Render("    ╰→ ")
 	guide := mutedStyle(m.th).Render("    │")
 	cont := "       "
@@ -1263,14 +1524,21 @@ func (m detailModel) renderThreadReply(author, body string, when time.Time, w in
 	if replyW < 8 {
 		replyW = 8
 	}
-	header := infoStyle(m.th).Bold(true).Render("@"+author) + mutedStyle(m.th).Render(" · "+relTime(when))
+	headerLine := indentBlock(infoStyle(m.th).Bold(true).Render("@"+author)+mutedStyle(m.th).Render(" · "+relTime(when)), marker)
+	if selected {
+		// Same primary-on-surface cursor bar as an anchor, so a reply reads as
+		// selectable too — with the ╰→ preserved so it still nests visually.
+		plain := fmt.Sprintf("    ╰→ %s @%s · %s", focusGlyph, author, relTime(when))
+		headerLine = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+			Bold(true).Width(w).Render(plain)
+	}
 	rbody := strings.TrimSpace(body)
 	if rbody == "" {
 		rbody = mutedStyle(m.th).Render("(no message)")
 	} else {
 		rbody = renderMarkdown(rbody, replyW, m.th)
 	}
-	return guide + "\n" + indentBlock(header, marker) + "\n" + indentBlock(rbody, cont)
+	return guide + "\n" + headerLine + "\n" + indentBlock(rbody, cont)
 }
 
 // citeLine is one line of a code citation: its file line number on the comment's
@@ -1413,7 +1681,23 @@ func indentBlock(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m detailModel) conversationHeader(e gh.TimelineEntry) string {
+func (m detailModel) conversationHeader(e gh.TimelineEntry, selected bool, w int) string {
+	// The selected block wears a full-width primary-on-surface bar (same cursor as
+	// an inline thread), with a leading glyph, so n/N selection is unmistakable.
+	if selected {
+		var what string
+		switch e.Kind {
+		case gh.KindDescription:
+			what = "opened this PR"
+		case gh.KindReview:
+			what = reviewStateWord(e.State)
+		default:
+			what = "commented"
+		}
+		plain := fmt.Sprintf("%s @%s %s · %s", focusGlyph, e.Author, what, relTime(e.CreatedAt))
+		return lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+			Bold(true).Width(w).Render(plain)
+	}
 	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)
 	when := mutedStyle(m.th).Render(relTime(e.CreatedAt))
 	switch e.Kind {
@@ -1426,6 +1710,21 @@ func (m detailModel) conversationHeader(e gh.TimelineEntry) string {
 		return who + " " + loc + " · " + when
 	default:
 		return who + " " + mutedStyle(m.th).Render("commented · "+relTime(e.CreatedAt))
+	}
+}
+
+// reviewStateWord is a short plain-text phrase for a review state, for the
+// selection bar (which can't carry the colored reviewBadge).
+func reviewStateWord(state string) string {
+	switch state {
+	case "APPROVED":
+		return "approved"
+	case "CHANGES_REQUESTED":
+		return "requested changes"
+	case "DISMISSED":
+		return "review dismissed"
+	default:
+		return "reviewed"
 	}
 }
 
@@ -1595,7 +1894,7 @@ func (m detailModel) renderInfo() string {
 				b.WriteString(renderMarkdown(c.Body, m.infoVP.Width, m.th) + "\n")
 				continue
 			}
-			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width) + "\n")
+			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width, false) + "\n")
 		}
 		b.WriteString("\n")
 		b.WriteString(mutedStyle(m.th).Render("r reply · y copy link · c new comment · v full conversation") + "\n")
@@ -1676,9 +1975,42 @@ func (m detailModel) viewComposer() string {
 		title = fmt.Sprintf("Comment on %s:%d", shortRepo(m.anchorPath), m.anchorLine)
 	case stateReply:
 		title = "Reply to " + m.replyAuthor
+	case stateEditComment:
+		title = "Edit your " + editKindLabel(m.editAnchor.kind)
 	}
 	head := warnStyle(m.th).Render(title) + mutedStyle(m.th).Render("   ctrl+s submit · esc cancel")
 	return lipgloss.JoinVertical(lipgloss.Left, head, m.composer.View())
+}
+
+// viewDescEditor draws the full-screen description editor: the Markdown editor on
+// the left, a live rendered preview on the right — mirroring the propose-PR
+// composer, minus the title field (a PR's title is edited elsewhere).
+func (m detailModel) viewDescEditor(h int) string {
+	w := bodyWidth(m.width)
+	editorW, previewW := composeWidths(w)
+
+	headline := lipgloss.NewStyle().Foreground(m.th.Primary).Bold(true).
+		Render(fmt.Sprintf("edit description · #%d", m.number))
+	rule := lipgloss.NewStyle().Foreground(m.th.Focus).Render(strings.Repeat("─", editorW))
+	editor := lipgloss.JoinVertical(lipgloss.Left,
+		headline, rule, "",
+		fieldLabel(m.th, "Description — Markdown", true),
+		m.composer.View(),
+	)
+	editorPane := lipgloss.NewStyle().Width(editorW).Height(h).Render(editor)
+
+	pvHead := lipgloss.NewStyle().Foreground(m.th.Muted).Render("Preview")
+	pvRule := lipgloss.NewStyle().Foreground(m.th.Overlay).Render(strings.Repeat("─", previewW))
+	var pvBody string
+	if strings.TrimSpace(m.composer.Value()) == "" {
+		pvBody = mutedStyle(m.th).Render("(nothing to preview yet — write a\ndescription on the left)")
+	} else {
+		pvBody = renderMarkdown(m.composer.Value(), previewW-1, m.th)
+	}
+	preview := lipgloss.JoinVertical(lipgloss.Left, pvHead, pvRule, "", pvBody)
+	previewPane := lipgloss.NewStyle().Width(previewW).Height(h).Render(preview)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, editorPane, stackVBar(m.th, h), previewPane)
 }
 
 func (m detailModel) viewFooter() string {
@@ -1689,12 +2021,21 @@ func (m detailModel) viewFooter() string {
 	var help string
 	switch {
 	case m.page == pageConversation:
-		// r replies when a thread is selected, else it refreshes.
-		rk := " · r refresh"
-		if len(m.convThreads) > 0 {
-			rk = " · n/N thread · r reply · y copy link"
+		// n/N walks every block; the block-specific actions (reply on an inline
+		// thread, edit on one of your own blocks) show only when they apply.
+		nav := " · n/N block"
+		if a, ok := m.selectedAnchor(); ok {
+			switch {
+			case a.replyID > 0:
+				nav += " · r reply · y copy link"
+			case a.repliable():
+				nav += " · r reply"
+			}
+			if a.mine {
+				nav += " · e edit"
+			}
 		}
-		help = "↑/↓ scroll" + rk + " · c comment · a approve · x request-changes · o open · v/d/esc close"
+		help = "↑/↓ scroll" + nav + " · c comment" + m.reviewKeys() + " · o open · v/d/esc close"
 	case m.focus == focusDiff:
 		// On the diff, c/s act on the cursor line; r replies when it has a thread,
 		// otherwise r refreshes.
@@ -1703,9 +2044,9 @@ func (m detailModel) viewFooter() string {
 			rk = " · r reply · y copy link"
 		}
 		help = "↑/↓ line · ^d/^u page · g/G top/end · n/N change · c comment line · S suggest" + rk +
-			" · s/i files/panel · ←/→ focus · v conversation · a approve · o open · esc back"
+			" · s/i files/panel · ←/→ focus · v conversation" + m.reviewKeys() + " · o open · esc back"
 	default:
-		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · s/i files/panel · v conversation · c comment · a approve · x changes · o open · r refresh · esc back"
+		help = "←/→ focus · ↑/↓ move · [ ] file · n/N change · s/i files/panel · v conversation · c comment" + m.reviewKeys() + " · o open · r refresh · esc back"
 	}
 	return surfaceBar(m.th, m.width,
 		lipgloss.NewStyle().Width(m.width).Foreground(m.th.Muted).Padding(0, 1).

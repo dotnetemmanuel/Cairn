@@ -944,7 +944,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Open help on ? — unless a text field is capturing input, where ? is a
 		// literal character.
-		capturing := (m.mode == modeDetail && m.detail.composing()) ||
+		capturing := (m.mode == modeDetail && m.detail.capturingText()) ||
 			(m.mode == modeStack && m.stackMode.capturing()) ||
 			(m.mode == modeConflict && m.conflict.capturing())
 		if msg.String() == "?" && !capturing {
@@ -1996,10 +1996,18 @@ func (m Model) viewFooter() string {
 				whyMark("comment", "comment"), whyMark("author", "authored"), whyMark("assign", "assigned")),
 		}, groupSep)
 	} else {
+		// Sample of how your own PRs read in a mixed list: your login tinted green in
+		// the author column (matches itemDelegate.Render).
+		mineName := "you"
+		if viewerLogin != "" {
+			mineName = viewerLogin
+		}
+		mineSample := lipgloss.NewStyle().Foreground(m.th.Success).Render("@"+mineName) + dim.Render(" your PR")
 		legend = strings.Join([]string{
 			group("CHECKS", mark(m.th.Success, "●", "passing"), mark(m.th.Danger, "●", "failing"), mark(m.th.Muted, "○", "none")),
 			group("REVIEW", diamond, mark(m.th.Success, "✓", "approved"), mark(m.th.Danger, "✗", "changes"), mark(m.th.Muted, "◇", "others")),
 			group("STATE", mark(m.th.Primary, "●", "merged"), mark(m.th.Muted, "●", "closed")),
+			group("AUTHOR", mineSample),
 		}, groupSep)
 	}
 
