@@ -857,21 +857,38 @@ query($owner:String!,$repo:String!,$cursor:String){
   repository(owner:$owner,name:$repo){
     pullRequests(states:OPEN,first:100,after:$cursor){
       pageInfo{hasNextPage endCursor}
-      nodes{number headRefName isDraft mergeable reviewDecision}
+      nodes{number headRefName baseRefName isDraft mergeable reviewDecision}
     }
   }
 }`
 
-// OpenPRsByBranch maps each open PR's head branch to its landing readiness via
-// GraphQL (Hard Rule 3). It supersedes OpenPRNumbersByBranch for the stack screen:
-// one query yields both the #N flags AND the mergeable/draft/review state the ship
-// gating needs. Identically-headed PRs keep the first seen; it paginates fully.
-func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
+// OpenPR is one open pull request's head/base (for reconstructing the remote
+// stack tree) plus its landing readiness (for ship gating) — everything remote
+// stack mode needs from one GraphQL query.
+type OpenPR struct {
+	Number         int
+	Head           string
+	Base           string
+	Draft          bool
+	Mergeable      string
+	ReviewDecision string
+}
+
+// Mergeability projects an OpenPR onto the readiness view used by the ship gate.
+func (p OpenPR) Mergeability() PRMergeability {
+	return PRMergeability{Number: p.Number, Draft: p.Draft, Mergeable: p.Mergeable, ReviewDecision: p.ReviewDecision}
+}
+
+// OpenPRs lists a repo's open pull requests with head/base and landing readiness
+// via GraphQL (Hard Rule 3), paginating fully. It backs both the #N/mergeability
+// map (OpenPRsByBranch) and the remote stack-tree reconstruction, so one fetch
+// serves the whole remote stack screen.
+func OpenPRs(owner, repo string) ([]OpenPR, error) {
 	client, err := graphQLClient()
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]PRMergeability{}
+	var out []OpenPR
 	var cursor *string
 	for {
 		var resp struct {
@@ -884,6 +901,7 @@ func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
 					Nodes []struct {
 						Number         int
 						HeadRefName    string
+						BaseRefName    string
 						IsDraft        bool
 						Mergeable      string
 						ReviewDecision string
@@ -899,13 +917,10 @@ func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
 			return out, err
 		}
 		for _, n := range resp.Repository.PullRequests.Nodes {
-			if _, seen := out[n.HeadRefName]; seen {
-				continue
-			}
-			out[n.HeadRefName] = PRMergeability{
-				Number: n.Number, Draft: n.IsDraft,
-				Mergeable: n.Mergeable, ReviewDecision: n.ReviewDecision,
-			}
+			out = append(out, OpenPR{
+				Number: n.Number, Head: n.HeadRefName, Base: n.BaseRefName,
+				Draft: n.IsDraft, Mergeable: n.Mergeable, ReviewDecision: n.ReviewDecision,
+			})
 		}
 		pi := resp.Repository.PullRequests.PageInfo
 		if !pi.HasNextPage {
@@ -913,6 +928,68 @@ func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
 		}
 		end := pi.EndCursor
 		cursor = &end
+	}
+	return out, nil
+}
+
+// OpenPRsByBranch maps each open PR's head branch to its landing readiness. One
+// query yields both the #N flags AND the mergeable/draft/review state the ship
+// gating needs. Identically-headed PRs keep the first seen.
+func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
+	prs, err := OpenPRs(owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]PRMergeability, len(prs))
+	for _, p := range prs {
+		if _, seen := out[p.Head]; seen {
+			continue
+		}
+		out[p.Head] = p.Mergeability()
+	}
+	return out, nil
+}
+
+// PRLanding records that a branch's most recent pull request has left the open
+// state — merged (shipped) or closed (abandoned) on the remote — while the local
+// stack still carries the branch. It is the drift signal local stack mode uses to
+// warn that the working copy is stale after someone lands the stack remotely (or a
+// merge happens via the GitHub UI). Number is that PR.
+type PRLanding struct {
+	Number int
+	Merged bool // true = merged (landed); false = closed without merging
+}
+
+// LandedPRsByBranch reports, for each head branch, whether its most recent PR has
+// left the open state — merged or closed — the drift signal for local stack mode.
+// Branches whose latest PR is still open, or that never had a PR, are omitted, so
+// the returned map holds only drifted branches. One REST call per branch (stacks
+// are small); a per-branch error skips that branch rather than failing the batch.
+func LandedPRsByBranch(owner, repo string, branches []string) (map[string]PRLanding, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]PRLanding{}
+	for _, b := range branches {
+		if b == "" {
+			continue
+		}
+		var prs []struct {
+			Number   int        `json:"number"`
+			State    string     `json:"state"`
+			MergedAt *time.Time `json:"merged_at"`
+		}
+		// state=all, newest-updated first, one result: the branch's latest PR, so a
+		// reopened-then-merged history reads as merged (its current state).
+		path := fmt.Sprintf("repos/%s/%s/pulls?head=%s:%s&state=all&sort=updated&direction=desc&per_page=1", owner, repo, owner, b)
+		if err := client.Get(path, &prs); err != nil {
+			continue // best-effort: a lookup failure just leaves this branch unflagged
+		}
+		if len(prs) == 0 || prs[0].State == "open" {
+			continue
+		}
+		out[b] = PRLanding{Number: prs[0].Number, Merged: prs[0].MergedAt != nil}
 	}
 	return out, nil
 }

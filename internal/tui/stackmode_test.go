@@ -162,9 +162,11 @@ func TestShipChainBottomUp(t *testing.T) {
 		branch string
 		want   string
 	}{
+		// "Whole stack" is the whole stack from ANY branch in it, bottom-up — not
+		// bounded by where HEAD sits (a blocker still halts the run at merge time).
 		{"feat-top", "feat-base,feat-mid,feat-top"},
-		{"feat-mid", "feat-base,feat-mid"},
-		{"feat-base", "feat-base"},
+		{"feat-mid", "feat-base,feat-mid,feat-top"},
+		{"feat-base", "feat-base,feat-mid,feat-top"},
 		{"main", ""},           // trunk has no chain
 		{"unknown-branch", ""}, // off-stack
 	}
@@ -1056,5 +1058,113 @@ func TestTreeFocusBlocksActionAccelerators(t *testing.T) {
 	s.focus = focusActions
 	if s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); s2.phase != stackNaming {
 		t.Errorf("n with the action list focused should start naming, got phase %d", s2.phase)
+	}
+}
+
+// --- Component B: remote drift detection + reconcile ---
+
+func TestRemoteDriftSplitsMergedAndClosed(t *testing.T) {
+	s := fixtureModel()
+	s.drift = map[string]gh.PRLanding{
+		"feat-base": {Number: 12, Merged: true},
+		"feat-mid":  {Number: 14, Merged: false}, // closed without merging
+	}
+	merged, closed := s.remoteDrift()
+	if len(merged) != 1 || merged[0] != "feat-base" {
+		t.Errorf("merged = %v, want [feat-base]", merged)
+	}
+	if len(closed) != 1 || closed[0] != "feat-mid" {
+		t.Errorf("closed = %v, want [feat-mid]", closed)
+	}
+	if !s.hasRemoteDrift() {
+		t.Error("hasRemoteDrift should be true when a branch drifted")
+	}
+	// The trunk never counts as drift, and a branch not in the tree is ignored.
+	s.drift = map[string]gh.PRLanding{"main": {Number: 1, Merged: true}, "ghost": {Number: 2, Merged: true}}
+	if s.hasRemoteDrift() {
+		t.Error("trunk and unknown branches must not register as drift")
+	}
+}
+
+func TestDriftMsgSetsAndClears(t *testing.T) {
+	s := fixtureModel()
+	s2, _ := s.Update(stackDriftMsg{drift: map[string]gh.PRLanding{"feat-base": {Number: 12, Merged: true}}})
+	if !s2.hasRemoteDrift() {
+		t.Error("a drift msg should populate the drift map")
+	}
+	// An empty refetch (post-reconcile) clears the stale warning.
+	s3, _ := s2.Update(stackDriftMsg{})
+	if s3.hasRemoteDrift() {
+		t.Error("an empty drift msg should clear the drift map")
+	}
+}
+
+func TestDriftBannerNamesBranchAndPR(t *testing.T) {
+	s := fixtureModel()
+	s.focus = focusActions
+	s.drift = map[string]gh.PRLanding{"feat-base": {Number: 12, Merged: true}}
+	out := ansi.Strip(s.renderActions(80))
+	if !strings.Contains(out, "feat-base (PR #12)") {
+		t.Errorf("drift banner should name the branch and its PR, got:\n%s", out)
+	}
+	if !strings.Contains(out, "merged on the remote") || !strings.Contains(out, "Press X to reconcile") {
+		t.Errorf("drift banner should explain the drift and point at X, got:\n%s", out)
+	}
+}
+
+func TestReconcileKeyGatedOnDrift(t *testing.T) {
+	key := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+	s := fixtureModel()
+	// No drift → X is inert.
+	if s2, _ := s.updateBrowsing(key("X")); s2.phase != stackBrowsing {
+		t.Errorf("X must be inert without drift, got phase %d", s2.phase)
+	}
+	// Drift present → X opens the reconcile confirmation.
+	s.drift = map[string]gh.PRLanding{"feat-base": {Number: 12, Merged: true}}
+	s2, _ := s.updateBrowsing(key("X"))
+	if s2.phase != stackConfirming || s2.pending.Verb != "reconcile" {
+		t.Errorf("X should open the reconcile confirm, got phase=%d verb=%q", s2.phase, s2.pending.Verb)
+	}
+}
+
+func TestReconcileConfirmExplainsAndRuns(t *testing.T) {
+	s := fixtureModel()
+	s.drift = map[string]gh.PRLanding{"feat-base": {Number: 12, Merged: true}}
+	s2, _ := s.startReconcile()
+	if s2.phase != stackConfirming || s2.pending.Verb != "reconcile" {
+		t.Fatalf("startReconcile: phase=%d verb=%q", s2.phase, s2.pending.Verb)
+	}
+	out := ansi.Strip(s2.renderConfirm(80))
+	if !strings.Contains(out, "feat-base") || !strings.Contains(out, "merged remotely") {
+		t.Errorf("reconcile confirm should name the merged branch it drops, got:\n%s", out)
+	}
+	// Enter runs it → running phase with a live command.
+	s3, cmd := s2.updateConfirming(tea.KeyMsg{Type: tea.KeyEnter})
+	if s3.phase != stackRunning || cmd == nil {
+		t.Errorf("enter should run reconcile: phase=%d cmd=%v", s3.phase, cmd != nil)
+	}
+}
+
+func TestGhostBranchFunnelsToReconcile(t *testing.T) {
+	s := fixtureModel() // current = feat-mid
+	s.status.Staged = 2 // so amend isn't disabled for the ordinary reason
+	// Current branch itself merged remotely = a ghost: create/maintain verbs funnel
+	// to reconcile.
+	s.drift = map[string]gh.PRLanding{"feat-mid": {Number: 9, Merged: true}}
+	for _, verb := range []string{"new", "insert", "amend", "restack", "sync"} {
+		c := townie.Command{Verb: verb}
+		if s.actionEnabled(c) {
+			t.Errorf("%s must be disabled on a ghost (merged) current branch", verb)
+		}
+		if r := s.actionDisabledReason(c); !strings.Contains(r, "reconcile (X)") {
+			t.Errorf("%s reason on a ghost branch = %q, want it to point at reconcile", verb, r)
+		}
+	}
+	// On a LIVE current branch (no drift), the same verbs stay enabled.
+	s.drift = nil
+	for _, verb := range []string{"new", "insert", "restack", "sync"} {
+		if !s.actionEnabled(townie.Command{Verb: verb}) {
+			t.Errorf("%s should be enabled on a live branch", verb)
+		}
 	}
 }
