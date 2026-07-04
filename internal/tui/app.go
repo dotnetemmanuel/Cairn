@@ -1172,8 +1172,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stackMode = newStackModel(m.th, m.localRepo)
 			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			m.mode = modeStack
-			// Load the open-PR flags for the local tree (branch → #number).
-			return m, fetchStackPRNums(m.localRepo)
+			// Load the open-PR flags for the local tree (branch → #number), and check
+			// whether any stack branch was landed/closed on the remote (drift → offer a
+			// reconcile). driftCmd is nil (skipped by Batch) when there's no tree.
+			return m, tea.Batch(fetchStackPRNums(m.localRepo), m.stackMode.driftCmd())
 		case "o":
 			// Flip the PR-list ordering: default newest-updated ↔ grouped by repo.
 			// Global (every tab reorders together, so scanning stays consistent as you

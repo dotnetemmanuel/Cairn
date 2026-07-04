@@ -89,6 +89,11 @@ type stackModel struct {
 	// alongside prNums so ship / merge-whole-stack can be dimmed-and-explained when
 	// a PR can't land, and the ship-stack confirmation can annotate each branch.
 	prMerge map[string]gh.PRMergeability
+	// drift is branch -> remote landing state for stack branches whose PR is no
+	// longer open (merged or closed) — the signal that someone landed/closed part
+	// of this stack on the remote (a teammate ship, a GitHub-UI merge) while the
+	// local tree still carries it. Drives the "reconcile with remote" affordance.
+	drift map[string]gh.PRLanding
 
 	ops    townie.Ops
 	output string
@@ -553,6 +558,12 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 		}
 		return s, nil
 
+	case stackDriftMsg:
+		// Always assign (even nil): a refetch that finds nothing clears a stale
+		// warning after a reconcile brought local back in step with the remote.
+		s.drift = msg.drift
+		return s, nil
+
 	case stackStreamMsg:
 		if msg.ev.Done {
 			s.runErr = msg.ev.Err
@@ -564,8 +575,8 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 				return s, func() tea.Msg { return enterConflictMsg{dir: "", gitTown: true} }
 			}
 			// Refresh the tree's PR flags — a propose just added one; a ship/sync may
-			// have removed one.
-			return s, fetchStackPRNums(s.repo)
+			// have removed one — and re-check remote drift (a reconcile clears it).
+			return s, tea.Batch(fetchStackPRNums(s.repo), s.driftCmd())
 		}
 		// Append the line as it streams in; keep reading the next.
 		if s.output != "" {
@@ -612,12 +623,20 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		// checkout/commit in another terminal) show without leaving stack mode.
 		// Also refresh the PR flags so a PR opened elsewhere shows its #N.
 		s.reload()
-		return s, fetchStackPRNums(s.repo)
+		return s, tea.Batch(fetchStackPRNums(s.repo), s.driftCmd())
 	case "t":
 		// Add the current (untracked) branch to the stack under the trunk. Inert
 		// otherwise (only meaningful when the branch has no recorded parent).
 		if s.currentUntracked() {
 			return s.runTrack()
+		}
+		return s, nil
+	case "X":
+		// Reconcile the local tree with the remote when part of the stack was landed
+		// or closed there. Handled before the focus gate (like t) so it works from
+		// either pane; inert when nothing has drifted.
+		if s.hasRemoteDrift() {
+			return s.startReconcile()
 		}
 		return s, nil
 	case "tab", "shift+tab", "h", "l", "left", "right":
@@ -1073,6 +1092,72 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 	return ch
 }
 
+// startReconcile opens the explained confirmation for reconciling the local tree
+// with the remote — the drift-detected counterpart to ship's cleanup.
+func (s stackModel) startReconcile() (stackModel, tea.Cmd) {
+	s.pending = reconcileCommand()
+	s.name.SetValue("")
+	s.affected = nil
+	s.phase = stackConfirming
+	return s, nil
+}
+
+// runReconcile brings the local stack back in step with the remote: a stack sync
+// (pull trunk, rebase survivors, drop merged branches) followed by cleanup of any
+// merged branch still checked out — exactly ship's local tail, run on demand when
+// the drift check finds branches that landed/closed remotely.
+func (s stackModel) runReconcile() (stackModel, tea.Cmd) {
+	s.phase = stackRunning
+	s.pending = reconcileCommand()
+	s.opName = ""
+	s.output = ""
+	trunk := ""
+	if s.tree != nil && s.tree.Root != nil {
+		trunk = s.tree.Root.Name
+	}
+	merged, _ := s.remoteDrift()
+	ops := s.ops
+	m := append([]string(nil), merged...) // snapshot; the model is a value copy
+	return s, func() tea.Msg {
+		return readStream(reconcileStream(trunk, m, ops))
+	}
+}
+
+// reconcileStream syncs the stack, then removes any merged branch git-town's sync
+// couldn't delete because it was checked out — forwarding output. A sync failure
+// stops with its error (a conflict routes to the resolver, like the other ops).
+func reconcileStream(trunk string, merged []string, ops townie.Ops) <-chan townie.StreamEvent {
+	ch := make(chan townie.StreamEvent, 64)
+	go func() {
+		defer close(ch)
+		ch <- townie.StreamEvent{Line: "Syncing the stack (pull trunk, rebase, drop merged branches)…"}
+		for ev := range ops.Stream("sync", "") {
+			if ev.Done {
+				if ev.Err != nil {
+					ch <- townie.StreamEvent{Done: true, Err: ev.Err}
+					return
+				}
+				break
+			}
+			ch <- ev
+		}
+		// sync deletes merged-remote branches it isn't sitting on; a merged branch you
+		// were checked out on lingers (git can't delete HEAD) — hop to trunk, remove it.
+		for ev := range ops.RemoveMergedLocal(trunk, merged) {
+			if ev.Done {
+				if ev.Err != nil {
+					ch <- townie.StreamEvent{Line: "  (cleanup: " + ev.Err.Error() + ")"}
+				}
+				break
+			}
+			ch <- ev
+		}
+		ch <- townie.StreamEvent{Line: "✓ Local stack is back in step with the remote."}
+		ch <- townie.StreamEvent{Done: true}
+	}()
+	return ch
+}
+
 // --- propose (open a PR) flow ---
 
 // proposeTarget is the branch the propose action acts on: the one under the tree
@@ -1325,6 +1410,115 @@ func fetchStackPRNums(repo string) tea.Cmd {
 	}
 }
 
+// stackDriftMsg carries the branch→remote-landing map: the stack branches whose
+// PR is merged or closed on the remote, so local stack mode can warn the tree is
+// stale and offer to reconcile.
+type stackDriftMsg struct {
+	drift map[string]gh.PRLanding
+}
+
+// fetchStackDrift checks whether any of the local stack's branches were landed or
+// closed on the remote (a teammate ship, a GitHub-UI merge) — one lookup per
+// branch. Best-effort: a failure leaves the drift map empty (no false warning).
+func fetchStackDrift(repo string, branches []string) tea.Cmd {
+	return func() tea.Msg {
+		owner, name, ok := gh.SplitRepo(repo)
+		if !ok || len(branches) == 0 {
+			return stackDriftMsg{}
+		}
+		d, _ := gh.LandedPRsByBranch(owner, name, branches)
+		return stackDriftMsg{drift: d}
+	}
+}
+
+// trackedFeatureBranches lists the stack's tracked, non-trunk branches — the ones
+// whose remote landing state the drift check looks up. nil without a tree.
+func (s stackModel) trackedFeatureBranches() []string {
+	if s.tree == nil {
+		return nil
+	}
+	var out []string
+	for _, n := range s.tree.Order {
+		if !n.IsTrunk {
+			out = append(out, n.Name)
+		}
+	}
+	return out
+}
+
+// driftCmd builds the drift-refetch command for the current tree, or nil when
+// there are no branches to check. Fired on entry, on refresh, and after any op.
+func (s stackModel) driftCmd() tea.Cmd {
+	br := s.trackedFeatureBranches()
+	if len(br) == 0 {
+		return nil
+	}
+	return fetchStackDrift(s.repo, br)
+}
+
+// remoteDrift splits the tracked, non-trunk branches whose PR has left the open
+// state (from the drift fetch) into those that MERGED and those that were CLOSED
+// without merging — the stale branches a reconcile brings the local tree in line
+// with. Both empty when nothing has drifted.
+func (s stackModel) remoteDrift() (merged, closed []string) {
+	if s.tree == nil || len(s.drift) == 0 {
+		return nil, nil
+	}
+	for _, n := range s.tree.Order {
+		if n.IsTrunk {
+			continue
+		}
+		d, ok := s.drift[n.Name]
+		if !ok {
+			continue
+		}
+		if d.Merged {
+			merged = append(merged, n.Name)
+		} else {
+			closed = append(closed, n.Name)
+		}
+	}
+	return merged, closed
+}
+
+// hasRemoteDrift reports whether any stack branch was landed or closed remotely —
+// the gate for the reconcile affordance (key X, the drift banner).
+func (s stackModel) hasRemoteDrift() bool {
+	m, c := s.remoteDrift()
+	return len(m)+len(c) > 0
+}
+
+// driftLabel annotates each drifted branch with its PR number (from the drift
+// fetch, since a merged/closed branch is gone from the open-PR map), so the
+// warning reads "feat-a (PR #12)" and cross-references GitHub.
+func (s stackModel) driftLabel(branches []string) []string {
+	out := make([]string, 0, len(branches))
+	for _, b := range branches {
+		if d, ok := s.drift[b]; ok && d.Number > 0 {
+			out = append(out, fmt.Sprintf("%s (PR #%d)", b, d.Number))
+		} else {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// reconcileCommand is the synthetic command behind the "reconcile with remote"
+// affordance — contextual (shown only when a stack branch landed/closed remotely),
+// so it's not in townie.Catalog(), but it routes through the confirm → run flow.
+func reconcileCommand() townie.Command {
+	return townie.Command{
+		Verb: "reconcile", Title: "reconcile with remote", Mutates: true,
+		Short: "sync the local stack with what landed on the remote",
+		Long: "Part of this stack was landed or closed on GitHub (a teammate shipped " +
+			"it, or you merged from the web), so your local git-town tree is out of " +
+			"date. This runs a stack sync — pulls the latest trunk, rebases the " +
+			"surviving branches onto it, and drops the branches whose PRs merged — then " +
+			"cleans up any merged branch you are still sitting on, leaving local and " +
+			"remote back in step. Nothing new is pushed or merged.",
+	}
+}
+
 func (s stackModel) updateNaming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -1381,6 +1575,10 @@ func (s stackModel) updateConfirming(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		// ready marks the tree-cursor branch's draft PR ready (via gh).
 		if s.pending.Verb == "ready" {
 			return s.runReady(s.opName)
+		}
+		// reconcile syncs the local tree with what landed remotely (gh-detected drift).
+		if s.pending.Verb == "reconcile" {
+			return s.runReconcile()
 		}
 		return s.runOp(s.pending.Verb, strings.TrimSpace(s.name.Value()), s.pending.Title)
 	}
@@ -1675,6 +1873,34 @@ func (s stackModel) renderActions(w int) string {
 		return colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, strings.Join(lines, "\n"), s.allBranchNames())
 	}
 	var banners []string
+	// Remote drift is the most urgent thing to surface: branches in this stack were
+	// landed or closed on the remote (a teammate shipped, or a GitHub-UI merge) and
+	// the local tree is now stale. Name each with its PR number and point at the
+	// one-key reconcile that brings local back in step.
+	if merged, closed := s.remoteDrift(); len(merged)+len(closed) > 0 {
+		trunk := "the trunk"
+		if s.tree != nil && s.tree.Root != nil {
+			trunk = s.tree.Root.Name
+		}
+		var clauses []string
+		if len(merged) > 0 {
+			was := "was"
+			if len(merged) > 1 {
+				was = "were"
+			}
+			clauses = append(clauses, fmt.Sprintf("%s %s merged on the remote", humanList(s.driftLabel(merged)), was))
+		}
+		if len(closed) > 0 {
+			was := "was"
+			if len(closed) > 1 {
+				was = "were"
+			}
+			clauses = append(clauses, fmt.Sprintf("%s %s closed on the remote", humanList(s.driftLabel(closed)), was))
+		}
+		banners = append(banners, warn(fmt.Sprintf(
+			"⚠ %s — your local stack is out of date. Press X to reconcile (sync the stack, drop merged branches, pull %s).",
+			strings.Join(clauses, ", and "), trunk)))
+	}
 	if s.currentUntracked() {
 		banners = append(banners, warn(fmt.Sprintf("⚠ %s isn't in a stack yet — press t to add it under %s.",
 			s.status.Branch, val(s.trackParent()))))
@@ -1859,6 +2085,20 @@ func (s stackModel) renderConfirm(w int) string {
 		effect = fmt.Sprintf("Marks %s as the trunk and sets rebase syncing — writes local .git/config only, nothing committed or pushed.", val(name))
 	case "ready":
 		effect = fmt.Sprintf("Marks %s's pull request ready for review on GitHub (takes it out of draft). This can notify reviewers and start required checks; nothing merges.", val(s.opName))
+	case "reconcile":
+		trunk := "the trunk"
+		if s.tree != nil && s.tree.Root != nil {
+			trunk = s.tree.Root.Name
+		}
+		merged, closed := s.remoteDrift()
+		switch {
+		case len(merged) > 0 && len(closed) > 0:
+			effect = fmt.Sprintf("Syncs the stack onto the latest %s, drops %s (merged remotely), and rebases the survivors; %s (closed remotely) stays local for you to decide on.", trunk, humanList(merged), humanList(closed))
+		case len(merged) > 0:
+			effect = fmt.Sprintf("Syncs the stack onto the latest %s, drops %s (merged remotely), and rebases the branches above onto %s.", trunk, humanList(merged), trunk)
+		default:
+			effect = fmt.Sprintf("Syncs the stack onto the latest %s and rebases it; %s was closed remotely and stays local for you to decide on.", trunk, humanList(closed))
+		}
 	default:
 		effect = "Affects " + cur + "."
 	}
@@ -2231,6 +2471,8 @@ func (s stackModel) viewFooter(spinnerFrame string) string {
 			help = "enter set up git-town · r refresh · esc dashboard"
 		case s.currentUntracked():
 			help = "t track this branch · ↑/↓ j/k move · enter choose · r refresh · esc dashboard"
+		case s.hasRemoteDrift():
+			help = "X reconcile with remote · ↑/↓ j/k move · enter choose · tab ←/→ tree · r refresh · esc dashboard"
 		case s.focus == focusTree:
 			help = "↑/↓ j/k branch · enter checkout · tab ←/→ actions · r refresh · esc dashboard"
 		default:

@@ -917,6 +917,50 @@ func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
 	return out, nil
 }
 
+// PRLanding records that a branch's most recent pull request has left the open
+// state — merged (shipped) or closed (abandoned) on the remote — while the local
+// stack still carries the branch. It is the drift signal local stack mode uses to
+// warn that the working copy is stale after someone lands the stack remotely (or a
+// merge happens via the GitHub UI). Number is that PR.
+type PRLanding struct {
+	Number int
+	Merged bool // true = merged (landed); false = closed without merging
+}
+
+// LandedPRsByBranch reports, for each head branch, whether its most recent PR has
+// left the open state — merged or closed — the drift signal for local stack mode.
+// Branches whose latest PR is still open, or that never had a PR, are omitted, so
+// the returned map holds only drifted branches. One REST call per branch (stacks
+// are small); a per-branch error skips that branch rather than failing the batch.
+func LandedPRsByBranch(owner, repo string, branches []string) (map[string]PRLanding, error) {
+	client, err := api.DefaultRESTClient()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]PRLanding{}
+	for _, b := range branches {
+		if b == "" {
+			continue
+		}
+		var prs []struct {
+			Number   int        `json:"number"`
+			State    string     `json:"state"`
+			MergedAt *time.Time `json:"merged_at"`
+		}
+		// state=all, newest-updated first, one result: the branch's latest PR, so a
+		// reopened-then-merged history reads as merged (its current state).
+		path := fmt.Sprintf("repos/%s/%s/pulls?head=%s:%s&state=all&sort=updated&direction=desc&per_page=1", owner, repo, owner, b)
+		if err := client.Get(path, &prs); err != nil {
+			continue // best-effort: a lookup failure just leaves this branch unflagged
+		}
+		if len(prs) == 0 || prs[0].State == "open" {
+			continue
+		}
+		out[b] = PRLanding{Number: prs[0].Number, Merged: prs[0].MergedAt != nil}
+	}
+	return out, nil
+}
+
 // MergePR merges a pull request on GitHub (REST PUT). method is "squash",
 // "merge", or "rebase" (defaults to squash). This is how a stack's bottom branch
 // lands on the trunk; the rest of the stack is re-parented afterwards by sync.

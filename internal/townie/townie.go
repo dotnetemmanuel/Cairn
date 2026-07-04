@@ -341,6 +341,11 @@ func (c Command) Hint() string {
 		// ready isn't a git-town call: Cairn marks the PR ready via the GitHub API.
 		return "gh: mark PR ready for review"
 	}
+	if c.Verb == "reconcile" {
+		// reconcile isn't a git-town verb: a stack sync, then local cleanup of any
+		// merged branch still checked out.
+		return "git-town sync --stack  →  drop merged branches locally"
+	}
 	a := argv(c.Verb, "<name>")
 	if a == nil {
 		return ""
