@@ -427,14 +427,14 @@ func Catalog() []Command {
 		},
 		{
 			Key: "G", Verb: "shipstack", Title: "merge whole stack", Mutates: true,
-			Short: "merge every branch from the bottom up to this one, in order",
-			Long: "Merges the WHOLE stack in one go: starting at the bottom (the branch " +
-				"that targets trunk) and working up to and including the branch you're on, " +
-				"it squash-merges each pull request into the trunk, retargets the branch " +
-				"above onto the trunk, deletes the merged branch, and finally syncs once. " +
-				"This is the most destructive action in Cairn — it lands several PRs and " +
-				"cannot be undone. If a PR along the way can't merge, the ones below it " +
-				"still land and everything above is left untouched.",
+			Short: "merge the whole stack, bottom to top, in order",
+			Long: "Merges the WHOLE stack in one go, wherever you are in it: starting at " +
+				"the bottom (the branch that targets trunk) and working up to the top, it " +
+				"squash-merges each pull request into the trunk, retargets the branch above " +
+				"onto the trunk, deletes the merged branch, and finally syncs once. This is " +
+				"the most destructive action in Cairn — it lands several PRs and cannot be " +
+				"undone. If a PR along the way can't merge, the ones below it still land and " +
+				"everything above is left untouched.",
 		},
 	}
 }

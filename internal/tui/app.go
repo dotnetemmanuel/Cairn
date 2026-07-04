@@ -1170,6 +1170,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "S":
 			// Enter the dedicated, local-context stack authoring mode.
 			m.stackMode = newStackModel(m.th, m.localRepo)
+			// Hand it a snapshot of the PR-reconstructed stacks (all repos) so remote
+			// stack mode can offer a repo chooser without a fresh inventory fetch.
+			m.stackMode.remoteStacks = m.stacks
 			m.stackMode, _ = m.stackMode.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			m.mode = modeStack
 			// Load the open-PR flags for the local tree (branch → #number), and check

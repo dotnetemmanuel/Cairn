@@ -162,9 +162,11 @@ func TestShipChainBottomUp(t *testing.T) {
 		branch string
 		want   string
 	}{
+		// "Whole stack" is the whole stack from ANY branch in it, bottom-up — not
+		// bounded by where HEAD sits (a blocker still halts the run at merge time).
 		{"feat-top", "feat-base,feat-mid,feat-top"},
-		{"feat-mid", "feat-base,feat-mid"},
-		{"feat-base", "feat-base"},
+		{"feat-mid", "feat-base,feat-mid,feat-top"},
+		{"feat-base", "feat-base,feat-mid,feat-top"},
 		{"main", ""},           // trunk has no chain
 		{"unknown-branch", ""}, // off-stack
 	}
@@ -1140,5 +1142,29 @@ func TestReconcileConfirmExplainsAndRuns(t *testing.T) {
 	s3, cmd := s2.updateConfirming(tea.KeyMsg{Type: tea.KeyEnter})
 	if s3.phase != stackRunning || cmd == nil {
 		t.Errorf("enter should run reconcile: phase=%d cmd=%v", s3.phase, cmd != nil)
+	}
+}
+
+func TestGhostBranchFunnelsToReconcile(t *testing.T) {
+	s := fixtureModel() // current = feat-mid
+	s.status.Staged = 2 // so amend isn't disabled for the ordinary reason
+	// Current branch itself merged remotely = a ghost: create/maintain verbs funnel
+	// to reconcile.
+	s.drift = map[string]gh.PRLanding{"feat-mid": {Number: 9, Merged: true}}
+	for _, verb := range []string{"new", "insert", "amend", "restack", "sync"} {
+		c := townie.Command{Verb: verb}
+		if s.actionEnabled(c) {
+			t.Errorf("%s must be disabled on a ghost (merged) current branch", verb)
+		}
+		if r := s.actionDisabledReason(c); !strings.Contains(r, "reconcile (X)") {
+			t.Errorf("%s reason on a ghost branch = %q, want it to point at reconcile", verb, r)
+		}
+	}
+	// On a LIVE current branch (no drift), the same verbs stay enabled.
+	s.drift = nil
+	for _, verb := range []string{"new", "insert", "restack", "sync"} {
+		if !s.actionEnabled(townie.Command{Verb: verb}) {
+			t.Errorf("%s should be enabled on a live branch", verb)
+		}
 	}
 }
