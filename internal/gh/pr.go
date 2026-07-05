@@ -304,6 +304,9 @@ query($owner:String!,$repo:String!,$number:Int!){
 
 // FetchPRDetail loads conversation + checks for a PR via GraphQL (Hard Rule 3).
 func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
+	if demoOn {
+		return demoFetchPRDetail(owner, repo, number)
+	}
 	client, err := graphQLClient()
 	if err != nil {
 		return PRDetail{}, err
@@ -543,6 +546,9 @@ func FetchPRDetail(owner, repo string, number int) (PRDetail, error) {
 // up to maxFiles. The diff is a patch-text read with no clean GraphQL form, so
 // it uses the REST files endpoint.
 func FetchPRFiles(owner, repo string, number int) ([]FileDiff, error) {
+	if demoOn {
+		return demoFetchPRFiles(owner, repo, number)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, err
@@ -758,6 +764,9 @@ func friendlyCreatePRError(err error, head, base string) error {
 // PR number — so the local stack tree can flag which branches already have a PR.
 // It paginates up to a sane cap; identically-headed PRs keep the first seen.
 func OpenPRNumbersByBranch(owner, repo string) (map[string]int, error) {
+	if demoOn {
+		return demoOpenPRNumbersByBranch(owner, repo)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, err
@@ -884,6 +893,9 @@ func (p OpenPR) Mergeability() PRMergeability {
 // map (OpenPRsByBranch) and the remote stack-tree reconstruction, so one fetch
 // serves the whole remote stack screen.
 func OpenPRs(owner, repo string) ([]OpenPR, error) {
+	if demoOn {
+		return demoOpenPRs(owner, repo)
+	}
 	client, err := graphQLClient()
 	if err != nil {
 		return nil, err
@@ -936,6 +948,9 @@ func OpenPRs(owner, repo string) ([]OpenPR, error) {
 // query yields both the #N flags AND the mergeable/draft/review state the ship
 // gating needs. Identically-headed PRs keep the first seen.
 func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
+	if demoOn {
+		return demoOpenPRsByBranch(owner, repo)
+	}
 	prs, err := OpenPRs(owner, repo)
 	if err != nil {
 		return nil, err
@@ -966,6 +981,9 @@ type PRLanding struct {
 // the returned map holds only drifted branches. One REST call per branch (stacks
 // are small); a per-branch error skips that branch rather than failing the batch.
 func LandedPRsByBranch(owner, repo string, branches []string) (map[string]PRLanding, error) {
+	if demoOn {
+		return demoLandedPRsByBranch(owner, repo, branches)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, err
@@ -1077,6 +1095,9 @@ func FriendlyMergeError(err error, label string) error {
 // retargeted to the trunk before its branch is deleted — otherwise deleting the
 // branch closes them.
 func PRsWithBase(owner, repo, base string) ([]int, error) {
+	if demoOn {
+		return demoPRsWithBase(owner, repo, base)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, err
