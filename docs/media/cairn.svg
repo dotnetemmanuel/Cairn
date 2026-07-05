@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="40 168 320 270" role="img" aria-label="Cairn logo">
+  <g stroke-linejoin="round" stroke-linecap="round" stroke-width="4">
+    <!-- ================= PINK STONE (bottom) — muted ================= -->
+    <polygon points="54,386 82,344 168,332 296,336 344,378 322,412 218,424 106,420"
+             fill="#C13F7C" stroke="#C13F7C"/>
+    <polygon points="54,386 106,420 218,424 322,412 344,378 322,398 218,406 100,400"
+             fill="#922E5F" stroke="#922E5F"/>
+    <polygon points="82,344 168,332 296,336 322,354 296,362 200,362 128,358"
+             fill="#DE7CAC" stroke="#DE7CAC"/>
+
+    <!-- ================= GREEN STONE — muted, down 4 ================= -->
+    <polygon points="90,300 116,256 194,258 268,276 306,304 286,332 214,344 124,334"
+             fill="#33957A" stroke="#33957A"/>
+    <polygon points="90,300 124,334 214,344 286,332 306,304 280,320 214,330 110,318"
+             fill="#216B57" stroke="#216B57"/>
+    <polygon points="116,256 194,258 268,276 288,290 264,298 196,298 128,286"
+             fill="#5CBD95" stroke="#5CBD95"/>
+
+    <!-- ================= BLUE STONE — muted, down 9 ================= -->
+    <polygon points="138,253 156,229 220,223 258,231 282,255 262,275 208,279 162,271"
+             fill="#3891AF" stroke="#3891AF"/>
+    <polygon points="138,253 162,271 208,279 262,275 282,255 260,265 208,269 158,263"
+             fill="#22617C" stroke="#22617C"/>
+    <polygon points="156,229 220,223 258,231 272,245 254,253 214,255 172,247"
+             fill="#71BFD7" stroke="#71BFD7"/>
+
+    <!-- ================= AMBER STONE (top) — muted, down 15 ================= -->
+    <polygon points="158,207 174,183 198,177 220,185 238,207 220,225 192,229 168,223"
+             fill="#D89871" stroke="#D89871"/>
+    <polygon points="158,207 168,223 192,229 220,225 238,207 218,217 192,221 164,215"
+             fill="#A46B4A" stroke="#A46B4A"/>
+    <polygon points="174,183 198,177 220,185 232,199 212,203 192,203 174,199"
+             fill="#EEC49A" stroke="#EEC49A"/>
+  </g>
+</svg>

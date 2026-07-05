@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⛰️  Cairn
+# <img src="docs/media/cairn.svg" alt="Cairn logo" width="40" valign="middle" />&nbsp; Cairn
 
 **A terminal cockpit for GitHub.** Your PR board, your code review, and your stacked-PR workflow, in one keyboard-driven TUI that never leaves the terminal.
 
