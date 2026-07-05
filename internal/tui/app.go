@@ -1769,11 +1769,12 @@ func (m Model) viewBody() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, m.renderStackSidebar(stackPaneW, bodyH), stackVBar(m.th, bodyH), listPane)
 }
 
-// Source icons (Nerd Font): a GitHub mark for remote-reconstructed nodes, a
-// laptop for branches also present in the local git-town config.
+// Source icons (Nerd Font): a cloud for remote-reconstructed nodes (they live
+// on the server), a laptop for branches also present in the local git-town
+// config. No vendor logos: the cloud avoids any trademarked GitHub mark.
 const (
-	iconRemote = "" // nf-fa-github
-	iconLocal  = "" // nf-fa-laptop
+	iconRemote = "" // nf-fa-cloud (remote / server-side)
+	iconLocal  = "" // nf-fa-laptop (local checkout)
 )
 
 func stackVBar(th theme.Theme, h int) string {

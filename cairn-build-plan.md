@@ -1,7 +1,7 @@
 # Cairn — Build Plan & Implementation Spec
 
 > A terminal cockpit for GitHub: dashboard + review + stacked-PR workflow in one TUI.
-> Think **gh-dash** (the board) × **GitHub Desktop** (approachable git ops) × **git-town** (branch workflow) × **Graphite** (PR stacking & merging), running fully local.
+> Think **gh-dash** (the board) × **GitHub Desktop** (approachable git ops) × **git-town** (branch workflow), with first-class **PR stacking & merging**, running fully local.
 
 **Cairn** — a cairn is a stack of balanced stones used as a trail marker. It carries three meanings at once: a *stack* (the core feature), a *waypoint you navigate by* (the cockpit), and stone-balancing as a *mindful* practice (a nod to Mindful Stack). Binary and module are `cairn`. The stack-tree view is rendered as a literal cairn — each PR a stone resting on the one below.
 
@@ -38,7 +38,7 @@ If you are about to write code that maintains stack relationships, that is rule 
 **Core differentiators** (the reasons this should exist rather than just using gh-dash):
 1. A **live stack tree** — a visual graph of the current stack with per-branch PR status and CI dots. Neither gh-dash nor GitHub Desktop has this.
 2. **In-TUI review** — diff + comment + approve in-pane, so you stop bouncing to github.com.
-3. **`ship`** — merge a reviewed stack bottom-up, auto-retargeting bases, without the Graphite web app.
+3. **`ship`** — merge a reviewed stack bottom-up, auto-retargeting bases, without leaving the terminal for a web app.
 
 **Non-goals (v1):**
 - No server-side merge queue (atomic "merge the whole green stack" needs server cooperation — out of scope; we do client-side bottom-up merging instead).
@@ -75,7 +75,7 @@ Rationale, specific to this project:
 
 ### Fallback: **TypeScript** (only if Go is rejected)
 
-Viable because Graphite's own CLI is TS. Stack would be **Ink** (React-for-CLI) + **Octokit** + shelling out to `git-town`. Costs: heavier runtime/distribution, no in-language gh-dash reference, weaker large-diff performance. Choose only if the maintainer would otherwise not ship at all. **Do not mix** — pick one and commit.
+Viable because comparable PR-stacking CLIs are written in TS. Stack would be **Ink** (React-for-CLI) + **Octokit** + shelling out to `git-town`. Costs: heavier runtime/distribution, no in-language gh-dash reference, weaker large-diff performance. Choose only if the maintainer would otherwise not ship at all. **Do not mix** — pick one and commit.
 
 ---
 
@@ -214,7 +214,7 @@ Three panes, vim-style navigation, rebindable keys, `?` help overlay.
 - ~~`up`/`down`/`top`/`bottom` navigation maps selection to branches.~~ Replaced
   by a hybrid: the left **Stack pane** (toggle `s`) follows the selected PR in
   the list. Stacks are reconstructed from PR base/head chains (remote, any repo)
-  and overlaid with local git-town drift (cwd repo); a GitHub icon marks remote
+  and overlaid with local git-town drift (cwd repo); a cloud icon marks remote
   nodes, a laptop icon marks branches in local git-town config.
 **Acceptance:** in a repo with an existing git-town stack, the tree renders correctly and flags an artificially-drifted branch amber.
 
