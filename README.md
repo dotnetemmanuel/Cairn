@@ -177,7 +177,7 @@ Optional, at `~/.config/cairn/config.yml`. With no file, Cairn runs on sensible 
 
 ## Status & roadmap
 
-Cairn is real and usable today: the board, in-pane review, the stack tree, full stack authoring, ship (single and whole-stack), remote stack mode, drift reconcile, the conflict resolver, and the notifications inbox all work. What's left is polish and, notably, **packaging and distribution** (goreleaser binaries, an AUR package), tracked as the final phase, so for now you build from source like it's an artisanal experience. The build plan in [`cairn-build-plan.md`](./cairn-build-plan.md) is the source of truth for the phased design.
+Cairn is real and usable today: the board, in-pane review, the stack tree, full stack authoring, ship (single and whole-stack), remote stack mode, drift reconcile, the conflict resolver, and the notifications inbox all work. What's left is polish and, notably, **packaging and distribution** (goreleaser binaries, an AUR package), tracked as the final phase, so for now you build from source like it's an artisanal experience.
 
 ---
 
