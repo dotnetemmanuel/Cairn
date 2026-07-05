@@ -8,10 +8,7 @@
 
 </div>
 
-> 📸 **[ SCREENSHOT #1 — HERO SHOT ]** (the money shot, top of the page)
-> **Screen:** the dashboard. **Terminal width:** ≥ 120 cols (the stack sidebar only appears at ≥ 90 cols *and* when the highlighted PR belongs to a stack, so pick such a PR first).
-> **Show, left to right:** the **stack sidebar** on the LEFT (its cairn tree for the selected PR, with branch names, #PR numbers, review glyphs, CI dots) → the vertical divider → the **PR list** on the RIGHT. Across the top of the list: the tab bar (My PRs / Needs my review / Involved / Orgs / Notifications) with one tab active. One PR row highlighted (the pink selection bar). Top chrome shows your login + remaining API budget; bottom shows the key-hint footer.
-> **When you have it:** save to `docs/media/hero.png` and replace this whole block with `![Cairn](docs/media/hero.png)`
+![Cairn](docs/media/hero.png)
 
 ---
 
@@ -53,10 +50,9 @@ Configurable sections, each backed by a GitHub search filter, rendered as a fast
 
 Cycle tabs with `tab` / `shift-tab`, jump between headers with `n` / `N`, group by repo with `o`, refresh every tab at once with `r`. Recently merged and closed PRs settle into a muted tail under the open ones, so you can see what just landed without playing detective.
 
-> 📸 **[ SCREENSHOT #2 — THE BOARD ]**
-> **Screen:** the dashboard PR list, **Orgs** or **Needs my review** tab active (busiest one wins). Toggle the sidebar off with `s` so the list runs full-width.
-> **Show:** 8–12 list rows with every column legible — repo, `#number`, title, author, the review-state glyph (◆ you / ◇ others), the CI dot (green/red/amber), and the relative updated-time. Include the **OPEN ── CLOSED** divider with at least two muted (greyed) merged/closed rows beneath it. Cursor on an open row so the pink selection bar is visible.
-> **When you have it:** save to `docs/media/board.png` and replace this block with `![The board](docs/media/board.png)`
+![The board](docs/media/board.png)
+![The board](docs/media/board2.png)
+
 
 ### 🔍 Review, without the round trip
 
@@ -71,18 +67,11 @@ Select a PR and the center pane opens the diff: syntax-highlighted, with a file 
 
 The right pane carries the conversation, the checks list, and the CI rollup, so you're reading state and history side by side with the code.
 
-> 📸 **[ SCREENSHOT #3 — REVIEW PANE (the diff) ]**
-> **Screen:** a PR open on the **diff page** (highlight a PR on the board, press `enter`). Terminal wide (≥ 120 cols) so all three columns fit.
-> **Show, left to right:** the **Files** pane → the **Diff** pane (syntax-highlighted, *focused*, so its title and rule are blue) → the **Conversation · Checks** info pane on the right. Move the diff cursor onto a line that carries an inline comment so the info pane leads with the **💬 line thread** for that line (this is what proves inline review at a glance). Footer shows the review keys (`a` approve · `x` request-changes · `c` comment · `v` conversation).
-> **Alt:** press `c` on a diff line to capture the inline-comment composer open instead — pick whichever reads clearer.
-> **When you have it:** save to `docs/media/review.png` and replace this block with `![Review pane](docs/media/review.png)`
+![Review pane](docs/media/review.png)
 
 Need the whole discussion instead of the diff? Press **`v`** for the full-page **conversation view**: the entire threaded timeline in one column — description, comments, reviews, inline threads (with their `╰→` reply guides), commits and events interleaved in order. Walk it block by block with `n` / `N`, reply with `r`, edit your own with `e`, and `v` again drops you back to the diff.
 
-> 📸 **[ SCREENSHOT #7 — FULL CONVERSATION VIEW ]**
-> **Screen:** a PR's **conversation page** (from the diff page, press `v`).
-> **Show:** the single-column threaded timeline top to bottom — the PR **description** first, then a mix of **comments, reviews, and inline threads** (the inline ones showing the quoted diff line + the `╰→` threaded replies), with **commit rows** and **events** interleaved in chronological order. Put the cursor on one block so its selection highlight shows. Footer shows `r` reply · `e` edit · `v` back to diff.
-> **When you have it:** save to `docs/media/conversation.png` and replace this block with `![Conversation view](docs/media/conversation.png)`
+![Conversation view](docs/media/conversation.png)
 
 ### ⛰️ The stack — stacked PRs that actually stay stacked
 
@@ -106,10 +95,7 @@ Press `S` to drop into **stack mode**, a dedicated cockpit for authoring and mai
 
 > **Under the hood:** every stack command is built on [git-town](https://www.git-town.com). Cairn issues the intent and shows you the result; git-town does the rebase math it's very good at. There is no hand-rolled `git rebase` anywhere in Cairn, on purpose, because that's how you end up on the archaeology dig.
 
-> 📸 **[ SCREENSHOT #4 — STACK MODE ]**
-> **Screen:** stack mode (press `S` from the dashboard, in a repo that has a real 3+ branch git-town stack checked out).
-> **Show:** the **cairn tree** — trunk at the bottom, feature branches stacked above it, each node showing branch name, `#PR`, review glyph, and CI dot; the current branch is the highlighted stone. Ideally one node is **amber with the ⚠ drift flag**. Alongside the tree, the **action list** with the highlighted command's plain-language explanation visible. At the very bottom, the **chevron statusline** showing the current branch and the pending-action hint.
-> **When you have it:** save to `docs/media/stack.png` and replace this block with `![Stack mode](docs/media/stack.png)`
+![Stack mode](docs/media/stack.png)
 
 ### 🚢 Ship it — one PR or the whole stack
 
@@ -132,19 +118,13 @@ Ran raw git behind Cairn's back? Merged a PR from the web UI in a moment of weak
 
 When a `sync` or `restack` hits a merge conflict, you don't get dumped into a bare `git mergetool` and left to bond with vim over the experience. Cairn opens an approachable, file-by-file resolver borrowed from GitHub Desktop's model: take the incoming side, take yours, take both, or edit by hand, then continue, all inside the TUI.
 
-> 📸 **[ SCREENSHOT #5 — CONFLICT RESOLVER ]**
-> **Screen:** the resolver, opened mid-conflict (run a `sync` / `restack` / `ship` that you've deliberately set up to conflict).
-> **Show:** the file **rail** on the left listing the conflicted files (one selected); the side-by-side panes — the **incoming** side and **yours** — with the **resolution** column between them; and the **choice bar**: *take incoming · take yours · take both · edit*. Make sure a conflicted hunk is visible in the panes so the ours/theirs difference reads.
-> **When you have it:** save to `docs/media/conflict.png` and replace this block with `![Conflict resolver](docs/media/conflict.png)`
+![Conflict resolver](docs/media/conflict.png)
 
 ### 📨 Notifications inbox
 
 The Notifications tab is a two-pane inbox: the list on the left, a live conversation preview on the right. Focus the preview with `→` or `enter`, scroll the thread, mark items read with `x`, and yank a link with `y`. It's the part of github.com you compulsively refresh, brought into the terminal so you can compulsively refresh it without breaking flow.
 
-> 📸 **[ SCREENSHOT #6 — NOTIFICATIONS INBOX ]**
-> **Screen:** the dashboard on the **Notifications** tab.
-> **Show:** the two-pane inbox — the **notification list** on the LEFT (each row: repo, title, reason, unread dot) with one item selected → the **conversation preview** on the RIGHT rendering that item's thread. Focus the preview (`→` or `enter`) so it's the active pane (blue title). Footer shows `x` read · `y` copy.
-> **When you have it:** save to `docs/media/notifications.png` and replace this block with `![Notifications](docs/media/notifications.png)`
+![Notifications](docs/media/notifications.png)
 
 ### 🎨 Theming
 

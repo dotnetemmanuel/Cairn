@@ -22,6 +22,9 @@ type Viewer struct {
 // FetchViewer issues a single GraphQL query for the logged-in user and the
 // current rate-limit quota.
 func FetchViewer() (Viewer, error) {
+	if demoOn {
+		return demoFetchViewer()
+	}
 	client, err := graphQLClient()
 	if err != nil {
 		return Viewer{}, err
@@ -51,6 +54,9 @@ func FetchViewer() (Viewer, error) {
 // belongs to (including private memberships, since the query runs as the
 // viewer). Order follows GitHub's default; the Orgs tab groups PRs by these.
 func FetchOrgs() ([]string, error) {
+	if demoOn {
+		return demoFetchOrgs()
+	}
 	client, err := graphQLClient()
 	if err != nil {
 		return nil, err

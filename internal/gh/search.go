@@ -124,6 +124,9 @@ type searchResponse struct {
 // matching items plus the total match count (which may exceed len(items) when
 // capped by limit).
 func SearchItems(filter string, limit int) (items []Item, total int, err error) {
+	if demoOn {
+		return demoSearch(filter, limit)
+	}
 	client, err := graphQLClient()
 	if err != nil {
 		return nil, 0, err

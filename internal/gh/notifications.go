@@ -50,6 +50,9 @@ type notificationThread struct {
 // (GitHub's default order). Notifications are REST-only (the one read not on
 // GraphQL); the inbox view consumes this richer shape rather than the Item one.
 func FetchNotificationFeed(limit int) ([]Notification, error) {
+	if demoOn {
+		return demoNotificationFeed(limit)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, err
@@ -96,6 +99,9 @@ func MarkThreadRead(threadID string) error {
 // renders. Review/CI state is not part of the notifications payload, so those
 // glyphs render as "none".
 func FetchNotifications(limit int) (items []Item, total int, err error) {
+	if demoOn {
+		return demoNotifications(limit)
+	}
 	client, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, 0, err

@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/dotnetemmanuel/cairn/internal/config"
 	"github.com/dotnetemmanuel/cairn/internal/doctor"
+	"github.com/dotnetemmanuel/cairn/internal/gh"
 	"github.com/dotnetemmanuel/cairn/internal/tui"
 )
 
@@ -19,13 +20,20 @@ const version = "0.0.0-phase0"
 func main() {
 	args := os.Args[1:]
 
-	// Bare invocation launches the TUI.
+	// Bare invocation launches the TUI. CAIRN_DEMO=1 flips it to demo mode so
+	// `CAIRN_DEMO=1 cairn` works too (handy for scripted screenshot capture).
 	if len(args) == 0 {
+		if os.Getenv("CAIRN_DEMO") == "1" {
+			runDemo()
+			return
+		}
 		runTUI()
 		return
 	}
 
 	switch args[0] {
+	case "demo":
+		runDemo()
 	case "doctor":
 		os.Exit(doctor.Run())
 	case "version", "--version", "-v":
@@ -61,6 +69,25 @@ func runTUI() {
 	}
 }
 
+// runDemo launches the TUI against built-in fake data (see internal/gh/demo.go).
+// It mirrors runTUI but enables the demo overlay and SKIPS the doctor preflight,
+// so demo mode runs on a clean machine with no gh/git-town and no auth. Config
+// still loads (theme, sections) so the board looks real; defaults on any error.
+func runDemo() {
+	gh.EnableDemo()
+
+	cfg, err := config.Load()
+	if err != nil {
+		cfg = config.Default()
+	}
+
+	p := tea.NewProgram(tui.New(cfg), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "cairn: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // fallthroughToGit execs git with the original arguments, mirroring its exit
 // code so muscle memory like `cairn status` behaves exactly like `git status`.
 func fallthroughToGit(args []string) {
@@ -87,6 +114,7 @@ func printHelp() {
 
 Usage:
   cairn            launch the TUI
+  cairn demo       launch the TUI against built-in fake data (no gh/git-town/auth)
   cairn doctor     diagnose tools (git, git-town, gh) and auth
   cairn version    print version
   cairn help       show this help
