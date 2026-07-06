@@ -182,9 +182,7 @@ Cairn is real and usable today: the board, in-pane review, the stack tree, full 
 ---
 
 ## License
-This project is licensed under CC BY-NC-ND 4.0.  
-You may clone and fork the repository, but commercial use, redistribution of modified versions, and creation of derivative works are not permitted.  
-Full license: https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode 
+MIT
 
 ---
 
