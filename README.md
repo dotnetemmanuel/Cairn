@@ -182,9 +182,10 @@ Cairn is real and usable today: the board, in-pane review, the stack tree, full 
 ---
 
 ## License
-
-MIT.
+This project is licensed under CC BY-NC-ND 4.0.  
+You may clone and fork the repository, but commercial use, redistribution of modified versions, and creation of derivative works are not permitted.  
+Full license: https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode 
 
 ---
 
-<sub>Cairn is an independent, open-source project. It is not affiliated with, endorsed by, or sponsored by GitHub, Inc. "GitHub" is a trademark of GitHub, Inc. Cairn interoperates with GitHub through your own `gh` credentials and uses no GitHub logos or brand marks.</sub>
+<sub>Cairn is an independent project. It is not affiliated with, endorsed by, or sponsored by GitHub, Inc. "GitHub" is a trademark of GitHub, Inc. Cairn interoperates with GitHub through your own `gh` credentials and uses no GitHub logos or brand marks.</sub>
