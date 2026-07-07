@@ -14,20 +14,20 @@ import (
 // in the config package) so config can embed it without an import cycle, and so
 // the TUI depends only on semantic roles — never raw hex.
 type Palette struct {
-	Name    string `yaml:"name"`
-	Base    string `yaml:"base"`    // app background
-	Surface string `yaml:"surface"` // panel background
-	Overlay string `yaml:"overlay"` // dividers, inactive pane borders
-	Text    string `yaml:"text"`    // primary text
-	Muted   string `yaml:"muted"`   // secondary text, empty CI dots, inactive nodes
-	Primary string `yaml:"primary"` // selection bar, active stack node ("you are here")
-	Focus   string `yaml:"focus"`   // focused pane border, section headers, spinners
-	Info    string `yaml:"info"`    // PR/issue numbers, links, branch names
-	Success string `yaml:"success"` // approved, merged, CI pass
-	Warning string `yaml:"warning"` // lineage drift (amber), CI pending
-	Danger  string `yaml:"danger"`  // CI fail, conflicts, changes-requested
-	Accent2 string `yaml:"accent2"` // commit hashes, subtle emphasis
-	CodeBg  string `yaml:"codeBg"`  // background for code blocks & inline code (decoupled from Overlay dividers)
+	Name    string `yaml:"name" json:"name"`
+	Base    string `yaml:"base" json:"base"`       // app background
+	Surface string `yaml:"surface" json:"surface"` // panel background
+	Overlay string `yaml:"overlay" json:"overlay"` // dividers, inactive pane borders
+	Text    string `yaml:"text" json:"text"`       // primary text
+	Muted   string `yaml:"muted" json:"muted"`     // secondary text, empty CI dots, inactive nodes
+	Primary string `yaml:"primary" json:"primary"` // selection bar, active stack node ("you are here")
+	Focus   string `yaml:"focus" json:"focus"`     // focused pane border, section headers, spinners
+	Info    string `yaml:"info" json:"info"`       // PR/issue numbers, links, branch names
+	Success string `yaml:"success" json:"success"` // approved, merged, CI pass
+	Warning string `yaml:"warning" json:"warning"` // lineage drift (amber), CI pending
+	Danger  string `yaml:"danger" json:"danger"`   // CI fail, conflicts, changes-requested
+	Accent2 string `yaml:"accent2" json:"accent2"` // commit hashes, subtle emphasis
+	CodeBg  string `yaml:"codeBg" json:"codeBg"`   // background for code blocks & inline code (decoupled from Overlay dividers)
 }
 
 // DefaultPalette returns the Event Horizon (dark) palette — the source-of-truth

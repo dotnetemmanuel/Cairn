@@ -341,7 +341,7 @@ func TestConflictFramesFitEveryScreen(t *testing.T) {
 func TestPaintBackgroundClipsOverWideRows(t *testing.T) {
 	m := Model{th: theme.New(theme.DefaultPalette()), width: 80, height: 24}
 	over := strings.Repeat("X", 200) // 200 columns on an 80-column screen
-	out := m.paintBackground(over + "\nsecond row")
+	out := m.paintBackground(over+"\nsecond row", m.th)
 	if rows := strings.Count(out, "\n") + 1; rows != 24 {
 		t.Errorf("paintBackground produced %d rows, want 24 (an over-wide row must be clipped, not wrapped)", rows)
 	}

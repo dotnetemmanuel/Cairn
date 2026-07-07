@@ -46,9 +46,14 @@ type Section struct {
 // repoPaths, keybindings) are declared now so the schema is stable, but only
 // Theme and DefaultTrunk are exercised in Phase 0.
 type Config struct {
-	// ThemeMode selects the built-in palette variant: "dark" (Event Horizon, the
-	// default) or "light" (Event Horizon Day, a warm-paper palette for working
-	// outdoors). Toggled live from the TUI and persisted here.
+	// ThemeName selects which theme is active by name (default "event-horizon").
+	// Themes are loaded from JSON: the built-ins are embedded, and any *.json file
+	// under ThemesDir() adds another selectable theme. Chosen live from the settings
+	// screen and persisted here.
+	ThemeName string `yaml:"themeName"`
+	// ThemeMode selects the active theme's palette variant: "dark" (the default) or
+	// "light" (a warm-paper variant for working outdoors). Toggled live from the TUI
+	// and persisted here.
 	ThemeMode string `yaml:"themeMode"`
 	// Theme is an optional power-user override layered over the active mode's
 	// built-in palette: any token set here wins, anything omitted falls back to
@@ -67,6 +72,7 @@ type Config struct {
 // Default returns the built-in configuration used when no file exists.
 func Default() Config {
 	return Config{
+		ThemeName: "event-horizon",
 		ThemeMode: theme.ModeDark,
 		// Theme override left empty: the active mode's built-in palette is used as-is
 		// unless the user sets specific tokens under `theme:` in config.yml.
@@ -92,6 +98,17 @@ func Path() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "cairn", "config.yml"), nil
+}
+
+// ThemesDir returns the directory scanned for user theme drop-ins
+// (~/.config/cairn/themes), honoring XDG_CONFIG_HOME. Dropping a valid *.json
+// theme file here makes it selectable in the settings screen.
+func ThemesDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "cairn", "themes"), nil
 }
 
 // Load reads the config file, layering it over the defaults so that omitted
@@ -120,10 +137,22 @@ func Load() (Config, error) {
 }
 
 // SaveThemeMode persists just the themeMode key, leaving every other key (and any
-// comments) in the file intact. A missing file or directory is created. It edits
-// the document node in place rather than re-marshalling the whole Config, so a
-// hand-written config.yml is not rewritten wholesale.
+// comments) in the file intact.
 func SaveThemeMode(mode string) error {
+	return saveScalars([][2]string{{"themeMode", mode}})
+}
+
+// SaveThemeSelection persists the theme name and mode together in one write,
+// leaving every other key (and any comments) in the file intact.
+func SaveThemeSelection(name, mode string) error {
+	return saveScalars([][2]string{{"themeName", name}, {"themeMode", mode}})
+}
+
+// saveScalars upserts a set of top-level key/value pairs into config.yml, editing
+// the document node in place rather than re-marshalling the whole Config, so a
+// hand-written config.yml keeps its other keys and comments. A missing file or
+// directory is created.
+func saveScalars(pairs [][2]string) error {
 	path, err := Path()
 	if err != nil {
 		return err
@@ -145,7 +174,9 @@ func SaveThemeMode(mode string) error {
 	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("%s: top level is not a mapping", path)
 	}
-	upsertScalar(doc.Content[0], "themeMode", mode)
+	for _, kv := range pairs {
+		upsertScalar(doc.Content[0], kv[0], kv[1])
+	}
 
 	out, err := yaml.Marshal(&doc)
 	if err != nil {

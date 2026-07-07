@@ -102,13 +102,16 @@ const (
 	modeDetail
 	modeStack
 	modeConflict
+	modeSettings
 )
 
 // Model is the root Bubble Tea model.
 type Model struct {
 	cfg       config.Config
 	th        theme.Theme
-	themeMode string // "dark" | "light"; toggled with ctrl+t
+	themes    theme.Library // available themes (built-ins + user drop-ins)
+	themeName string        // active theme name; chosen in the settings screen
+	themeMode string        // "dark" | "light"; toggled with ctrl+t
 
 	width  int
 	height int
@@ -117,6 +120,7 @@ type Model struct {
 	detail    detailModel
 	stackMode stackModel
 	conflict  conflictModel
+	settings  settingsModel
 
 	sections []section
 	active   int
@@ -186,7 +190,20 @@ func New(cfg config.Config) Model {
 	if mode != theme.ModeLight {
 		mode = theme.ModeDark
 	}
-	th := theme.Resolve(mode, cfg.Theme)
+
+	// Load the theme library (embedded built-ins + user drop-ins from ~/.config/
+	// cairn/themes). A bad or missing themes dir is not fatal — the built-ins are
+	// always present. Resolve the configured theme by name, falling back to the
+	// default if the name is unknown (e.g. a since-removed drop-in).
+	themesDir, _ := config.ThemesDir()
+	lib := theme.LoadLibrary(themesDir)
+	name := cfg.ThemeName
+	if name == "" {
+		name = "event-horizon"
+	}
+	nt := lib.GetOrDefault(name)
+	name = nt.Name
+	th := theme.ResolveNamed(nt, mode, cfg.Theme)
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
@@ -195,6 +212,8 @@ func New(cfg config.Config) Model {
 	m := Model{
 		cfg:           cfg,
 		th:            th,
+		themes:        lib,
+		themeName:     name,
 		themeMode:     mode,
 		spinner:       sp,
 		headerLoading: true,
@@ -877,6 +896,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.conflict, cmd = m.conflict.Update(msg)
 			return m, cmd
 		}
+		if m.mode == modeSettings {
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
+			return m, cmd
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -940,6 +964,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Anything else scrolls the (possibly taller-than-screen) help body.
 			var cmd tea.Cmd
 			m.helpVP, cmd = m.helpVP.Update(msg)
+			return m, cmd
+		}
+		// Settings screen owns every key: enter applies, esc/q/, cancels, and
+		// anything else is navigation. Placed before the global ?/ctrl+t handlers so
+		// they don't fire while the picker is open.
+		if m.mode == modeSettings {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit // never let the picker trap a quit
+			case "enter":
+				return m.applySettings()
+			case "esc", "q", ",":
+				return m.cancelSettings()
+			}
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
 			return m, cmd
 		}
 		// Open help on ? — unless a text field is capturing input, where ? is a
@@ -1179,6 +1219,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// whether any stack branch was landed/closed on the remote (drift → offer a
 			// reconcile). driftCmd is nil (skipped by Batch) when there's no tree.
 			return m, tea.Batch(fetchStackPRNums(m.localRepo), m.stackMode.driftCmd())
+		case ",":
+			// Open the settings screen (theme picker). Comma is the near-universal
+			// "preferences" shortcut and is free here; ctrl+s is deliberately avoided
+			// (many terminals trap it as XOFF and freeze).
+			return m.openSettings()
 		case "o":
 			// Flip the PR-list ordering: default newest-updated ↔ grouped by repo.
 			// Global (every tab reorders together, so scanning stays consistent as you
@@ -1250,9 +1295,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // don't ghost behind the new ones.
 func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
 	m.themeMode = theme.Toggle(m.themeMode)
-	m.th = theme.Resolve(m.themeMode, m.cfg.Theme)
-	m.spinner.Style = lipgloss.NewStyle().Foreground(m.th.Focus)
+	nt := m.themes.GetOrDefault(m.themeName)
+	m.applyTheme(theme.ResolveNamed(nt, m.themeMode, m.cfg.Theme))
 
+	// Persist out-of-band; a write failure must not break the live toggle.
+	name, mode := m.themeName, m.themeMode
+	persist := func() tea.Msg { _ = config.SaveThemeSelection(name, mode); return nil }
+	return m, tea.Batch(tea.ClearScreen, persist)
+}
+
+// applyTheme pushes a resolved theme into the live model: the spinner, the list
+// delegate (rebuilt by resizeLists), the cached inbox preview, and whichever
+// sub-screen is currently active. Shared by the ctrl+t toggle and the settings
+// screen so both re-theme every surface identically.
+func (m *Model) applyTheme(th theme.Theme) {
+	m.th = th
+	m.spinner.Style = lipgloss.NewStyle().Foreground(th.Focus)
 	// The list-row delegate carries the theme, so rebuild it; then push the new
 	// theme into whichever sub-screen is live (detail caches rendered viewports,
 	// so it needs an explicit re-render — stack and conflict render from th).
@@ -1263,18 +1321,39 @@ func (m Model) toggleTheme() (tea.Model, tea.Cmd) {
 	m.loadPreviewVP()
 	switch m.mode {
 	case modeDetail:
-		m.detail.restyle(m.th)
+		m.detail.restyle(th)
 	case modeStack:
-		m.stackMode.th = m.th
+		m.stackMode.th = th
 		m.stackMode.restyleComposer() // re-theme the textarea/title under the new palette
 	case modeConflict:
-		m.conflict.th = m.th
+		m.conflict.th = th
 	}
+}
 
-	// Persist out-of-band; a write failure must not break the live toggle.
-	mode := m.themeMode
-	persist := func() tea.Msg { _ = config.SaveThemeMode(mode); return nil }
+// openSettings enters the settings screen, seeded with the active theme + variant.
+func (m Model) openSettings() (tea.Model, tea.Cmd) {
+	m.settings = newSettingsModel(m.themes, m.themeName, m.themeMode, m.cfg.Theme, m.width, m.height)
+	m.mode = modeSettings
+	return m, tea.ClearScreen
+}
+
+// applySettings commits the settings screen's chosen theme + variant to the whole
+// app, persists it, and returns to the dashboard.
+func (m Model) applySettings() (tea.Model, tea.Cmd) {
+	m.themeName = m.settings.selectedName()
+	m.themeMode = m.settings.mode
+	m.mode = modeDashboard
+	nt := m.themes.GetOrDefault(m.themeName)
+	m.applyTheme(theme.ResolveNamed(nt, m.themeMode, m.cfg.Theme))
+	name, mode := m.themeName, m.themeMode
+	persist := func() tea.Msg { _ = config.SaveThemeSelection(name, mode); return nil }
 	return m, tea.Batch(tea.ClearScreen, persist)
+}
+
+// cancelSettings leaves the settings screen without applying the previewed theme.
+func (m Model) cancelSettings() (tea.Model, tea.Cmd) {
+	m.mode = modeDashboard
+	return m, tea.ClearScreen
 }
 
 // toggleSelectedGroup folds or unfolds the OPEN/CLOSED group whose header is
@@ -1500,6 +1579,8 @@ func (m Model) View() string {
 		body = m.stackMode.View(m.spinner.View(), m.viewHeader())
 	case m.mode == modeConflict:
 		body = m.conflict.View()
+	case m.mode == modeSettings:
+		body = m.settings.View()
 	default:
 		// Header and footer are full-width bars (flush to the edges); only the
 		// tabs+body content is indented by the left gutter.
@@ -1510,7 +1591,15 @@ func (m Model) View() string {
 			m.viewFooter(),
 		)
 	}
-	return m.paintBackground(body)
+	// Paint with the theme the body was rendered in. In settings mode that's the
+	// candidate (preview) theme, not the still-active m.th — otherwise the reasserted
+	// page background would be the old theme's Base, ghosting dark gaps through a
+	// light preview (and vice versa).
+	paintTheme := m.th
+	if m.mode == modeSettings {
+		paintTheme = m.settings.candidateTheme
+	}
+	return m.paintBackground(body, paintTheme)
 }
 
 // paintBackground fills the whole frame with the theme's Base background and Text
@@ -1521,8 +1610,8 @@ func (m Model) View() string {
 // document default (Text on Base) after every reset so unstyled regions keep the
 // page color, then let the outer style pad each line to full width and the frame to
 // full height.
-func (m Model) paintBackground(view string) string {
-	def := lipgloss.NewStyle().Foreground(m.th.Text).Background(m.th.Base)
+func (m Model) paintBackground(view string, th theme.Theme) string {
+	def := lipgloss.NewStyle().Foreground(th.Text).Background(th.Base)
 	// The opening SGR for the default: render a marker and slice off the codes
 	// before it. Empty when the color profile has no color (e.g. tests) — a no-op.
 	stamped := def.Render("\x00")
@@ -1940,6 +2029,7 @@ func (m Model) viewFooter() string {
 			dim.Render("x mark read"),
 			dim.Render("y copy link"),
 			dim.Render("r sync all"),
+			dim.Render(", themes"),
 			themeFooterHint(m.th),
 			dim.Render("? help"),
 			dim.Render("q quit"),
@@ -1966,6 +2056,7 @@ func (m Model) viewFooter() string {
 		parts = append(parts,
 			stackHint,
 			dim.Render("r sync all"),
+			dim.Render(", themes"),
 			themeFooterHint(m.th),
 			dim.Render("? help"),
 			dim.Render("q quit"),

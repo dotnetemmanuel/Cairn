@@ -1,0 +1,36 @@
+{
+  "name": "retro-82",
+  "label": "retro-82",
+  "dark": {
+    "name": "retro-82",
+    "base": "#05182e",
+    "surface": "#0a2138",
+    "overlay": "#134e5a",
+    "text": "#f6dcac",
+    "muted": "#6d8f8a",
+    "primary": "#faa968",
+    "focus": "#3f8f8a",
+    "info": "#8cbfb8",
+    "success": "#028391",
+    "warning": "#e97b3c",
+    "danger": "#f85525",
+    "accent2": "#6a9d97",
+    "codeBg": "#103049"
+  },
+  "light": {
+    "name": "retro-82-day",
+    "base": "#f6e8cd",
+    "surface": "#ecdcb8",
+    "overlay": "#d8c49a",
+    "text": "#0a2138",
+    "muted": "#5f7d84",
+    "primary": "#d9762b",
+    "focus": "#0d6e78",
+    "info": "#17808f",
+    "success": "#0a7d6b",
+    "warning": "#c85f22",
+    "danger": "#d83a12",
+    "accent2": "#3f7d78",
+    "codeBg": "#e6d2a2"
+  }
+}
