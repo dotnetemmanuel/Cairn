@@ -1483,10 +1483,11 @@ func (m detailModel) renderInlineComment(e gh.TimelineEntry, w int, selected boo
 	loc := infoStyle(m.th).Render(fmt.Sprintf("%s:%d", shortRepo(e.Path), e.Line))
 	header := who + " " + mutedStyle(m.th).Render("on ") + loc + mutedStyle(m.th).Render(" · "+relTime(e.CreatedAt))
 	if selected {
-		// Conversation thread cursor: a full-width primary-on-surface bar makes the
-		// selected thread unmistakable (a lone ▌ read too faint).
+		// Conversation thread cursor: a full-width primary-on-focusBg bar makes the
+		// selected thread unmistakable (a lone ▌ read too faint). FocusBg defaults to
+		// Surface but a theme can set it lighter so the bar reads on a low-contrast base.
 		plain := fmt.Sprintf("%s @%s on %s:%d · %s", focusGlyph, e.Author, shortRepo(e.Path), e.Line, relTime(e.CreatedAt))
-		header = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+		header = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.FocusBg).
 			Bold(true).Width(w).Render(plain)
 	}
 
@@ -1526,10 +1527,10 @@ func (m detailModel) renderThreadReply(author, body string, when time.Time, w in
 	}
 	headerLine := indentBlock(infoStyle(m.th).Bold(true).Render("@"+author)+mutedStyle(m.th).Render(" · "+relTime(when)), marker)
 	if selected {
-		// Same primary-on-surface cursor bar as an anchor, so a reply reads as
+		// Same primary-on-focusBg cursor bar as an anchor, so a reply reads as
 		// selectable too — with the ╰→ preserved so it still nests visually.
 		plain := fmt.Sprintf("    ╰→ %s @%s · %s", focusGlyph, author, relTime(when))
-		headerLine = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+		headerLine = lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.FocusBg).
 			Bold(true).Width(w).Render(plain)
 	}
 	rbody := strings.TrimSpace(body)
@@ -1682,7 +1683,7 @@ func indentBlock(s, prefix string) string {
 }
 
 func (m detailModel) conversationHeader(e gh.TimelineEntry, selected bool, w int) string {
-	// The selected block wears a full-width primary-on-surface bar (same cursor as
+	// The selected block wears a full-width primary-on-focusBg bar (same cursor as
 	// an inline thread), with a leading glyph, so n/N selection is unmistakable.
 	if selected {
 		var what string
@@ -1695,7 +1696,7 @@ func (m detailModel) conversationHeader(e gh.TimelineEntry, selected bool, w int
 			what = "commented"
 		}
 		plain := fmt.Sprintf("%s @%s %s · %s", focusGlyph, e.Author, what, relTime(e.CreatedAt))
-		return lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.Surface).
+		return lipgloss.NewStyle().Foreground(m.th.Primary).Background(m.th.FocusBg).
 			Bold(true).Width(w).Render(plain)
 	}
 	who := infoStyle(m.th).Bold(true).Render("@" + e.Author)

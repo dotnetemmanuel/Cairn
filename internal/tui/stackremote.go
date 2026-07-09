@@ -479,7 +479,7 @@ func (s stackModel) renderRemoteChooser(w int) string {
 			"  " + mutedStyle(s.th).Render(count)
 		if i == s.chooserCursor {
 			cursor := lipgloss.NewStyle().Foreground(s.th.Primary).Render(focusGlyph + " ")
-			rows = append(rows, styledBar(s.th.Text, s.th.Surface, w, cursor+label))
+			rows = append(rows, styledBar(s.th.Text, s.th.FocusBg, w, cursor+label))
 		} else {
 			rows = append(rows, "    "+label)
 		}

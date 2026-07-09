@@ -183,5 +183,6 @@ func paletteFrom(t Theme) Palette {
 		Danger:  string(t.Danger),
 		Accent2: string(t.Accent2),
 		CodeBg:  string(t.CodeBg),
+		FocusBg: string(t.FocusBg),
 	}
 }

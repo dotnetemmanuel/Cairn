@@ -162,6 +162,34 @@ func TestBuiltinCodeBgDistinctFromBase(t *testing.T) {
 	}
 }
 
+// FocusBg backs the selected cursor bar. A theme that doesn't set it must inherit
+// Surface (so event-horizon stays byte-for-byte as it was), while retro-82 opts its
+// dark variant into a lighter tone so the bar reads against its near-black base.
+func TestFocusBgFallsBackToSurface(t *testing.T) {
+	lib := LoadLibrary("")
+	eh, ok := lib.Get("event-horizon")
+	if !ok {
+		t.Fatal("event-horizon not found")
+	}
+	for _, mode := range []string{ModeDark, ModeLight} {
+		th := ResolveNamed(eh, mode, Palette{})
+		if th.FocusBg != th.Surface {
+			t.Errorf("event-horizon %s: FocusBg %q must fall back to Surface %q", mode, th.FocusBg, th.Surface)
+		}
+	}
+	retro, ok := lib.Get("retro-82")
+	if !ok {
+		t.Fatal("retro-82 not found")
+	}
+	dark := ResolveNamed(retro, ModeDark, Palette{})
+	if dark.FocusBg == dark.Surface {
+		t.Errorf("retro-82 dark: FocusBg should be its own lighter tone, not Surface %q", dark.Surface)
+	}
+	if luminance(string(dark.FocusBg)) <= luminance(string(dark.Surface)) {
+		t.Errorf("retro-82 dark: FocusBg %q not lighter than Surface %q", dark.FocusBg, dark.Surface)
+	}
+}
+
 func TestGetOrDefault_FallsBack(t *testing.T) {
 	lib := LoadLibrary("")
 	nt := lib.GetOrDefault("does-not-exist")

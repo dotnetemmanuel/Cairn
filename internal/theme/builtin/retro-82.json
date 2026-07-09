@@ -15,7 +15,8 @@
     "warning": "#e97b3c",
     "danger": "#f85525",
     "accent2": "#6a9d97",
-    "codeBg": "#103049"
+    "codeBg": "#103049",
+    "focusBg": "#134e5a"
   },
   "light": {
     "name": "retro-82-day",

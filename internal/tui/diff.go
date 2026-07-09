@@ -188,11 +188,11 @@ func renderDiff(th theme.Theme, f gh.FileDiff, width, activeHunk, cursor int, co
 			gutter = blankGutter
 			hunkIdx++
 			if hunkIdx == activeHunk {
-				// Full-width pink-on-surface bar, matching the selected thread header in
+				// Full-width primary-on-focusBg bar, matching the selected thread header in
 				// the conversation view, so the focused hunk is unmistakable. Emitted
 				// directly (not through the gutter/wrap path) so the background spans the
 				// whole pane; rowAt still gets this line's entry to stay aligned.
-				bar := lipgloss.NewStyle().Foreground(th.Primary).Background(th.Surface).
+				bar := lipgloss.NewStyle().Foreground(th.Primary).Background(th.FocusBg).
 					Bold(true).Width(width).Render(focusGlyph + " " + raw)
 				rowAt = append(rowAt, len(out))
 				out = append(out, bar)
