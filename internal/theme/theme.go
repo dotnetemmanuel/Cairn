@@ -14,20 +14,21 @@ import (
 // in the config package) so config can embed it without an import cycle, and so
 // the TUI depends only on semantic roles — never raw hex.
 type Palette struct {
-	Name    string `yaml:"name"`
-	Base    string `yaml:"base"`    // app background
-	Surface string `yaml:"surface"` // panel background
-	Overlay string `yaml:"overlay"` // dividers, inactive pane borders
-	Text    string `yaml:"text"`    // primary text
-	Muted   string `yaml:"muted"`   // secondary text, empty CI dots, inactive nodes
-	Primary string `yaml:"primary"` // selection bar, active stack node ("you are here")
-	Focus   string `yaml:"focus"`   // focused pane border, section headers, spinners
-	Info    string `yaml:"info"`    // PR/issue numbers, links, branch names
-	Success string `yaml:"success"` // approved, merged, CI pass
-	Warning string `yaml:"warning"` // lineage drift (amber), CI pending
-	Danger  string `yaml:"danger"`  // CI fail, conflicts, changes-requested
-	Accent2 string `yaml:"accent2"` // commit hashes, subtle emphasis
-	CodeBg  string `yaml:"codeBg"`  // background for code blocks & inline code (decoupled from Overlay dividers)
+	Name    string `yaml:"name" json:"name"`
+	Base    string `yaml:"base" json:"base"`       // app background
+	Surface string `yaml:"surface" json:"surface"` // panel background
+	Overlay string `yaml:"overlay" json:"overlay"` // dividers, inactive pane borders
+	Text    string `yaml:"text" json:"text"`       // primary text
+	Muted   string `yaml:"muted" json:"muted"`     // secondary text, empty CI dots, inactive nodes
+	Primary string `yaml:"primary" json:"primary"` // selection bar, active stack node ("you are here")
+	Focus   string `yaml:"focus" json:"focus"`     // focused pane border, section headers, spinners
+	Info    string `yaml:"info" json:"info"`       // PR/issue numbers, links, branch names
+	Success string `yaml:"success" json:"success"` // approved, merged, CI pass
+	Warning string `yaml:"warning" json:"warning"` // lineage drift (amber), CI pending
+	Danger  string `yaml:"danger" json:"danger"`   // CI fail, conflicts, changes-requested
+	Accent2 string `yaml:"accent2" json:"accent2"` // commit hashes, subtle emphasis
+	CodeBg  string `yaml:"codeBg" json:"codeBg"`   // background for code blocks & inline code (decoupled from Overlay dividers)
+	FocusBg string `yaml:"focusBg" json:"focusBg"` // background of the focused/selected cursor bar (falls back to Surface when unset)
 }
 
 // DefaultPalette returns the Event Horizon (dark) palette — the source-of-truth
@@ -106,7 +107,7 @@ func Fingerprint(t Theme) string {
 		string(t.Base), string(t.Surface), string(t.Overlay), string(t.Text),
 		string(t.Muted), string(t.Primary), string(t.Focus), string(t.Info),
 		string(t.Success), string(t.Warning), string(t.Danger), string(t.Accent2),
-		string(t.CodeBg),
+		string(t.CodeBg), string(t.FocusBg),
 	}, "|")
 }
 
@@ -149,6 +150,7 @@ type Theme struct {
 	Danger  lipgloss.Color
 	Accent2 lipgloss.Color
 	CodeBg  lipgloss.Color
+	FocusBg lipgloss.Color
 }
 
 // New resolves a Palette into a Theme, falling back to the Event Horizon (dark)
@@ -175,9 +177,19 @@ func build(b, override Palette) Theme {
 		}
 		return lipgloss.Color(v)
 	}
+	// FocusBg defaults to the resolved Surface when no palette sets it, so themes
+	// that don't opt in (e.g. event-horizon) keep the original surface-backed cursor
+	// bar; retro-82 sets focusBg to a lighter tone so its focus bar reads on the dark base.
+	surface := pick(p.Surface, d.Surface)
+	focusBg := surface
+	if p.FocusBg != "" {
+		focusBg = lipgloss.Color(p.FocusBg)
+	} else if d.FocusBg != "" {
+		focusBg = lipgloss.Color(d.FocusBg)
+	}
 	return Theme{
 		Base:    pick(p.Base, d.Base),
-		Surface: pick(p.Surface, d.Surface),
+		Surface: surface,
 		Overlay: pick(p.Overlay, d.Overlay),
 		Text:    pick(p.Text, d.Text),
 		Muted:   pick(p.Muted, d.Muted),
@@ -189,5 +201,6 @@ func build(b, override Palette) Theme {
 		Danger:  pick(p.Danger, d.Danger),
 		Accent2: pick(p.Accent2, d.Accent2),
 		CodeBg:  pick(p.CodeBg, d.CodeBg),
+		FocusBg: focusBg,
 	}
 }

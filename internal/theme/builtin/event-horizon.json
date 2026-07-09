@@ -1,0 +1,36 @@
+{
+  "name": "event-horizon",
+  "label": "Event Horizon",
+  "dark": {
+    "name": "event-horizon",
+    "base": "#1c1e26",
+    "surface": "#232530",
+    "overlay": "#2e303e",
+    "text": "#fadad1",
+    "muted": "#6c6f93",
+    "primary": "#ee64ac",
+    "focus": "#26bbd9",
+    "info": "#3fc4de",
+    "success": "#29d398",
+    "warning": "#fab795",
+    "danger": "#e95678",
+    "accent2": "#59e3e3",
+    "codeBg": "#2e303e"
+  },
+  "light": {
+    "name": "event-horizon-day",
+    "base": "#e9dcbd",
+    "surface": "#dfd0ac",
+    "overlay": "#c8b78e",
+    "text": "#2b2833",
+    "muted": "#79705f",
+    "primary": "#d4267f",
+    "focus": "#0c8fa6",
+    "info": "#1577a3",
+    "success": "#09a96a",
+    "warning": "#c2611a",
+    "danger": "#db1f4d",
+    "accent2": "#0e8a86",
+    "codeBg": "#dacda6"
+  }
+}

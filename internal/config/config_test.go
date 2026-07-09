@@ -118,3 +118,52 @@ func TestSaveThemeModePreservesOtherKeys(t *testing.T) {
 		t.Errorf("ThemeMode = %q, want light", c.ThemeMode)
 	}
 }
+
+func TestDefaultThemeName(t *testing.T) {
+	if got := Default().ThemeName; got != "event-horizon" {
+		t.Errorf("default ThemeName = %q, want event-horizon", got)
+	}
+}
+
+func TestSaveThemeSelectionRoundTripsBothKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	if err := SaveThemeSelection("retro-82", "light"); err != nil {
+		t.Fatalf("SaveThemeSelection: %v", err)
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.ThemeName != "retro-82" {
+		t.Errorf("ThemeName = %q, want retro-82", c.ThemeName)
+	}
+	if c.ThemeMode != "light" {
+		t.Errorf("ThemeMode = %q, want light", c.ThemeMode)
+	}
+
+	// Re-selecting updates both keys in place (no duplication).
+	if err := SaveThemeSelection("event-horizon", "dark"); err != nil {
+		t.Fatalf("SaveThemeSelection (update): %v", err)
+	}
+	c, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.ThemeName != "event-horizon" || c.ThemeMode != "dark" {
+		t.Errorf("after update: name=%q mode=%q, want event-horizon/dark", c.ThemeName, c.ThemeMode)
+	}
+}
+
+func TestThemesDirUnderConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	got, err := ThemesDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "cairn", "themes"); got != want {
+		t.Errorf("ThemesDir = %q, want %q", got, want)
+	}
+}

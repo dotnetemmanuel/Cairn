@@ -212,18 +212,18 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 
 	if selected {
 		// On the selection bar, colors would clash — render the whole row in
-		// primary-on-surface, keeping only the CI dot colored for at-a-glance
+		// primary-on-focusBg, keeping only the CI dot colored for at-a-glance
 		// status. (The dot uses true color regardless of background.) styledBar
-		// reasserts the surface background after the CI dot's (and draft tag's)
+		// reasserts the bar background after the CI dot's (and draft tag's)
 		// reset so the highlight spans the entire line, not just up to the dot.
 		titleCell := title
 		if draftTag != "" {
-			tag := lipgloss.NewStyle().Foreground(d.th.Warning).Background(d.th.Surface).
+			tag := lipgloss.NewStyle().Foreground(d.th.Warning).Background(d.th.FocusBg).
 				Bold(true).Render(title[:len(draftTag)])
 			titleCell = tag + title[len(draftTag):]
 		}
 		plain := strings.Join([]string{ref, rev, titleCell, author, upd}, " ")
-		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+indent+ci+" "+plain))
+		fmt.Fprint(w, styledBar(d.th.Primary, d.th.FocusBg, d.width, focusCell+" "+indent+ci+" "+plain))
 		return
 	}
 
@@ -288,7 +288,7 @@ func (d itemDelegate) renderNotif(w io.Writer, n gh.Notification, selected bool)
 	if selected {
 		reason := rGlyph + " " + reasonLabelTxt
 		plain := strings.Join([]string{typeG, reason, title, upd}, " ")
-		fmt.Fprint(w, styledBar(d.th.Primary, d.th.Surface, d.width, focusCell+" "+plain))
+		fmt.Fprint(w, styledBar(d.th.Primary, d.th.FocusBg, d.width, focusCell+" "+plain))
 		return
 	}
 

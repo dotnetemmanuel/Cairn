@@ -142,6 +142,8 @@ func (m Model) helpBody(inner int) string {
 			{"s", "toggle the stack sidebar"},
 			{"S", "open stack mode (author/maintain the cwd repo's stack)"},
 			{"r", "sync all tabs (re-run every query)"},
+			{",", "settings — pick a theme (live preview)"},
+			{"ctrl+t", "toggle light / dark variant"},
 			{"?", "toggle this help"},
 			{"q", "quit"},
 		} {

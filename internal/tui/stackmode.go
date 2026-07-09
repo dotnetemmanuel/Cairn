@@ -2188,11 +2188,11 @@ func (s stackModel) renderActions(w int) string {
 		// propose target) so it stands out the same as in the tree.
 		line := fmt.Sprintf("%s  %s — %s", key, labelStyle.Render(label), colorBranches(shortStyle, s.th, short, s.allBranchNames()))
 		if i == s.cursor && s.focus == focusActions {
-			// Same full-width Surface highlight as the focused PR row: styledBar
+			// Same full-width focusBg highlight as the focused PR row: styledBar
 			// reasserts the background after each fragment's reset so the bar spans
 			// the whole line (both themes), with the cursor glyph in Primary.
 			cursor := lipgloss.NewStyle().Foreground(s.th.Primary).Render(focusGlyph + " ")
-			line = styledBar(s.th.Text, s.th.Surface, w, cursor+line)
+			line = styledBar(s.th.Text, s.th.FocusBg, w, cursor+line)
 		} else {
 			line = "  " + line
 		}
