@@ -516,6 +516,11 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		// comment, or the selected conversation thread) to the clipboard — a one-key
 		// handoff to paste back into chat. Falls back to the PR link.
 		return m.copyLink()
+	case "Y":
+		// Yank the whole text of the block under the cursor: a conversation comment
+		// or review on the conversation page, the cursor line's inline thread on the
+		// diff. The shift-pair of y — same target, the substance instead of the link.
+		return m.copyBody()
 	case "c":
 		// On the diff with the diff pane focused, c comments on the cursor
 		// line (GitHub's "Add single comment"); otherwise it's a PR-level
@@ -780,16 +785,29 @@ func commentPermalink(prURL string, commentID int) string {
 	return prURL + "#discussion_r" + strconv.Itoa(commentID)
 }
 
+// issueCommentPermalink builds the GitHub permalink for a top-level PR comment:
+// <pr-url>#issuecomment-<id>, the anchor GitHub uses for conversation comments.
+func issueCommentPermalink(prURL string, commentID int) string {
+	return prURL + "#issuecomment-" + strconv.Itoa(commentID)
+}
+
 // linkForSelection returns the most specific GitHub link for what's under the
-// cursor, plus a label for the status line: the selected conversation thread or
+// cursor, plus a label for the status line: the selected conversation block or
 // the diff cursor's inline comment when there is one, otherwise the PR itself.
 func (m detailModel) linkForSelection() (url, kind string) {
 	if m.url == "" {
 		return "", ""
 	}
-	// Conversation page: the selected (n/N) inline thread.
-	if a, ok := m.selectedAnchor(); ok && m.page == pageConversation && a.replyID > 0 {
-		return commentPermalink(m.url, a.replyID), "comment"
+	// Conversation page: the selected (n/N) block. Inline threads and top-level
+	// comments each have their own anchor; a review carries only a GraphQL node id
+	// (no numeric id to build #pullrequestreview- from), so it falls back to the PR.
+	if a, ok := m.selectedAnchor(); ok && m.page == pageConversation {
+		switch {
+		case a.replyID > 0:
+			return commentPermalink(m.url, a.replyID), "comment"
+		case a.kind == gh.KindComment && a.editID > 0:
+			return issueCommentPermalink(m.url, a.editID), "comment"
+		}
 	}
 	// Diff page: an inline comment anchored to the cursor's line (the thread anchor).
 	if m.page == pageDiff {
@@ -813,6 +831,51 @@ func (m detailModel) copyLink() (detailModel, tea.Cmd) {
 		return m, nil
 	}
 	m.status = okStyle(m.th).Render("✓ copied " + kind + " link  " + url)
+	return m, nil
+}
+
+// bodyForSelection returns the full text of the block under the cursor plus a
+// label for the status line: the selected conversation block (description,
+// top-level comment, review summary, inline comment or reply) or, on the diff,
+// the thread on the cursor's line. A multi-comment thread copies as one
+// transcript with @author headers; a lone comment copies verbatim, so a pasted
+// ```suggestion block survives the round trip.
+func (m detailModel) bodyForSelection() (text, kind string) {
+	if m.page == pageConversation {
+		a, ok := m.selectedAnchor()
+		if !ok {
+			return "", ""
+		}
+		return strings.TrimSpace(a.body), editKindLabel(a.kind)
+	}
+	cs := m.lineComments()
+	if len(cs) == 0 {
+		return "", ""
+	}
+	if len(cs) == 1 {
+		return strings.TrimSpace(cs[0].Body), "comment"
+	}
+	parts := make([]string, 0, len(cs))
+	for _, c := range cs {
+		parts = append(parts, "@"+c.Author+":\n"+strings.TrimSpace(c.Body))
+	}
+	return strings.Join(parts, "\n\n"), "thread"
+}
+
+// copyBody writes the whole text of the comment/review under the cursor to the
+// system clipboard — the paste-the-substance companion to y, which copies the
+// link to it.
+func (m detailModel) copyBody() (detailModel, tea.Cmd) {
+	text, kind := m.bodyForSelection()
+	if text == "" {
+		m.status = warnStyle(m.th).Render("nothing to copy here — put the cursor on a comment or review")
+		return m, nil
+	}
+	if err := clipboard.WriteAll(text); err != nil {
+		m.status = errStyle(m.th).Render("copy failed: " + err.Error())
+		return m, nil
+	}
+	m.status = okStyle(m.th).Render(fmt.Sprintf("✓ copied %s text (%d lines)", kind, strings.Count(text, "\n")+1))
 	return m, nil
 }
 
@@ -1898,7 +1961,7 @@ func (m detailModel) renderInfo() string {
 			b.WriteString("\n" + m.renderThreadReply(c.Author, c.Body, c.CreatedAt, m.infoVP.Width, false) + "\n")
 		}
 		b.WriteString("\n")
-		b.WriteString(mutedStyle(m.th).Render("r reply · y copy link · c new comment · v full conversation") + "\n")
+		b.WriteString(mutedStyle(m.th).Render("r reply · y copy link · Y copy text · c new comment · v full conversation") + "\n")
 		// A rule divides the contextual line thread from the PR-level info below.
 		b.WriteString(mutedStyle(m.th).Render(strings.Repeat("─", max(1, m.infoVP.Width))) + "\n\n")
 	}
@@ -2026,11 +2089,16 @@ func (m detailModel) viewFooter() string {
 		// thread, edit on one of your own blocks) show only when they apply.
 		nav := " · n/N block"
 		if a, ok := m.selectedAnchor(); ok {
-			switch {
-			case a.replyID > 0:
-				nav += " · r reply · y copy link"
-			case a.repliable():
+			if a.repliable() {
 				nav += " · r reply"
+			}
+			// y only advertises itself when the block has a link of its own — on a
+			// review or the description it would just re-yank the PR link.
+			if url, _ := m.linkForSelection(); url != "" && url != m.url {
+				nav += " · y copy link"
+			}
+			if strings.TrimSpace(a.body) != "" {
+				nav += " · Y copy text"
 			}
 			if a.mine {
 				nav += " · e edit"
@@ -2042,7 +2110,7 @@ func (m detailModel) viewFooter() string {
 		// otherwise r refreshes.
 		rk := " · r refresh"
 		if len(m.lineComments()) > 0 {
-			rk = " · r reply · y copy link"
+			rk = " · r reply · y copy link · Y copy text"
 		}
 		help = "↑/↓ line · ^d/^u page · g/G top/end · n/N change · c comment line · S suggest" + rk +
 			" · s/i files/panel · ←/→ focus · v conversation" + m.reviewKeys() + " · o open · esc back"

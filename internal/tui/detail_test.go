@@ -732,6 +732,105 @@ func TestCopyLinkResolvesCommentPermalink(t *testing.T) {
 	}
 }
 
+// A top-level conversation comment has its own #issuecomment- anchor; before
+// this it fell through to the bare PR link, which read like y was doing nothing.
+func TestCopyLinkResolvesTopLevelComment(t *testing.T) {
+	m := convDetail(t, 140)
+	m.url = "https://github.com/o/r/pull/7"
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	m.convCursor = anchorOfKind(t, m, gh.KindComment)
+	const want = "https://github.com/o/r/pull/7#issuecomment-42"
+	if url, kind := m.linkForSelection(); url != want || kind != "comment" {
+		t.Errorf("linkForSelection = %q/%q, want %q/comment", url, kind, want)
+	}
+}
+
+func TestCopyBodyResolvesSelection(t *testing.T) {
+	// Conversation page: every navigable block yields its own full text.
+	m := convDetail(t, 140)
+	m = driveDetail(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	for _, tc := range []struct {
+		kind       gh.TimelineKind
+		want, kLbl string
+	}{
+		{gh.KindDescription, "the description", "description"},
+		{gh.KindComment, "a top-level comment", "comment"},
+		{gh.KindReview, "the review summary", "review"},
+		{gh.KindInline, "tweak this", "comment"},
+	} {
+		m.convCursor = anchorOfKind(t, m, tc.kind)
+		text, kind := m.bodyForSelection()
+		if text != tc.want || kind != tc.kLbl {
+			t.Errorf("kind %d: bodyForSelection = %q/%q, want %q/%s", tc.kind, text, kind, tc.want, tc.kLbl)
+		}
+	}
+
+	// Diff page: the cursor line's inline comment, copied verbatim.
+	d := inlineDetail(t, 140, true)
+	d.focus = focusDiff
+	d = driveDetail(d,
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")},
+	)
+	if text, kind := d.bodyForSelection(); text != "tweak this" || kind != "comment" {
+		t.Errorf("diff: bodyForSelection = %q/%q, want \"tweak this\"/comment", text, kind)
+	}
+
+	// A thread with replies copies as one @author transcript.
+	d.detail.ReviewComments = append(d.detail.ReviewComments, gh.ReviewComment{
+		Author: "hubot", Body: "done", Path: "big.py", Line: 2, Side: "RIGHT",
+		DatabaseID: 1000, CreatedAt: time.Now(),
+	})
+	const wantThread = "@octocat:\ntweak this\n\n@hubot:\ndone"
+	if text, kind := d.bodyForSelection(); text != wantThread || kind != "thread" {
+		t.Errorf("thread: bodyForSelection = %q/%q, want %q/thread", text, kind, wantThread)
+	}
+
+	// Nothing under the cursor (no comment on this line) → nothing to copy.
+	e := inlineDetail(t, 140, false)
+	e.focus = focusDiff
+	if text, _ := e.bodyForSelection(); text != "" {
+		t.Errorf("empty: bodyForSelection = %q, want \"\"", text)
+	}
+}
+
+// convDetail builds a detail model whose conversation holds one of each block
+// kind: description, top-level comment, review summary, inline comment.
+func convDetail(t *testing.T, width int) detailModel {
+	t.Helper()
+	th := theme.New(theme.DefaultPalette())
+	m := newDetail(th, gh.Item{IsPR: true, Repo: "o/r", Number: 7})
+	now := time.Now()
+	detail := gh.PRDetail{
+		Number: 7, State: "OPEN", HeadSHA: "deadbeef", Body: "the description",
+		Comments: []gh.Comment{{Author: "octocat", Body: "a top-level comment", DatabaseID: 42, CreatedAt: now}},
+		Reviews:  []gh.Review{{ID: "R_1", Author: "hubot", State: "COMMENTED", Body: "the review summary", CreatedAt: now}},
+		ReviewComments: []gh.ReviewComment{
+			{Author: "octocat", Body: "tweak this", Path: "big.py", Line: 2, Side: "RIGHT", DatabaseID: 999, CreatedAt: now},
+		},
+	}
+	files := []gh.FileDiff{{
+		Filename: "big.py", Status: "modified", Additions: 2, Deletions: 1,
+		Patch: "@@ -1,2 +1,3 @@\n ctx\n-removed\n+added1\n+added2",
+	}}
+	return driveDetail(m,
+		tea.WindowSizeMsg{Width: width, Height: 40},
+		prLoadedMsg{detail: detail, files: files},
+	)
+}
+
+// anchorOfKind finds the conversation cursor index of the first block of kind k.
+func anchorOfKind(t *testing.T, m detailModel, k gh.TimelineKind) int {
+	t.Helper()
+	for i, a := range m.convAnchors {
+		if a.kind == k {
+			return i
+		}
+	}
+	t.Fatalf("no conversation anchor of kind %d in %d anchors", k, len(m.convAnchors))
+	return -1
+}
+
 func TestFilesPaneToggle(t *testing.T) {
 	m := inlineDetail(t, 140, true)
 	if f, _, _ := m.paneWidths(); f == 0 {
