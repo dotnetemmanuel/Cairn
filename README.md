@@ -173,6 +173,13 @@ Cairn shells out to `git`, `git-town`, and `gh`, and expects all three on your P
 
 Optional, at `~/.config/cairn/config.yml`. With no file, Cairn runs on sensible defaults: the built-in theme and the five default sections. It reads each repo's trunk from git-town's configuration (`git-town.main-branch`), so `master`, `trunk`, or whatever you named your main branch in 2014 works out of the box, not just `main`. If git-town isn't configured yet, a `defaultTrunk` in the config file (default `main`) fills in. Sections take GitHub search-syntax filters, so you can tune the board to your teams and repos. Full token reference lives in the build plan's Appendix A.
 
+If you keep a scratch repo for trying things out, list it under `devRepos` and it disappears from every tab, closed tails and notifications included. `cairn dev` brings it back for as long as that run lasts, and says so in the header.
+
+```yaml
+devRepos:
+  - you/your-sandbox
+```
+
 ---
 
 ## Status & roadmap

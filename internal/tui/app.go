@@ -186,6 +186,8 @@ type notifConvEntry struct {
 
 // New constructs the root model from loaded config.
 func New(cfg config.Config) Model {
+	setDevRepos(cfg.DevRepos)
+
 	mode := cfg.ThemeMode
 	if mode != theme.ModeLight {
 		mode = theme.ModeDark
@@ -342,6 +344,7 @@ func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cm
 			if err != nil {
 				return notifFeedMsg{idx: idx, err: err}
 			}
+			feed = dropHiddenNotifications(feed)
 			var unread, read []gh.Notification
 			for _, n := range feed {
 				if n.Unread {
@@ -358,6 +361,7 @@ func loadSection(idx int, typ, filter string, showClosed bool, limit int) tea.Cm
 		if typ == config.SectionOrgs {
 			return loadOrgs(idx)
 		}
+		filter = hideDevRepos(filter)
 		items, total, err := gh.SearchItems(filter, searchLimit)
 		if err != nil {
 			return sectionLoadedMsg{idx: idx, err: err}
@@ -402,7 +406,7 @@ func loadInvolved(idx int) tea.Msg {
 	var groups []group
 	total := 0
 	for _, sp := range involvedSpecs() {
-		items, _, err := gh.SearchItems(sp.filter, searchLimit)
+		items, _, err := gh.SearchItems(hideDevRepos(sp.filter), searchLimit)
 		if err != nil {
 			return groupedLoadedMsg{idx: idx, err: err}
 		}
@@ -442,7 +446,7 @@ func loadOrgs(idx int) tea.Msg {
 	for _, o := range orgs {
 		q += " org:" + o
 	}
-	items, _, err := gh.SearchItems(q, searchLimit)
+	items, _, err := gh.SearchItems(hideDevRepos(q), searchLimit)
 	if err != nil {
 		return groupedLoadedMsg{idx: idx, err: err}
 	}
@@ -1733,6 +1737,9 @@ func renderBrandHeader(th theme.Theme, login string, rate int, loading bool, her
 		calls := lipgloss.NewStyle().Foreground(th.Muted).Render(fmt.Sprintf("%d API calls remaining", rate))
 		status = lipgloss.NewStyle().Foreground(th.Text).Render("Logged in as ") + who +
 			lipgloss.NewStyle().Foreground(th.Muted).Render(" · ") + calls
+		if devMode {
+			status += lipgloss.NewStyle().Foreground(th.Warning).Render(" · dev mode: test repos visible")
+		}
 	}
 	statusRow := surfaceBar(th, width, " "+status)
 
