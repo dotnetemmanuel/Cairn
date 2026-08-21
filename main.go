@@ -21,11 +21,15 @@ func main() {
 	args := os.Args[1:]
 
 	// Bare invocation launches the TUI. CAIRN_DEMO=1 flips it to demo mode so
-	// `CAIRN_DEMO=1 cairn` works too (handy for scripted screenshot capture).
+	// `CAIRN_DEMO=1 cairn` works too (handy for scripted screenshot capture);
+	// CAIRN_DEV=1 is the same shortcut for dev mode.
 	if len(args) == 0 {
 		if os.Getenv("CAIRN_DEMO") == "1" {
 			runDemo()
 			return
+		}
+		if os.Getenv("CAIRN_DEV") == "1" {
+			tui.EnableDev()
 		}
 		runTUI()
 		return
@@ -34,6 +38,11 @@ func main() {
 	switch args[0] {
 	case "demo":
 		runDemo()
+	case "dev", "--dev", "-dev":
+		// Show the repos you test Cairn against (devRepos in config.yml) alongside
+		// real work. Everything else is a normal run.
+		tui.EnableDev()
+		runTUI()
 	case "doctor":
 		os.Exit(doctor.Run())
 	case "version", "--version", "-v":
@@ -114,6 +123,7 @@ func printHelp() {
 
 Usage:
   cairn            launch the TUI
+  cairn dev        launch the TUI with your test repos visible (devRepos in config.yml)
   cairn demo       launch the TUI against built-in fake data (no gh/git-town/auth)
   cairn doctor     diagnose tools (git, git-town, gh) and auth
   cairn version    print version

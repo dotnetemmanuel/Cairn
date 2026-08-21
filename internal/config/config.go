@@ -62,6 +62,9 @@ type Config struct {
 	DefaultTrunk string            `yaml:"defaultTrunk"`
 	RepoPaths    map[string]string `yaml:"repoPaths"`
 	Sections     []Section         `yaml:"sections"`
+	// DevRepos are repos you test Cairn against (a sandbox). They are kept out of
+	// every list unless you launch `cairn dev`, so the board only carries real work.
+	DevRepos []string `yaml:"devRepos"`
 	// ShowClosed toggles the recently-closed/merged tail shown under each PR
 	// section's open list. Per-section ShowClosed overrides this.
 	ShowClosed bool `yaml:"showClosed"`
