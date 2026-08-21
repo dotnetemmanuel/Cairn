@@ -15,7 +15,9 @@ import (
 	"github.com/dotnetemmanuel/cairn/internal/tui"
 )
 
-const version = "0.0.0-phase0"
+// version is stamped in at build time with -ldflags "-X main.version=<tag>";
+// a plain go build stays "dev" so a local binary never claims to be a release.
+var version = "dev"
 
 func main() {
 	args := os.Args[1:]
