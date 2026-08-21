@@ -191,6 +191,17 @@ func (o Ops) streamCmds(cmds [][]string) <-chan StreamEvent {
 	return ch
 }
 
+// BranchSHA returns the commit a local branch points at, or "" if it can't be
+// read. A ship uses it to tell whether GitHub's merge verdict describes the
+// branch it just pushed or the one before it.
+func (o Ops) BranchSHA(branch string) string {
+	out, err := o.Runner.Run(o.Dir, "git", "rev-parse", "refs/heads/"+branch)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // SetParent records branch's git-town parent in local .git/config — the "track
 // this branch" action that adds an untracked branch to the stack tree. Nothing is
 // committed, staged, or pushed. Streamed like the other ops so the stack screen
@@ -329,8 +340,8 @@ func (c Command) Hint() string {
 		return "gh: merge PR (squash)  →  git-town sync --stack"
 	}
 	if c.Verb == "shipstack" {
-		// The whole-stack ship loops ship's remote steps bottom-up, then syncs once.
-		return "for each branch bottom-up: gh merge PR (squash) → retarget children → delete  ·  then git-town sync"
+		// The whole-stack ship loops ship's remote steps bottom-up, syncing between them.
+		return "for each branch bottom-up: git-town sync → gh merge PR (squash) → retarget children → delete"
 	}
 	if c.Verb == "propose" {
 		// propose isn't a single git-town call: Cairn pushes the branch, then opens
@@ -431,7 +442,8 @@ func Catalog() []Command {
 			Long: "Merges the WHOLE stack in one go, wherever you are in it: starting at " +
 				"the bottom (the branch that targets trunk) and working up to the top, it " +
 				"squash-merges each pull request into the trunk, retargets the branch above " +
-				"onto the trunk, deletes the merged branch, and finally syncs once. This is " +
+				"onto the trunk, deletes the merged branch, then rebuilds the next branch on " +
+				"the merged trunk (a sync) so it can merge in turn. This is " +
 				"the most destructive action in Cairn — it lands several PRs and cannot be " +
 				"undone. If a PR along the way can't merge, the ones below it still land and " +
 				"everything above is left untouched.",

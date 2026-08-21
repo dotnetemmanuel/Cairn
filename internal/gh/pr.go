@@ -965,6 +965,50 @@ func OpenPRsByBranch(owner, repo string) (map[string]PRMergeability, error) {
 	return out, nil
 }
 
+// PRMergeSnapshot is a PR's readiness plus the head commit and base branch the
+// verdict was computed against. A whole-stack ship needs that pairing: after it
+// pushes a rewritten branch, GitHub keeps serving the OLD verdict for a moment,
+// and a "conflicting" that describes the previous head would stop a stack that
+// is about to merge cleanly.
+type PRMergeSnapshot struct {
+	PRMergeability
+	HeadOid string
+	BaseRef string
+}
+
+// PRMergeState reads one PR's landing readiness with the head and base it was
+// computed for. A whole-stack ship polls it between merges: pushing a branch (or
+// moving its base) makes GitHub recompute the merge, and it answers UNKNOWN (or
+// keeps the previous answer) while that runs.
+func PRMergeState(owner, repo string, number int) (PRMergeSnapshot, error) {
+	client, err := graphQLClient()
+	if err != nil {
+		return PRMergeSnapshot{}, err
+	}
+	var resp struct {
+		Repository struct {
+			PullRequest struct {
+				Number         int
+				IsDraft        bool
+				Mergeable      string
+				ReviewDecision string
+				HeadRefOid     string
+				BaseRefName    string
+			}
+		}
+	}
+	q := `query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$num){number isDraft mergeable reviewDecision headRefOid baseRefName}}}`
+	if err := client.Do(q, map[string]interface{}{"owner": owner, "repo": repo, "num": number}, &resp); err != nil {
+		return PRMergeSnapshot{}, err
+	}
+	pr := resp.Repository.PullRequest
+	return PRMergeSnapshot{
+		PRMergeability: PRMergeability{Number: pr.Number, Draft: pr.IsDraft, Mergeable: pr.Mergeable, ReviewDecision: pr.ReviewDecision},
+		HeadOid:        pr.HeadRefOid,
+		BaseRef:        pr.BaseRefName,
+	}, nil
+}
+
 // PRLanding records that a branch's most recent pull request has left the open
 // state — merged (shipped) or closed (abandoned) on the remote — while the local
 // stack still carries the branch. It is the drift signal local stack mode uses to

@@ -1039,25 +1039,22 @@ func TestCurrentUntrackedAndTrack(t *testing.T) {
 	}
 }
 
-// TestTreeFocusBlocksActionAccelerators: while the branch tree is focused (the
-// default on entry), the letter accelerators must NOT fire — so navigating can't
-// accidentally trigger a destructive action. You tab to the action list first.
-func TestTreeFocusBlocksActionAccelerators(t *testing.T) {
-	keys := []string{"n", "p", "I", "S", "R", "A", "M", "G", "Y"}
-	for _, k := range keys {
+// TestActionAcceleratorsWorkFromEitherPane: stack mode opens with the branch tree
+// focused, so accelerators that only worked on the action list looked like dead
+// keys. They now fire from either pane; the confirmation still gates the action.
+func TestActionAcceleratorsWorkFromEitherPane(t *testing.T) {
+	for _, focus := range []stackFocus{focusTree, focusActions} {
 		s := fixtureModel()
-		s.status.Staged = 0
-		s.focus = focusTree
-		s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
-		if s2.phase != stackBrowsing {
-			t.Errorf("key %q while the tree is focused fired something (phase=%d) — must be inert", k, s2.phase)
+		s.focus = focus
+		if s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); s2.phase != stackNaming {
+			t.Errorf("n with focus %d should start naming, got phase %d", focus, s2.phase)
 		}
 	}
-	// Sanity: with the ACTION LIST focused, an accelerator still acts (n -> naming).
+	// Tree navigation still owns its own keys, whatever the accelerators do.
 	s := fixtureModel()
-	s.focus = focusActions
-	if s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}); s2.phase != stackNaming {
-		t.Errorf("n with the action list focused should start naming, got phase %d", s2.phase)
+	s.focus = focusTree
+	if s2, _ := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}); s2.phase != stackBrowsing {
+		t.Errorf("j must still navigate the tree, got phase %d", s2.phase)
 	}
 }
 
@@ -1166,5 +1163,35 @@ func TestGhostBranchFunnelsToReconcile(t *testing.T) {
 		if !s.actionEnabled(townie.Command{Verb: verb}) {
 			t.Errorf("%s should be enabled on a live branch", verb)
 		}
+	}
+}
+
+// TestExitCarriesWhetherAnythingChanged: leaving stack mode after a merge must
+// tell the dashboard to reload, so the PRs that just landed move to Closed on
+// their own. Browsing or checking out a branch changes nothing, so it must not
+// spend API calls on a refresh.
+func TestExitCarriesWhetherAnythingChanged(t *testing.T) {
+	if !runChangesPRs("shipstack") || !runChangesPRs("propose") {
+		t.Error("merging and proposing change what the dashboard shows")
+	}
+	if runChangesPRs("checkout") || runChangesPRs("") {
+		t.Error("moving HEAD changes nothing on GitHub")
+	}
+
+	s := fixtureModel()
+	s.changed = true
+	_, cmd := s.updateBrowsing(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("esc should emit an exit command")
+	}
+	msg, ok := cmd().(stackExitMsg)
+	if !ok || !msg.changed {
+		t.Errorf("exit after a merge must ask for a refresh, got %#v", cmd())
+	}
+
+	fresh := fixtureModel()
+	_, cmd = fresh.updateBrowsing(tea.KeyMsg{Type: tea.KeyEsc})
+	if msg, _ := cmd().(stackExitMsg); msg.changed {
+		t.Error("exit after only browsing must not ask for a refresh")
 	}
 }

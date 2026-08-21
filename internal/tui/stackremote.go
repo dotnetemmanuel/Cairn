@@ -289,7 +289,7 @@ func (s stackModel) updateRemoteChooser(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	list := s.remoteChooserList()
 	switch msg.String() {
 	case "q":
-		return s, func() tea.Msg { return stackExitMsg{} }
+		return s, func() tea.Msg { return stackExitMsg{changed: s.changed} }
 	case "esc":
 		return s.toggleRemote() // step back to local mode
 	case "j", "down":
@@ -328,7 +328,7 @@ func (s stackModel) updateRemoteTree(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	nodes := s.remoteNodes()
 	switch msg.String() {
 	case "q":
-		return s, func() tea.Msg { return stackExitMsg{} }
+		return s, func() tea.Msg { return stackExitMsg{changed: s.changed} }
 	case "esc":
 		s.remoteRepo = "" // back to the chooser
 		return s, nil
@@ -411,7 +411,7 @@ func (s stackModel) runRemoteShipStack(anchor string) (stackModel, tea.Cmd) {
 	ops := s.ops
 	c := append([]string(nil), chain...)
 	return s, func() tea.Msg {
-		return readStream(shipStackStream(owner, repo, c, trunk, ops, false))
+		return readStream(shipStackStream(owner, repo, c, trunk, ops, false, liveShipAPI{}))
 	}
 }
 

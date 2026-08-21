@@ -1005,3 +1005,29 @@ func TestSubheaderShowsWithoutSidebar(t *testing.T) {
 		t.Errorf("expected the section subheader without a sidebar; got:\n%s", v)
 	}
 }
+
+// TestExitingStackModeAfterAChangeSyncsTheBoard: a merged PR should move itself
+// to Closed when you come back, without a manual refresh.
+func TestExitingStackModeAfterAChangeSyncsTheBoard(t *testing.T) {
+	cfg := config.Config{Sections: []config.Section{{Title: "My PRs", Filter: "is:open"}}}
+
+	m := New(cfg)
+	m.mode = modeStack
+	next, cmd := m.Update(stackExitMsg{changed: true})
+	m = next.(Model)
+	if cmd == nil || !m.sections[0].loading {
+		t.Error("returning from a stack change must reload the board")
+	}
+	if m.flash == "" {
+		t.Error("the reload must say why every tab just refreshed")
+	}
+
+	quiet := New(cfg)
+	quiet.mode = modeStack
+	quiet.sections[0].loading = false // New starts the board loading; clear it first
+	next, cmd = quiet.Update(stackExitMsg{})
+	quiet = next.(Model)
+	if cmd != nil || quiet.sections[0].loading {
+		t.Error("a look-and-leave must not spend API calls")
+	}
+}
