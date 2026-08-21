@@ -73,6 +73,7 @@ func runTUI() {
 		os.Exit(1)
 	}
 
+	tui.SetVersion(version)
 	p := tea.NewProgram(tui.New(cfg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "cairn: %v\n", err)
