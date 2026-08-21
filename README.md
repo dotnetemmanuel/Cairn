@@ -10,6 +10,12 @@
 
 ![Cairn](docs/media/hero.png)
 
+<div align="center">
+
+[What it is](#whats-a-cairn) · [Why it exists](#why-cairn-exists) · [What it does](#features-the-full-tour) · [How it works](#how-it-works-the-honest-version) · **[Install](#install)** · [Configuration](#configuration)
+
+</div>
+
 ---
 
 ## What's a cairn?
