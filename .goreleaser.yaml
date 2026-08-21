@@ -41,21 +41,18 @@ changelog:
   use: github-native
 
 release:
+  # Every line here is one paragraph: release notes render a single newline as a
+  # line break, so a hard-wrapped paragraph arrives in pieces.
   footer: |
     ## Installing
 
     Full instructions: https://github.com/dotnetemmanuel/Cairn/blob/main/docs/Install.md
 
-    Cairn shells out to `git`, `git-town` and `gh`, and reuses your `gh` login.
-    Run `cairn doctor` after installing and it will tell you what is missing.
+    Cairn shells out to `git`, `git-town` and `gh`, and reuses your `gh` login. Run `cairn doctor` after installing and it will tell you what is missing.
 
-    **Windows is experimental in this release.** The binaries build cleanly and
-    nothing in the code is Unix-only, but nobody has run them on Windows yet.
-    If you try it, please say how it went.
+    **Windows is experimental.** The binaries build cleanly and nothing in the code is Unix-only, but nobody has run them on Windows yet. If you try it, please say how it went.
 
-    Reporting anything is easiest from inside Cairn: press `b` and it opens an issue
-    with your version, platform and `doctor` output already filled in. Otherwise:
-    https://github.com/dotnetemmanuel/Cairn/issues
+    Reporting anything is easiest from inside Cairn: press `b` and it opens an issue with your version, platform and `doctor` output already filled in. Otherwise: https://github.com/dotnetemmanuel/Cairn/issues
 
 homebrew_casks:
   - repository:
