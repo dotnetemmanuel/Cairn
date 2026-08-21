@@ -35,12 +35,10 @@ checksum:
   algorithm: sha256
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+  # Let GitHub write the notes from the merged PRs since the last tag. The raw
+  # commit list it replaces was every commit in the project, alphabetised, with
+  # SHAs, because the first release had no previous tag to compare against.
+  use: github-native
 
 release:
   footer: |
@@ -53,7 +51,11 @@ release:
 
     **Windows is experimental in this release.** The binaries build cleanly and
     nothing in the code is Unix-only, but nobody has run them on Windows yet.
-    If you try it, please say how it went: https://github.com/dotnetemmanuel/Cairn/issues
+    If you try it, please say how it went.
+
+    Reporting anything is easiest from inside Cairn: press `b` and it opens an issue
+    with your version, platform and `doctor` output already filled in. Otherwise:
+    https://github.com/dotnetemmanuel/Cairn/issues
 
 homebrew_casks:
   - repository:
