@@ -37,30 +37,24 @@ func (r Report) OK() bool {
 
 // requiredTools are the external binaries Cairn shells out to. git-town owns
 // every stack mutation (Hard Rule 1); gh provides the token go-gh reads
-// (Hard Rule 2); git handles diff/status and the fall-through.
-var requiredTools = []struct {
-	name string
-	hint string
-}{
-	{"git", "install git"},
-	{"git-town", "install git-town: https://www.git-town.com (e.g. `pacman -S git-town`)"},
-	{"gh", "install the GitHub CLI: https://cli.github.com"},
-}
+// (Hard Rule 2); git handles diff/status and the fall-through. How to install a
+// missing one depends on the machine, so the hint is resolved at check time.
+var requiredTools = []string{"git", "git-town", "gh"}
 
 // Diagnose runs all checks and returns a Report.
 func Diagnose() Report {
 	var r Report
 
-	for _, t := range requiredTools {
-		path, err := exec.LookPath(t.name)
-		c := Check{Name: t.name, Required: true}
+	for _, tool := range requiredTools {
+		path, err := exec.LookPath(tool)
+		c := Check{Name: tool, Required: true}
 		if err != nil {
 			c.OK = false
-			c.Detail = "not found in PATH — " + t.hint
+			c.Detail = "not found in PATH — " + hintFor(tool)
 		} else {
 			c.OK = true
 			c.Detail = path
-			if v := toolVersion(t.name); v != "" {
+			if v := toolVersion(tool); v != "" {
 				c.Detail = fmt.Sprintf("%s (%s)", path, v)
 			}
 		}

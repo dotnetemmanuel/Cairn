@@ -61,6 +61,7 @@ func runTUI() {
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cairn: config error: %v\n", err)
+		holdWindowIfLaunchedByClick()
 		os.Exit(1)
 	}
 
@@ -70,6 +71,7 @@ func runTUI() {
 		fmt.Fprintln(os.Stderr, "cairn: environment not ready")
 		fmt.Fprintln(os.Stderr, report.String())
 		fmt.Fprintln(os.Stderr, "\nRun `cairn doctor` for details, fix the above, and retry.")
+		holdWindowIfLaunchedByClick()
 		os.Exit(1)
 	}
 

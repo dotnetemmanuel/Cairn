@@ -64,7 +64,14 @@ around a hundred lines.
 
 Download the archive for your platform from
 [Releases](https://github.com/dotnetemmanuel/Cairn/releases), unpack it, and put
-`cairn` somewhere on your PATH. `checksums.txt` in the same release covers every
+`cairn` somewhere on your PATH.
+
+**Which file?** Take **amd64** unless you know otherwise. It covers any Intel or
+any AMD processor: AMD designed the instruction set, Intel adopted it, and
+Windows calls it x64, so the three names mean one file. A Windows VM on an Intel
+or AMD host is amd64 too. **arm64** is only for ARM machines: Apple Silicon Macs
+(M1 and later), Snapdragon-based Windows laptops, and ARM Linux boards. Run the
+wrong one and Windows says the app cannot run on your PC. `checksums.txt` in the same release covers every
 archive:
 
 ```sh
