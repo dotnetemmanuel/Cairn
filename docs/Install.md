@@ -15,11 +15,13 @@ what is missing.
 
 ## Arch Linux
 
+The AUR package is built by every release but is not published yet: AUR account
+registration was closed when v0.1.0 was cut. Until it goes up, use the one-line
+installer below. When it lands, this becomes:
+
 ```sh
 yay -S cairn-bin        # or: paru -S cairn-bin
 ```
-
-Updates arrive with your normal system upgrade.
 
 ## macOS and Linux, with Homebrew
 

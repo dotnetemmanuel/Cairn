@@ -152,12 +152,13 @@ That's the whole trick: Cairn is the cockpit, git-town is the engine, `gh` is th
 ## Install
 
 ```sh
-yay -S cairn-bin                              # Arch
+curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh
+
 brew install dotnetemmanuel/tap/cairn         # macOS and Linux
 scoop install cairn                           # Windows (experimental in v0.1.0)
-
-curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh
 ```
+
+An Arch package is on the way; the one-line installer works there today.
 
 Archives for every platform are on the [releases page](https://github.com/dotnetemmanuel/Cairn/releases), and [docs/Install.md](docs/Install.md) covers each route, building from source, and what to do about macOS quarantine.
 
