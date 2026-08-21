@@ -191,7 +191,7 @@ An Arch package is on the way; the one-line installer works there today.
 
 Archives for every platform are on the [releases page](https://github.com/dotnetemmanuel/Cairn/releases), and [docs/Install.md](docs/Install.md) covers each route, building from source, and what to do about macOS quarantine.
 
-Found a bug, or something you needed and couldn't do? [Open an issue](https://github.com/dotnetemmanuel/Cairn/issues).
+Found a bug, or something you needed and couldn't do? The best way to tell me is from inside Cairn: press **`b`** and it opens an issue with your version, platform and `doctor` output already filled in, so I can actually reproduce it. Failing that, [open one by hand](https://github.com/dotnetemmanuel/Cairn/issues).
 
 ---
 
