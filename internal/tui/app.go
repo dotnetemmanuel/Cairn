@@ -926,6 +926,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stackExitMsg:
 		m.mode = modeDashboard
+		// A merge/propose/sync just changed things on GitHub: reload every tab so the
+		// PRs that landed move to Closed on their own, with a flash saying why.
+		if msg.changed {
+			m.flash = "↻ Your stack changed, syncing all tabs so merged PRs move to Closed…"
+			cmds := append(m.syncAllCmds(), clearFlashAfter())
+			return m, tea.Batch(cmds...)
+		}
 		return m, nil
 
 	case enterConflictMsg:

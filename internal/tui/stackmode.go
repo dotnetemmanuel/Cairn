@@ -37,8 +37,10 @@ const (
 	composeBody
 )
 
-// stackExitMsg tells the root model to return to the dashboard.
-type stackExitMsg struct{}
+// stackExitMsg tells the root model to return to the dashboard. changed is set
+// when the session merged/opened/changed something on GitHub, so the board can
+// reload instead of showing a PR that has since landed.
+type stackExitMsg struct{ changed bool }
 
 // stackStreamMsg carries one unit of a delegated op's streamed output: a line as
 // it arrives, or the terminal completion event. ch lets Update re-arm the next
@@ -70,7 +72,8 @@ type stackModel struct {
 
 	// Pane focus: the action list (right) or the branch tree (left, for checkout).
 	focus      stackFocus
-	treeCursor int // index into tree.Order when the tree is focused
+	changed    bool // a run that can change what the dashboard shows has completed
+	treeCursor int  // index into tree.Order when the tree is focused
 
 	phase    stackPhase
 	pending  townie.Command
@@ -667,6 +670,7 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 		if msg.ev.Done {
 			s.runErr = msg.ev.Err
 			s.phase = stackDone
+			s.changed = s.changed || runChangesPRs(s.pending.Verb)
 			// Remote mode has no local checkout to reload — refresh the shipped repo's
 			// PRs/tree so the merged branches drop out and the tree reflects the remote.
 			if s.remote {
@@ -728,7 +732,7 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "esc", "q":
-		return s, func() tea.Msg { return stackExitMsg{} }
+		return s, func() tea.Msg { return stackExitMsg{changed: s.changed} }
 	case "r":
 		// Re-read lineage + working-tree status, so external git changes (a
 		// checkout/commit in another terminal) show without leaving stack mode.
@@ -763,11 +767,11 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		return s, nil
 	}
 
-	// Direct command-key accelerators (n/p/I/S/R/A/M/G/Y) — but ONLY when the action
-	// list is focused, so navigating the branch tree can never accidentally fire a
-	// stack action (a stray M/G is destructive). Tab to the actions first. Guarded
-	// with !needsInit so they stay inert until git-town is set up.
-	if !s.needsInit() && s.focus == focusActions {
+	// Direct command-key accelerators (n/p/I/S/R/A/M/G/Y), from either pane — none of
+	// them collide with the tree's j/k/enter, and every one opens its confirmation
+	// before doing anything. Guarded with !needsInit so they stay inert until
+	// git-town is set up.
+	if !s.needsInit() {
 		if c := townie.Find(msg.String()); c != nil {
 			s.cursor = s.commandIndex(c.Key)
 			return s.triggerAction(*c)
@@ -803,6 +807,12 @@ func (s stackModel) updateBrowsing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		return s.triggerAction(s.commands[s.cursor])
 	}
 	return s, nil
+}
+
+// runChangesPRs reports whether a finished op can change what the dashboard
+// shows. Everything can except moving HEAD.
+func runChangesPRs(verb string) bool {
+	return verb != "" && verb != "checkout"
 }
 
 // commandIndex returns the action-list index for a command key (for cursor
@@ -1067,10 +1077,57 @@ func shipStream(owner, repo, branch, trunk string, ops townie.Ops, syncLocal boo
 	return ch
 }
 
+// shipAPI is the GitHub half of a ship: the calls that merge, move and delete
+// pull requests. An interface so the order of merges and syncs is testable
+// without touching the network.
+type shipAPI interface {
+	findPROpen(owner, repo, branch string) (int, error)
+	mergePR(owner, repo string, num int, method string) error
+	prsWithBase(owner, repo, base string) ([]int, error)
+	retargetPR(owner, repo string, num int, base string) error
+	deleteRemoteBranch(owner, repo, branch string) error
+	mergeState(owner, repo string, num int) (gh.PRMergeSnapshot, error)
+}
+
+// liveShipAPI is the production shipAPI: straight through to the gh package.
+type liveShipAPI struct{}
+
+func (liveShipAPI) findPROpen(owner, repo, branch string) (int, error) {
+	return gh.FindPROpenForBranch(owner, repo, branch)
+}
+
+func (liveShipAPI) mergePR(owner, repo string, num int, method string) error {
+	return gh.MergePR(owner, repo, num, method)
+}
+
+func (liveShipAPI) prsWithBase(owner, repo, base string) ([]int, error) {
+	return gh.PRsWithBase(owner, repo, base)
+}
+
+func (liveShipAPI) retargetPR(owner, repo string, num int, base string) error {
+	return gh.RetargetPR(owner, repo, num, base)
+}
+
+func (liveShipAPI) deleteRemoteBranch(owner, repo, branch string) error {
+	return gh.DeleteRemoteBranch(owner, repo, branch)
+}
+
+func (liveShipAPI) mergeState(owner, repo string, num int) (gh.PRMergeSnapshot, error) {
+	return gh.PRMergeState(owner, repo, num)
+}
+
+// How long a whole-stack ship waits for GitHub to recompute a PR's merge state
+// after the branch below it landed. Variables so tests don't sleep.
+var (
+	shipMergeStateTries = 10
+	shipMergeStateWait  = 2 * time.Second
+)
+
 // runShipStack merges a whole stack bottom-up: it loops ship's remote steps for
-// each branch in the chain (lowest first), then syncs once at the end. Like
-// runShip it's orchestrated here (gh merges + one git-town sync), not a townie
-// verb. branches must already be in bottom-up merge order (from shipChain).
+// each branch in the chain (lowest first), syncing between them, then syncs once
+// at the end. Like runShip it's orchestrated here (gh merges + git-town syncs),
+// not a townie verb. branches must already be in bottom-up merge order (from
+// shipChain).
 func (s stackModel) runShipStack(branches []string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: "shipstack", Title: "merge whole stack"}
@@ -1084,17 +1141,57 @@ func (s stackModel) runShipStack(branches []string) (stackModel, tea.Cmd) {
 	ops := s.ops
 	chain := append([]string(nil), branches...) // snapshot; the model is a value copy
 	return s, func() tea.Msg {
-		return readStream(shipStackStream(owner, repo, chain, trunk, ops, true))
+		return readStream(shipStackStream(owner, repo, chain, trunk, ops, true, liveShipAPI{}))
 	}
 }
 
-// shipStackStream lands a whole stack bottom-up. For each branch it merges the PR
-// (squash), retargets that branch's child PRs onto the trunk, and deletes the
-// merged branch — exactly the per-branch steps shipStream runs, looped in order.
+// streamSync runs one git town sync, forwarding its output, and returns the error
+// it ended with.
+func streamSync(ops townie.Ops, ch chan<- townie.StreamEvent) error {
+	for ev := range ops.Stream("sync", "") {
+		if ev.Done {
+			return ev.Err
+		}
+		ch <- ev
+	}
+	return nil
+}
+
+// settledMergeState reads a PR's readiness until GitHub answers for the branch we
+// actually pushed (wantHead) and the base we moved it to (wantBase), and stops
+// saying UNKNOWN. Both matter: it recomputes the merge in the background, and
+// until that finishes it serves the verdict from BEFORE the push, which would
+// condemn a branch that now merges cleanly. Returns false when no settled answer
+// arrives in time, so the caller attempts the merge rather than cancelling it.
+func settledMergeState(api shipAPI, owner, repo string, num int, wantHead, wantBase string) (gh.PRMergeSnapshot, bool) {
+	var st gh.PRMergeSnapshot
+	for i := 0; i < shipMergeStateTries; i++ {
+		got, err := api.mergeState(owner, repo, num)
+		if err != nil {
+			return st, false
+		}
+		st = got
+		fresh := (wantHead == "" || st.HeadOid == wantHead) && (wantBase == "" || st.BaseRef == wantBase)
+		if fresh && st.Mergeable != "UNKNOWN" && st.Mergeable != "" {
+			return st, true
+		}
+		time.Sleep(shipMergeStateWait)
+	}
+	return st, false
+}
+
+// shipStackStream lands a whole stack bottom-up. For each branch it syncs the
+// branch onto the freshly-merged trunk, merges the PR (squash), retargets that
+// branch's child PRs onto the trunk, and deletes the merged branch. The sync
+// between merges is what makes the run get past the first branch: everything
+// above the bottom still carries the commits that just landed as ONE squash, so
+// GitHub sees the same lines changed twice and refuses the merge until the branch
+// is rewritten onto the trunk. Remote mode has no checkout to sync, so there a
+// conflict stops the run with that explanation instead.
 // It STOPS at the first branch that can't merge (leaving the ones below landed and
 // everything above untouched), then runs ONE git town sync so the local stack
 // reflects whatever shipped. The Done event carries the blocking error, if any.
-func shipStackStream(owner, repo string, branches []string, trunk string, ops townie.Ops, syncLocal bool) <-chan townie.StreamEvent {
+func shipStackStream(owner, repo string, branches []string, trunk string, ops townie.Ops, syncLocal bool, api shipAPI) <-chan townie.StreamEvent {
 	ch := make(chan townie.StreamEvent, 64)
 	go func() {
 		defer close(ch)
@@ -1109,10 +1206,22 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 		mergedAny := false
 		var merged []string   // branches whose PR actually merged (for local cleanup)
 		var stopReason string // the branch we couldn't merge/retarget; the run halts here
-		skipSync := false     // set when we halt with a just-merged branch still undeleted
+		var syncErr error     // a git-town sync that failed, mid-run or at the end
+		skipSync := false     // set when the closing sync would be wrong or pointless
 		for i, branch := range branches {
 			ch <- townie.StreamEvent{Line: fmt.Sprintf("[%d/%d] %s", i+1, len(branches), branch)}
-			num, err := gh.FindPROpenForBranch(owner, repo, branch)
+			pushedHead := ""
+			if i > 0 && syncLocal {
+				ch <- townie.StreamEvent{Line: fmt.Sprintf("  Rebuilding %s on the merged %s before merging it…", branch, trunk)}
+				if err := streamSync(ops, ch); err != nil {
+					syncErr = err
+					stopReason = fmt.Sprintf("couldn't put %s back on top of %s after the branches below it landed", branch, trunk)
+					skipSync = true
+					break
+				}
+				pushedHead = ops.BranchSHA(branch)
+			}
+			num, err := api.findPROpen(owner, repo, branch)
 			if err != nil {
 				stopReason = err.Error()
 				break
@@ -1121,9 +1230,23 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 				stopReason = "no open PR found for " + branch
 				break
 			}
+			// Above the bottom, GitHub has just been handed a new base (and, locally, a
+			// rewritten branch) — wait for its verdict rather than racing it, and stop
+			// with a plain reason if the branch really does conflict.
+			if i > 0 {
+				st, settled := settledMergeState(api, owner, repo, num, pushedHead, trunk)
+				if settled && st.Mergeable == "CONFLICTING" {
+					stopReason = squashConflictReason(branch, branches[i-1], trunk, syncLocal)
+					skipSync = true
+					break
+				}
+			}
 			ch <- townie.StreamEvent{Line: fmt.Sprintf("  Merging PR #%d…", num)}
-			if err := gh.MergePR(owner, repo, num, "squash"); err != nil {
+			if err := api.mergePR(owner, repo, num, "squash"); err != nil {
 				stopReason = gh.FriendlyMergeError(err, branch).Error()
+				if i > 0 && strings.Contains(strings.ToLower(err.Error()), "conflict") {
+					stopReason = squashConflictReason(branch, branches[i-1], trunk, syncLocal)
+				}
 				break
 			}
 			mergedAny = true
@@ -1135,14 +1258,14 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 			// clean stop the user can finish by hand beats a silently-closed child PR.
 			retargetOK := true
 			if trunk != "" {
-				kids, err := gh.PRsWithBase(owner, repo, branch)
+				kids, err := api.prsWithBase(owner, repo, branch)
 				if err != nil {
 					retargetOK = false
 					ch <- townie.StreamEvent{Line: "    (could not list child PRs: " + err.Error() + ")"}
 				}
 				for _, kid := range kids {
 					ch <- townie.StreamEvent{Line: fmt.Sprintf("  Retargeting PR #%d onto %s…", kid, trunk)}
-					if err := gh.RetargetPR(owner, repo, kid, trunk); err != nil {
+					if err := api.retargetPR(owner, repo, kid, trunk); err != nil {
 						retargetOK = false
 						ch <- townie.StreamEvent{Line: "    (could not retarget #" + fmt.Sprint(kid) + ": " + err.Error() + ")"}
 					}
@@ -1154,7 +1277,7 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 				break
 			}
 			ch <- townie.StreamEvent{Line: fmt.Sprintf("  Merged PR #%d. Removing the branch…", num)}
-			if err := gh.DeleteRemoteBranch(owner, repo, branch); err != nil {
+			if err := api.deleteRemoteBranch(owner, repo, branch); err != nil {
 				ch <- townie.StreamEvent{Line: "    (could not delete remote branch: " + err.Error() + ")"}
 			}
 		}
@@ -1168,16 +1291,9 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 		// ship, the merged branches must drop out and their children re-parent. Skip
 		// only after a retarget halt, where a just-merged branch is still undeleted and
 		// sync would try to rebase its squashed commits and conflict.
-		var syncErr error
 		if syncLocal && mergedAny && !skipSync {
 			ch <- townie.StreamEvent{Line: "Syncing the stack…"}
-			for ev := range ops.Stream("sync", "") {
-				if ev.Done {
-					syncErr = ev.Err
-					break
-				}
-				ch <- ev
-			}
+			syncErr = streamSync(ops, ch)
 			// If we shipped the branch we were ON (the top — whole-stack always includes
 			// current), git-town's sync couldn't delete it (can't delete HEAD). Hop to
 			// the trunk and remove the leftover so a complete ship lands clean on the
@@ -1201,6 +1317,8 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 		// merged, is the error to show (a sync conflict also routes to the resolver).
 		var finalErr error
 		switch {
+		case syncErr != nil && stopReason != "":
+			finalErr = fmt.Errorf("%s: %w", stopReason, syncErr)
 		case syncErr != nil:
 			finalErr = syncErr
 		case stopReason != "":
@@ -1209,6 +1327,16 @@ func shipStackStream(owner, repo string, branches []string, trunk string, ops to
 		ch <- townie.StreamEvent{Done: true, Err: finalErr}
 	}()
 	return ch
+}
+
+// squashConflictReason explains a branch that conflicts once the branch below it
+// has been squashed into the trunk: the same changes now exist twice, as the
+// squash commit and as the original commits this branch still carries.
+func squashConflictReason(branch, below, trunk string, syncLocal bool) string {
+	if syncLocal {
+		return fmt.Sprintf("%s still conflicts with %s after being rebuilt on it: resolve the conflict on %s, push it, then re-run", branch, trunk, branch)
+	}
+	return fmt.Sprintf("%s conflicts with %s: it still carries %s's commits, which were squashed into %s when it landed. Check the repo out locally and sync the stack (S in stack mode), then re-run", branch, trunk, below, trunk)
 }
 
 // startReconcile opens the explained confirmation for reconciling the local tree
@@ -2402,7 +2530,7 @@ func (s stackModel) renderShipStackConfirm(w int) string {
 	orderNote := mutedStyle(s.th).Render(wrapPlain(
 		"Merged bottom-up, in this order. If one can't merge, the branches below it "+
 			"still land and everything above is left untouched.", textW, ""))
-	effect := fmt.Sprintf("Squash-merges each PR into %s, deletes each merged branch, then syncs once so what remains re-parents onto %s.", trunk, trunk)
+	effect := fmt.Sprintf("Squash-merges each PR into %s and deletes each merged branch, syncing between merges so the next branch sits on the merged %s and what remains re-parents onto it.", trunk, trunk)
 	effectLine := colorBranches(lipgloss.NewStyle().Foreground(s.th.Warning), s.th, wrapPlain("• "+effect, textW, "  "), s.allBranchNames())
 	cmdLine := lipgloss.NewStyle().Foreground(s.th.Muted).Render("runs:  " + s.pending.Hint())
 	confirm := lipgloss.NewStyle().Foreground(s.th.Danger).Bold(true).Render(fmt.Sprintf("[enter] merge %d branches", len(branches))) +
