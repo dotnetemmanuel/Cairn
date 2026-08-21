@@ -151,6 +151,29 @@ That's the whole trick: Cairn is the cockpit, git-town is the engine, `gh` is th
 
 ## Install
 
+### What you need first
+
+Cairn is one binary that drives three tools you probably already have. Install them before Cairn, because it checks on startup and refuses to launch without them, naming the one that is missing:
+
+| | | |
+|---|---|---|
+| [git](https://git-scm.com) | diffs, status, and command fall-through | `pacman -S git` · `brew install git` |
+| [git-town](https://www.git-town.com) | every stack mutation: sync, restack, ship | `pacman -S git-town` · `brew install git-town` |
+| [gh](https://cli.github.com) | the GitHub CLI, whose token Cairn reads | `pacman -S github-cli` · `brew install gh` |
+
+Then authenticate once, with `gh`, not with Cairn:
+
+```sh
+gh auth login
+gh auth refresh -s read:org,workflow   # org repos need read:org, Actions need workflow
+```
+
+Cairn never stores a token of its own. `cairn doctor` checks all of the above and tells you what is missing, in plain language.
+
+Homebrew pulls the three tools in for you. The install script and the release archives do not: they tell you what to install.
+
+### Getting the binary
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh
 
@@ -161,8 +184,6 @@ scoop install cairn                           # Windows (experimental in v0.1.0)
 An Arch package is on the way; the one-line installer works there today.
 
 Archives for every platform are on the [releases page](https://github.com/dotnetemmanuel/Cairn/releases), and [docs/Install.md](docs/Install.md) covers each route, building from source, and what to do about macOS quarantine.
-
-Cairn shells out to `git`, `git-town` and `gh`, and reuses your `gh` login. Run `cairn doctor` and it'll tell you exactly what's missing, in plain language, instead of failing three screens deep with a stack trace.
 
 Found a bug, or something you needed and couldn't do? [Open an issue](https://github.com/dotnetemmanuel/Cairn/issues).
 
