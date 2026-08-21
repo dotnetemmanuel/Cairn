@@ -1257,6 +1257,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the detail view. Works on any PR row, and on a PR/issue/other
 			// notification (via its web URL) in the inbox.
 			return m.copySelectedLink()
+		case "b":
+			// A prefilled bug report: version, platform and doctor output are already
+			// in the form, so what lands in the tracker is reproducible.
+			m.flash = "↻ Opening a bug report in your browser, with your version and setup filled in…"
+			return m, tea.Batch(openBugReport(), clearFlashAfter())
 		case "r":
 			// Refresh is a whole-board sync, not just the active tab: re-run every
 			// section's query so a PR whose state changed (e.g. you just commented on

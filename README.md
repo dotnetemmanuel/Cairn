@@ -151,21 +151,20 @@ That's the whole trick: Cairn is the cockpit, git-town is the engine, `gh` is th
 
 ## Install
 
-See **[docs/Install.md](docs/Install.md)** for the current build-from-source steps. Packaged binaries (AUR, releases) are coming in the distribution phase.
-
-The short version, if you're impatient:
-
 ```sh
-git clone https://github.com/dotnetemmanuel/Cairn.git
-cd Cairn
-go build -o cairn .
-gh auth login                              # Cairn reuses this token
-gh auth refresh -s read:org,workflow       # org repos + Actions
-./cairn doctor                             # confirm your setup is green
-./cairn                                    # launch
+curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh
+
+brew install dotnetemmanuel/tap/cairn         # macOS and Linux
+scoop install cairn                           # Windows (experimental in v0.1.0)
 ```
 
-Cairn shells out to `git`, `git-town`, and `gh`, and expects all three on your PATH. Run `cairn doctor` and it'll tell you exactly what's missing, in plain language, instead of failing three screens deep with a stack trace.
+An Arch package is on the way; the one-line installer works there today.
+
+Archives for every platform are on the [releases page](https://github.com/dotnetemmanuel/Cairn/releases), and [docs/Install.md](docs/Install.md) covers each route, building from source, and what to do about macOS quarantine.
+
+Cairn shells out to `git`, `git-town` and `gh`, and reuses your `gh` login. Run `cairn doctor` and it'll tell you exactly what's missing, in plain language, instead of failing three screens deep with a stack trace.
+
+Found a bug, or something you needed and couldn't do? [Open an issue](https://github.com/dotnetemmanuel/Cairn/issues).
 
 ---
 
@@ -184,7 +183,9 @@ devRepos:
 
 ## Status & roadmap
 
-Cairn is real and usable today: the board, in-pane review, the stack tree, full stack authoring, ship (single and whole-stack), remote stack mode, drift reconcile, the conflict resolver, and the notifications inbox all work. What's left is polish and, notably, **packaging and distribution** (goreleaser binaries, an AUR package), tracked as the final phase, so for now you build from source like it's an artisanal experience.
+Cairn is real and usable today: the board, in-pane review, the stack tree, full stack authoring, ship (single and whole-stack), remote stack mode, drift reconcile, the conflict resolver, and the notifications inbox all work. It ships as a packaged binary for Linux, macOS and Windows, on Arch, Homebrew, Scoop, or one curl command.
+
+Version numbers say `0.x` on purpose: keys, config keys and command names may still move between releases. Windows is experimental until someone confirms it runs there. What's left is polish, and whatever you find and report.
 
 ---
 

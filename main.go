@@ -15,7 +15,9 @@ import (
 	"github.com/dotnetemmanuel/cairn/internal/tui"
 )
 
-const version = "0.0.0-phase0"
+// version is stamped in at build time with -ldflags "-X main.version=<tag>";
+// a plain go build stays "dev" so a local binary never claims to be a release.
+var version = "dev"
 
 func main() {
 	args := os.Args[1:]
@@ -71,6 +73,7 @@ func runTUI() {
 		os.Exit(1)
 	}
 
+	tui.SetVersion(version)
 	p := tea.NewProgram(tui.New(cfg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "cairn: %v\n", err)

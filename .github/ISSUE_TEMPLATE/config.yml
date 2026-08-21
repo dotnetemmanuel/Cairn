@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Installing Cairn
+    url: https://github.com/dotnetemmanuel/Cairn/blob/main/docs/Install.md
+    about: Install routes for Linux, macOS and Windows, and building from source.
+  - name: What Cairn does
+    url: https://github.com/dotnetemmanuel/Cairn/blob/main/README.md
+    about: The full tour, the keys, and how the stack workflow fits together.

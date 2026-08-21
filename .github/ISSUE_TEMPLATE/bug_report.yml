@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in Cairn behaved wrongly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The two fields below are what make a terminal
+        bug reproducible, so they are required.
+
+        `cairn doctor` reports which tools it found and whether you are logged in.
+        It never prints your token.
+  - type: input
+    id: version
+    attributes:
+      label: Cairn version
+      description: Output of `cairn version`.
+      placeholder: cairn 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `cairn doctor`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and terminal
+      placeholder: Arch Linux, Alacritty. Or macOS 15, iTerm2. Or Windows 11, Windows Terminal.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: The keys you pressed and the screen you were on.
+      placeholder: |
+        1. Opened cairn in a repo with a three branch stack
+        2. Pressed S, then G
+        3. Confirmed with enter
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true

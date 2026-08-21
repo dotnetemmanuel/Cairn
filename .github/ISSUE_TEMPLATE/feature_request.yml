@@ -1,0 +1,30 @@
+name: Feature request
+description: Cairn could not do something you needed
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe what you were trying to get done, not the feature you imagine.
+        The workflow is the useful part; the design usually looks different once
+        the problem is clear.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What were you trying to do?
+      placeholder: I keep a stack of four PRs and I wanted to reorder two of them without leaving Cairn.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How do you do it today?
+      description: The command line you drop to, the browser tab you open, the thing you gave up on.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Anything you already have in mind (optional)
+    validations:
+      required: false

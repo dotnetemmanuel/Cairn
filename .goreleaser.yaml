@@ -1,0 +1,105 @@
+version: 2
+
+project_name: cairn
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: cairn
+    main: .
+    binary: cairn
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  # The name template is a contract: scripts/install.sh builds its download URL
+  # from the OS and architecture alone, so changing this breaks the installer.
+  - id: cairn
+    name_template: "cairn_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE.MD
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  footer: |
+    ## Installing
+
+    Full instructions: https://github.com/dotnetemmanuel/Cairn/blob/main/docs/Install.md
+
+    Cairn shells out to `git`, `git-town` and `gh`, and reuses your `gh` login.
+    Run `cairn doctor` after installing and it will tell you what is missing.
+
+    **Windows is experimental in this release.** The binaries build cleanly and
+    nothing in the code is Unix-only, but nobody has run them on Windows yet.
+    If you try it, please say how it went: https://github.com/dotnetemmanuel/Cairn/issues
+
+homebrew_casks:
+  - repository:
+      owner: dotnetemmanuel
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/dotnetemmanuel/Cairn
+    description: Keyboard-driven terminal cockpit for GitHub, with stacked PRs
+    binaries:
+      - cairn
+    dependencies:
+      - formula: git
+      - formula: git-town
+      - formula: gh
+
+scoops:
+  - repository:
+      owner: dotnetemmanuel
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/dotnetemmanuel/Cairn
+    description: Keyboard-driven terminal cockpit for GitHub, with stacked PRs
+    license: MIT
+    # Scoop cannot depend on packages outside its own buckets, so the tools Cairn
+    # shells out to are named here instead.
+    post_install:
+      - "Write-Host 'Cairn needs git, git-town and gh on your PATH. Run: cairn doctor'"
+
+aurs:
+  # Publishing is off until an AUR account exists: registration was closed when
+  # v0.1.0 was cut. The package is still generated into dist/ on every release, so
+  # flipping skip_upload to false is the only change needed to go live.
+  - skip_upload: true
+    name: cairn-bin
+    homepage: https://github.com/dotnetemmanuel/Cairn
+    description: Keyboard-driven terminal cockpit for GitHub, with stacked PRs
+    maintainers:
+      - "Emmanuel Duchene <emmanuel@mindfulstack.se>"
+    license: MIT
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: ssh://aur@aur.archlinux.org/cairn-bin.git
+    depends:
+      - git
+      - git-town
+      - github-cli
+    package: |-
+      install -Dm755 "./cairn" "${pkgdir}/usr/bin/cairn"
+      install -Dm644 "./LICENSE.MD" "${pkgdir}/usr/share/licenses/cairn-bin/LICENSE"
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/cairn-bin/README.md"
