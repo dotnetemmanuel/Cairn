@@ -181,8 +181,12 @@ Homebrew pulls the three tools in for you. The install script and the release ar
 ### Getting the binary
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh
-
+curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh   # macOS and Linux
+```
+```powershell
+irm https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.ps1 | iex          # Windows (experimental in v0.1.0)
+```
+```sh
 brew install dotnetemmanuel/tap/cairn         # macOS and Linux
 scoop install cairn                           # Windows (experimental in v0.1.0)
 ```

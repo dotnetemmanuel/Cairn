@@ -6,8 +6,8 @@
 #
 # Installs into ~/.local/bin (override with CAIRN_INSTALL_DIR). Never installs
 # system packages: it checks for the tools Cairn shells out to and tells you what
-# to run. Windows is not covered here, use Scoop or the .zip from the release
-# page.
+# to run. Windows is not covered here, use scripts/install.ps1, Scoop, or the
+# .zip from the release page.
 set -eu
 
 REPO=dotnetemmanuel/Cairn
@@ -33,8 +33,8 @@ done
 os=$(uname -s)
 case $os in
   Linux) os=linux ;;
-  Darwin) os=darwin ;;
-  MINGW*|MSYS*|CYGWIN*) die "on Windows use: scoop install cairn, or the .zip from https://github.com/$REPO/releases" ;;
+  Darwin) os=macos ;;
+  MINGW*|MSYS*|CYGWIN*) die "on Windows use scripts/install.ps1, scoop install cairn, or the .zip from https://github.com/$REPO/releases" ;;
   *) die "unsupported operating system: $os" ;;
 esac
 
@@ -93,27 +93,48 @@ case ":$PATH:" in
   *) say ""; say "$INSTALL_DIR is not on your PATH. Add this to your shell profile:"; say "  export PATH=\"\$PATH:$INSTALL_DIR\"" ;;
 esac
 
+# Mirrors internal/doctor/hints.go's installHint: keep the two in sync, since
+# this is what a fresh install prints and doctor is what every later run prints.
+tool_hint() {
+  tool=$1
+  case $os in
+    macos) say "  brew install $tool" ;;
+    linux)
+      if command -v pacman >/dev/null 2>&1; then
+        case $tool in
+          gh) say "  sudo pacman -S github-cli" ;;
+          *) say "  sudo pacman -S $tool" ;;
+        esac
+      elif command -v apt >/dev/null 2>&1; then
+        case $tool in
+          git) say "  sudo apt install git" ;;
+          gh) say "  see https://cli.github.com (it ships its own apt repository)" ;;
+          git-town) say "  take the .deb from https://github.com/git-town/git-town/releases/latest" ;;
+        esac
+      elif command -v dnf >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; then
+        pm=dnf; command -v dnf >/dev/null 2>&1 || pm=zypper
+        case $tool in
+          git) say "  sudo $pm install git" ;;
+          gh) say "  sudo $pm install gh" ;;
+          git-town) say "  take the .rpm from https://github.com/git-town/git-town/releases/latest" ;;
+        esac
+      else
+        say "  see https://github.com/$REPO/blob/main/docs/Install.md for your platform"
+      fi
+      ;;
+  esac
+}
+
 missing=
-missing_pacman=
 for tool in git git-town gh; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    missing="$missing $tool"
-    case $tool in
-      gh) missing_pacman="$missing_pacman github-cli" ;;
-      *) missing_pacman="$missing_pacman $tool" ;;
-    esac
-  fi
+  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
   say ""
   say "Cairn shells out to these, and they are not on your PATH:$missing"
-  if [ "$os" = darwin ]; then
-    say "  brew install$missing"
-  elif command -v pacman >/dev/null 2>&1; then
-    say "  sudo pacman -S$missing_pacman"
-  else
-    say "  see https://github.com/$REPO/blob/main/docs/Install.md for your platform"
-  fi
+  for tool in $missing; do
+    tool_hint "$tool"
+  done
 fi
 
 say ""

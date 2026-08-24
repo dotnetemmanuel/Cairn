@@ -40,7 +40,31 @@ Scoop cannot install `git-town` or `gh` for you. Get them from
 [git-town.com](https://www.git-town.com) and [cli.github.com](https://cli.github.com),
 or `scoop install git gh` plus the git-town release binary.
 
-## Anything else, with one command
+## Windows, with one command
+
+```powershell
+irm https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.ps1 | iex
+```
+
+It detects your architecture, downloads the matching build, checks it against
+the release's `checksums.txt` before unpacking, installs into
+`%LOCALAPPDATA%\Programs\cairn`, and adds that to your user PATH (not the
+system one, and it tells you exactly what it changed and how to undo it). Like
+Scoop, it cannot install `git-town` or `gh` for you; it prints the `winget`
+command for each one missing.
+
+```powershell
+# a specific version, or a different directory
+& ([scriptblock]::Create((irm .../install.ps1))) -Version v0.1.1
+& ([scriptblock]::Create((irm .../install.ps1))) -InstallDir C:\tools\cairn
+```
+
+If you would rather read a script before piping it into PowerShell, that is
+the right instinct: it is
+[scripts/install.ps1](https://github.com/dotnetemmanuel/Cairn/blob/main/scripts/install.ps1),
+the Windows counterpart to `install.sh` below.
+
+## macOS and Linux, anything else, with one command
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh

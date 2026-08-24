@@ -18,10 +18,13 @@ builds:
       - -s -w -X main.version={{ .Version }}
 
 archives:
-  # The name template is a contract: scripts/install.sh builds its download URL
-  # from the OS and architecture alone, so changing this breaks the installer.
+  # The name template is a contract: scripts/install.sh and scripts/install.ps1
+  # build their download URLs from the OS and architecture alone, so changing
+  # this breaks both installers. "darwin" is Go's GOOS name, not what anyone
+  # calls the OS, so the archive says macos instead; amd64/arm64 stay as-is.
   - id: cairn
-    name_template: "cairn_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: >-
+      cairn_{{ .Version }}_{{ if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}_{{ .Arch }}
     formats: [tar.gz]
     format_overrides:
       - goos: windows
