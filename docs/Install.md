@@ -112,6 +112,14 @@ xattr -d com.apple.quarantine ./cairn
 
 The Homebrew route avoids that.
 
+On Windows, a binary downloaded through a browser carries a mark Windows uses
+to flag unfamiliar apps: double-click `cairn.exe` from Explorer and Microsoft
+Defender SmartScreen says "Windows protected your PC", because Cairn is not
+signed with a code-signing certificate. Click **More info**, then **Run
+anyway**, the same one-time trust decision as the macOS quarantine step above.
+`scripts/install.ps1` does not hit this, since SmartScreen only checks files
+Explorer launches, not ones a script starts directly.
+
 ## Building from source
 
 You need [Go](https://go.dev) 1.26 or newer. Go resolves the library
