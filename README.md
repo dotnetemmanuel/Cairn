@@ -184,11 +184,11 @@ Homebrew pulls the three tools in for you. The install script and the release ar
 curl -fsSL https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.sh | sh   # macOS and Linux
 ```
 ```powershell
-irm https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.ps1 | iex          # Windows (experimental in v0.1.0)
+irm https://raw.githubusercontent.com/dotnetemmanuel/Cairn/main/scripts/install.ps1 | iex          # Windows
 ```
 ```sh
 brew install dotnetemmanuel/tap/cairn         # macOS and Linux
-scoop install cairn                           # Windows (experimental in v0.1.0)
+scoop install cairn                           # Windows
 ```
 
 An Arch package is on the way; the one-line installer works there today.
@@ -216,7 +216,7 @@ devRepos:
 
 Cairn is real and usable today: the board, in-pane review, the stack tree, full stack authoring, ship (single and whole-stack), remote stack mode, drift reconcile, the conflict resolver, and the notifications inbox all work. It ships as a packaged binary for Linux, macOS and Windows, on Arch, Homebrew, Scoop, or one curl command.
 
-Version numbers say `0.x` on purpose: keys, config keys and command names may still move between releases. Windows is experimental until someone confirms it runs there. What's left is polish, and whatever you find and report.
+Version numbers say `0.x` on purpose: keys, config keys and command names may still move between releases. Windows has had less mileage than Linux and macOS, but it has been confirmed running end to end, install through the full TUI. What's left is polish, and whatever you find and report.
 
 ---
 

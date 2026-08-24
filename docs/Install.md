@@ -8,10 +8,11 @@ token. There is no Cairn login and Cairn never stores a token of its own. The
 Arch and Homebrew routes pull those three tools in for you; the others tell you
 what is missing.
 
-> **Windows is experimental in v0.1.0.** The binaries build cleanly and nothing
-> in the code is Unix-only, but nobody has run Cairn on Windows yet. Expect the
-> box drawing to look right in Windows Terminal and poor in the old console. If
-> you try it, please [say how it went](https://github.com/dotnetemmanuel/Cairn/issues).
+> **Windows is confirmed working as of v0.1.1**, install through the full TUI,
+> on Windows 11 in Windows Terminal. It has had far less real-world use than
+> Linux and macOS, though, so if something looks wrong, especially box drawing
+> in the old console rather than Windows Terminal,
+> [say so](https://github.com/dotnetemmanuel/Cairn/issues).
 
 ## Arch Linux
 
