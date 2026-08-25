@@ -547,6 +547,169 @@ func TestStackTabFocusesTreeAndCheckout(t *testing.T) {
 	}
 }
 
+func TestStackCheckoutRefusedWhenAnotherWorktreeHoldsBranch(t *testing.T) {
+	s := fixtureModel() // current = feat-mid
+	s.focus = focusTree
+	s.held = map[string]string{"feat-top": "/home/e/repo-top"}
+	s.treeCursor = s.tree.IndexOf("feat-top")
+	s2, cmd := s.updateTree(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("a branch held by another worktree must not shell out to git checkout")
+	}
+	if s2.phase != stackDone || s2.blocked == "" {
+		t.Fatalf("want a shown refusal, got phase=%d blocked=%q", s2.phase, s2.blocked)
+	}
+	if s2.runErr != nil {
+		t.Errorf("a git rule saying no is not a failure; got err=%v", s2.runErr)
+	}
+	if !strings.Contains(s2.output, "/home/e/repo-top") {
+		t.Errorf("refusal should name the worktree holding it; got:\n%s", s2.output)
+	}
+	if out := s2.renderOutput(60); strings.Contains(out, "failed") {
+		t.Errorf("the result pane must not read as a failure; got:\n%s", out)
+	}
+	// The branches that are free still check out.
+	s.treeCursor = s.tree.IndexOf("feat-base")
+	if _, cmd := s.updateTree(tea.KeyMsg{Type: tea.KeyEnter}); cmd == nil {
+		t.Error("an unheld branch should still check out")
+	}
+}
+
+func TestTreeBadgesBranchesHeldByAnotherWorktree(t *testing.T) {
+	s := fixtureModel()
+	s.held = map[string]string{"feat-top": "/home/e/repo-top"}
+	s.loose = []string{"spike"}
+	out := s.renderLocalTree(60)
+	if !strings.Contains(out, "worktree") {
+		t.Errorf("tree should badge the held branch; got:\n%s", out)
+	}
+	s.held = map[string]string{"spike": "/home/e/repo-spike"}
+	if out := s.renderLocalTree(60); !strings.Contains(out, "worktree") {
+		t.Errorf("a held loose branch should be badged too; got:\n%s", out)
+	}
+}
+
+func TestDriftCheckCoversSiblingStacks(t *testing.T) {
+	s := newStackModelBare(theme.New(theme.DefaultPalette()), "o/sandbox")
+	// Two stacks off the same trunk; we are standing in the second.
+	lin := stack.Lineage{
+		Trunk:     "main",
+		Parents:   map[string]string{"feat-landed": "main", "fix-here": "main"},
+		Perennial: map[string]bool{},
+	}
+	s.tree = stack.BuildTree(lin, "fix-here", func(_, _ string) bool { return false })
+	s.status = stack.RepoStatus{InRepo: true, Branch: "fix-here"}
+	got := s.trackedFeatureBranches()
+	if len(got) != 2 {
+		t.Fatalf("drift check must cover every tracked branch the tree draws, got %v", got)
+	}
+	// The banner stays scoped to the stack we are in.
+	s.drift = map[string]gh.PRLanding{"feat-landed": {Number: 29, Merged: true}}
+	if merged, closed := s.remoteDrift(); len(merged)+len(closed) != 0 {
+		t.Errorf("a sibling stack must not raise this stack's reconcile banner: %v %v", merged, closed)
+	}
+}
+
+func TestTreeBadgesMergedSiblingRatherThanNoPR(t *testing.T) {
+	s := fixtureModel()
+	s.prNums = map[string]int{"feat-base": 10, "feat-mid": 11}
+	s.prMerge = map[string]gh.PRMergeability{"feat-base": {Number: 10}, "feat-mid": {Number: 11}}
+	s.drift = map[string]gh.PRLanding{"feat-top": {Number: 29, Merged: true}}
+	out := s.renderLocalTree(60)
+	if !strings.Contains(out, "merged") {
+		t.Errorf("a branch whose PR landed should read merged; got:\n%s", out)
+	}
+	if strings.Contains(out, "no PR") {
+		t.Errorf("a landed branch must not read \"no PR\"; got:\n%s", out)
+	}
+}
+
+func TestDeepNarrowTreeWithTagsDoesNotPanic(t *testing.T) {
+	s := newStackModelBare(theme.New(theme.DefaultPalette()), "o/sandbox")
+	s.width = 80
+	parents := map[string]string{"lvl-01": "main"}
+	for i := 2; i <= 12; i++ {
+		parents[fmt.Sprintf("lvl-%02d", i)] = fmt.Sprintf("lvl-%02d", i-1)
+	}
+	s.tree = stack.BuildTree(stack.Lineage{Trunk: "main", Parents: parents, Perennial: map[string]bool{}},
+		"lvl-12", func(_, _ string) bool { return true })
+	s.status = stack.RepoStatus{InRepo: true, Branch: "lvl-12"}
+	// Every tag at once on the deepest, most indented row.
+	s.prNums = map[string]int{"lvl-12": 4321}
+	s.prMerge = map[string]gh.PRMergeability{"lvl-12": {Number: 4321, Draft: true}}
+	s.held = map[string]string{"lvl-12": "/home/e/elsewhere"}
+	out := s.renderLocalTree(s.treeWidth())
+	// The name outranks the tags: it must survive where they cannot.
+	if !strings.Contains(out, "lvl-12") {
+		t.Errorf("the deepest branch lost its name to the tags; got:\n%s", out)
+	}
+}
+
+func TestTagsSurviveOnAnOrdinaryRow(t *testing.T) {
+	s := newStackModelBare(theme.New(theme.DefaultPalette()), "o/sandbox")
+	s.width = 80
+	lin := stack.Lineage{
+		Trunk:     "main",
+		Parents:   map[string]string{"feat-1": "main", "feat-2": "feat-1", "feat-3": "feat-2"},
+		Perennial: map[string]bool{},
+	}
+	// feat-3 carries every tag at once, on a roomy terminal.
+	s.tree = stack.BuildTree(lin, "feat-3", func(b, _ string) bool { return b == "feat-3" })
+	s.status = stack.RepoStatus{InRepo: true, Branch: "feat-3"}
+	s.prNums = map[string]int{"feat-3": 123}
+	s.prMerge = map[string]gh.PRMergeability{"feat-3": {Number: 123, Draft: true}}
+	s.held = map[string]string{"feat-3": "/home/e/elsewhere"}
+	out := s.renderLocalTree(s.treeWidth())
+	for _, want := range []string{"feat-3", "#123", "draft", "worktree", "⚠"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a row that fits must keep %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestTruncateSurvivesNegativeWidth(t *testing.T) {
+	if got := truncate("feat/some-branch", -3); got != "" {
+		t.Errorf("truncate(-3) = %q, want empty and no panic", got)
+	}
+	if got := truncate("feat/some-branch", 0); got != "" {
+		t.Errorf("truncate(0) = %q", got)
+	}
+}
+
+func TestProposeReasonPointsSomewhereThatWorksForASiblingStack(t *testing.T) {
+	s := newStackModelBare(theme.New(theme.DefaultPalette()), "o/sandbox")
+	lin := stack.Lineage{
+		Trunk:     "main",
+		Parents:   map[string]string{"feat-landed": "main", "fix-here": "main"},
+		Perennial: map[string]bool{},
+	}
+	s.tree = stack.BuildTree(lin, "fix-here", func(_, _ string) bool { return false })
+	s.status = stack.RepoStatus{InRepo: true, Branch: "fix-here", HasUpstream: true}
+	s.prNums = map[string]int{}
+	s.drift = map[string]gh.PRLanding{"feat-landed": {Number: 29, Merged: true}}
+	s.focus = focusTree
+	s.treeCursor = s.tree.IndexOf("feat-landed")
+
+	propose := townie.Command{Verb: "propose"}
+	if s.actionEnabled(propose) {
+		t.Error("a branch whose PR already merged must not be re-proposed")
+	}
+	// X is inert outside the current stack, so the reason must not send you there.
+	if s.hasRemoteDrift() {
+		t.Fatal("fixture is wrong: reconcile should not apply to a sibling stack")
+	}
+	r := s.actionDisabledReason(propose)
+	if !strings.Contains(r, "check it out first") {
+		t.Errorf("reason should point at a key that does something; got %q", r)
+	}
+	// Inside the current stack, reconcile IS the move, so the wording stays.
+	s.drift = map[string]gh.PRLanding{"fix-here": {Number: 30, Merged: true}}
+	s.treeCursor = s.tree.IndexOf("fix-here")
+	if r := s.actionDisabledReason(propose); !strings.Contains(r, "reconcile (X)") {
+		t.Errorf("in-stack reason should still point at reconcile; got %q", r)
+	}
+}
+
 func TestStackCheckoutCurrentBranchIsNoop(t *testing.T) {
 	s := fixtureModel()
 	s.focus = focusTree
