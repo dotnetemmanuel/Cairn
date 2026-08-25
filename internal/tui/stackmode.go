@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -65,7 +66,10 @@ type stackModel struct {
 	status stack.RepoStatus
 	tree   *stack.Tree // local git-town tree (drift-aware); nil when no git-town
 	loose  []string    // local branches not in the stack (no git-town parent) — "not in a stack"
-	trunk  string      // best-effort trunk guess, for the git-town init prompt
+	// held is branch -> path of the OTHER worktree that has it checked out. Git
+	// allows one working copy per branch, so these can't be checked out here.
+	held  map[string]string
+	trunk string // best-effort trunk guess, for the git-town init prompt
 
 	commands []townie.Command
 	cursor   int
@@ -75,8 +79,11 @@ type stackModel struct {
 	changed    bool // a run that can change what the dashboard shows has completed
 	treeCursor int  // index into tree.Order when the tree is focused
 
-	phase    stackPhase
-	pending  townie.Command
+	phase   stackPhase
+	pending townie.Command
+	// blocked is a short "you can't do that here" headline for the result pane —
+	// a git rule said no, so it reads amber, not as a red failure.
+	blocked  string
 	affected []string
 	name     textinput.Model
 	opName   string // branch name of the op currently running/shown
@@ -103,11 +110,11 @@ type stackModel struct {
 	// reconstructed stacks (BuildRemoteStacks). Ship actions are pure GitHub API
 	// (merge / retarget / delete), skipping the local git-town sync local mode runs.
 	// The default (remote=false) is the local git-town tree above.
-	remote        bool                        // in remote mode
-	remoteStacks  []*stack.Tree               // snapshot of the app's PR-reconstructed stacks (all repos)
-	remoteRepo    string                      // chosen repo slug; "" = show the repo chooser
-	chooserCursor int                         // index into the chooser's flat repo list
-	remoteCursor  int                         // index into the chosen repo's flattened node list
+	remote        bool                         // in remote mode
+	remoteStacks  []*stack.Tree                // snapshot of the app's PR-reconstructed stacks (all repos)
+	remoteRepo    string                       // chosen repo slug; "" = show the repo chooser
+	chooserCursor int                          // index into the chooser's flat repo list
+	remoteCursor  int                          // index into the chosen repo's flattened node list
 	remoteMerge   map[string]gh.PRMergeability // landing readiness for the chosen repo's PRs
 
 	ops    townie.Ops
@@ -182,6 +189,7 @@ func (s *stackModel) clearOp() {
 	s.phase = stackBrowsing
 	s.output = ""
 	s.runErr = nil
+	s.blocked = ""
 	s.opName = ""
 }
 
@@ -197,6 +205,7 @@ func (s *stackModel) reload() {
 	// Local branches not in the stack ("not in a stack"), shown under the tree so
 	// they're visible and can be checked out + added with t.
 	s.loose = stack.LooseBranches("", s.tree)
+	s.held = stack.HeldByWorktree("")
 	// Park the tree cursor on the current branch so checkout starts from "here" —
 	// searching the combined nav list (stack nodes THEN loose branches), so it also
 	// lands on a loose current branch.
@@ -489,6 +498,11 @@ func (s stackModel) actionDisabledReason(c townie.Command) string {
 			return ""
 		}
 		if state, landed := s.driftState(t); landed {
+			// Reconcile only acts on the stack you are standing in, so a landed branch
+			// in a sibling stack must be pointed at a key that does something.
+			if !s.inCurrentStack(t) {
+				return fmt.Sprintf("%s was %s on the remote: check it out first, then X", t, state)
+			}
 			return fmt.Sprintf("%s was %s on the remote — reconcile (X), don't re-propose", t, state)
 		}
 		if n := s.tree.NodeByName(t); n == nil {
@@ -513,6 +527,9 @@ func (s stackModel) actionDisabledReason(c townie.Command) string {
 			return "the trunk has no PR"
 		}
 		if state, landed := s.driftState(t); landed {
+			if !s.inCurrentStack(t) {
+				return fmt.Sprintf("%s was %s on the remote: check it out first, then X", t, state)
+			}
 			return fmt.Sprintf("%s was %s on the remote — reconcile (X)", t, state)
 		}
 		if s.prNums[t] == 0 {
@@ -706,7 +723,7 @@ func (s stackModel) Update(msg tea.Msg) (stackModel, tea.Cmd) {
 		case stackDone:
 			// Any key dismisses the result and returns to the list.
 			s.phase = stackBrowsing
-			s.output, s.runErr = "", nil
+			s.output, s.runErr, s.blocked = "", nil, ""
 			return s, nil
 		default:
 			if s.remote {
@@ -898,9 +915,39 @@ func (s stackModel) updateTree(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 		if target == s.status.Branch {
 			return s, nil // already here
 		}
+		if path, ok := s.held[target]; ok {
+			return s.refuseCheckout(target, path), nil
+		}
 		return s.runOp("checkout", target, "checkout")
 	}
 	return s, nil
+}
+
+// refuseCheckout says why a branch can't be checked out here instead of shelling
+// out to a git checkout that would fail with "already used by worktree". Nothing
+// broke — git gives a branch one working copy — so it lands in the result pane as
+// an amber limit, not a red failure.
+func (s stackModel) refuseCheckout(branch, path string) stackModel {
+	s.phase = stackDone
+	s.pending = townie.Command{Verb: "checkout", Title: "checkout"}
+	s.opName = branch
+	s.runErr = nil
+	s.blocked = "cannot switch here"
+	s.output = fmt.Sprintf("%s is open in\n\n  %s\n\n"+
+		"Git gives a branch one working copy at a time, so it can't be opened here as "+
+		"well. Work on it in that folder, or remove that worktree and press r.",
+		branch, tildePath(path))
+	return s
+}
+
+// tildePath rewrites a path under the home directory as ~/… — the folder is the
+// point of the message, and the leading /home/<user> is noise in a narrow pane.
+func tildePath(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !strings.HasPrefix(p, home+"/") {
+		return p
+	}
+	return "~" + strings.TrimPrefix(p, home)
 }
 
 // runOp launches a delegated op (mutation or checkout) and moves to the running
@@ -909,7 +956,7 @@ func (s stackModel) runOp(verb, name, title string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: verb, Title: title}
 	s.opName = name
-	s.output = ""
+	s.output, s.blocked = "", ""
 	ops := s.ops
 	// Start streaming inside the Cmd (not here) so the process only launches when
 	// bubbletea runs the command — keeps unit tests that merely assert a non-nil
@@ -940,7 +987,7 @@ func (s stackModel) runReady(branch string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: "ready", Title: "mark ready"}
 	s.opName = branch
-	s.output = ""
+	s.output, s.blocked = "", ""
 	owner, repo, _ := gh.SplitRepo(s.repo)
 	num := s.prNums[branch]
 	return s, func() tea.Msg {
@@ -982,7 +1029,7 @@ func (s stackModel) runShip(branch string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: "ship", Title: "merge"}
 	s.opName = branch
-	s.output = ""
+	s.output, s.blocked = "", ""
 	owner, repo, _ := gh.SplitRepo(s.repo)
 	trunk := ""
 	if s.tree != nil && s.tree.Root != nil {
@@ -1132,7 +1179,7 @@ func (s stackModel) runShipStack(branches []string) (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: "shipstack", Title: "merge whole stack"}
 	s.opName = ""
-	s.output = ""
+	s.output, s.blocked = "", ""
 	owner, repo, _ := gh.SplitRepo(s.repo)
 	trunk := ""
 	if s.tree != nil && s.tree.Root != nil {
@@ -1357,7 +1404,7 @@ func (s stackModel) runReconcile() (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = reconcileCommand()
 	s.opName = ""
-	s.output = ""
+	s.output, s.blocked = "", ""
 	trunk := ""
 	if s.tree != nil && s.tree.Root != nil {
 		trunk = s.tree.Root.Name
@@ -1521,7 +1568,7 @@ func (s stackModel) updateComposing(msg tea.KeyMsg) (stackModel, tea.Cmd) {
 // the same machinery as the other ops.
 func (s stackModel) runPropose() (stackModel, tea.Cmd) {
 	s.phase = stackRunning
-	s.output = ""
+	s.output, s.blocked = "", ""
 	owner, repo, _ := gh.SplitRepo(s.repo)
 	head := s.opName
 	base := s.proposeBase
@@ -1590,7 +1637,7 @@ func (s stackModel) runTrack() (stackModel, tea.Cmd) {
 	s.phase = stackRunning
 	s.pending = townie.Command{Verb: "track", Title: "track"}
 	s.opName = s.status.Branch
-	s.output = ""
+	s.output, s.blocked = "", ""
 	branch := s.status.Branch
 	parent := s.trackParent()
 	ops := s.ops
@@ -1678,22 +1725,18 @@ func fetchStackDrift(repo string, branches []string) tea.Cmd {
 	}
 }
 
-// trackedFeatureBranches lists the CURRENT stack's tracked, non-trunk branches —
-// the ones whose remote landing state the drift check looks up. Scoped to the
-// current branch's stack (matching where remoteDrift displays it), so the fetch is
-// a couple of calls, not one per branch across every stack. nil off-tree; a
-// checkout re-fires the fetch for the newly-current stack. Falls back to the whole
-// tree when the current branch isn't a node (so nothing is silently unchecked).
+// trackedFeatureBranches lists every tracked, non-trunk branch in the local tree —
+// the ones whose remote landing state the drift check looks up. It covers the WHOLE
+// tree, not just the current stack, because the tree draws the whole tree: a sibling
+// stack left unchecked renders as "no PR" when its PR actually merged. One lookup
+// per branch, bounded by what git-town tracks locally. The reconcile banner stays
+// scoped to the current stack (see remoteDrift) — only the fetch is wider.
 func (s stackModel) trackedFeatureBranches() []string {
 	if s.tree == nil {
 		return nil
 	}
-	nodes := s.tree.Focused(s.status.Branch)
-	if len(nodes) == 0 {
-		nodes = s.tree.Order
-	}
 	var out []string
-	for _, n := range nodes {
+	for _, n := range s.tree.Order {
 		if !n.IsTrunk {
 			out = append(out, n.Name)
 		}
@@ -1758,6 +1801,20 @@ func (s stackModel) driftState(branch string) (state string, landed bool) {
 		return "merged", true
 	}
 	return "closed", true
+}
+
+// inCurrentStack reports whether branch belongs to the stack the current branch is
+// in, which is the scope reconcile (X) acts on.
+func (s stackModel) inCurrentStack(branch string) bool {
+	if s.tree == nil {
+		return false
+	}
+	for _, n := range s.tree.Focused(s.status.Branch) {
+		if n.Name == branch {
+			return true
+		}
+	}
+	return false
 }
 
 // driftLabel annotates each drifted branch with its PR number (from the drift
@@ -1986,6 +2043,9 @@ func (s stackModel) treeWidth() int {
 					need += len(" no PR")
 				}
 			}
+			if _, ok := s.held[n.Name]; ok {
+				need += len(" worktree")
+			}
 			if n.Drifted {
 				need += 2
 			}
@@ -1997,6 +2057,9 @@ func (s stackModel) treeWidth() int {
 			need := 4 + lipgloss.Width(name) + 1 // marker + indent + name + slack
 			if num := s.prNums[name]; num > 0 {
 				need += len(fmt.Sprintf(" #%d", num))
+			}
+			if _, ok := s.held[name]; ok {
+				need += len(" worktree")
 			}
 			if need > w {
 				w = need
@@ -2011,6 +2074,20 @@ func (s stackModel) treeWidth() int {
 		w = maxW
 	}
 	return w
+}
+
+// readableName is the fewest columns of a branch name worth keeping its tags for.
+const readableName = 8
+
+// fitRow splits a tree row between the branch name and its tags. Tags are dropped
+// only when keeping them would cut the name below a readable floor, since a row
+// stripped to nothing but tags says nothing.
+func fitRow(w, fixed, nameLen, suffixW int) (nameW int, keepSuffix bool) {
+	avail := w - fixed - suffixW - 1
+	if suffixW == 0 || avail >= nameLen || avail >= readableName {
+		return max(avail, 0), true
+	}
+	return max(w-fixed-1, 0), false
 }
 
 // renderLocalTree draws the cwd repo's git-town stack with the CURRENT branch
@@ -2076,14 +2153,20 @@ func (s stackModel) renderLocalTree(w int) string {
 				suffix += " " + lipgloss.NewStyle().Foreground(s.th.Muted).Render("no PR")
 			}
 		}
+		if _, ok := s.held[n.Name]; ok {
+			suffix += " " + mutedStyle(s.th).Render("worktree")
+		}
 		// The local-drift ⚠ is suppressed once a branch has landed remotely: its
 		// "merged"/"closed" tag already explains it, and reconcile (not restack) is
 		// the fix, so a drift marker would just be conflicting noise.
 		if _, landed := s.drift[n.Name]; n.Drifted && !landed {
 			suffix += " " + lipgloss.NewStyle().Foreground(s.th.Warning).Render("⚠")
 		}
-		used := 2 + len(indent) + lipgloss.Width(suffix)
-		b.WriteString(marker + indent + nameStyle.Render(truncate(n.Name, w-used-1)) + suffix + "\n")
+		nameW, keep := fitRow(w, 2+len(indent), lipgloss.Width(n.Name), lipgloss.Width(suffix))
+		if !keep {
+			suffix = ""
+		}
+		b.WriteString(marker + indent + nameStyle.Render(truncate(n.Name, nameW)) + suffix + "\n")
 	}
 
 	// Loose branches: real git branches that aren't part of a stack yet (no
@@ -2116,8 +2199,14 @@ func (s stackModel) renderLocalTree(w int) string {
 			if num := s.prNums[name]; num > 0 {
 				suffix += " " + lipgloss.NewStyle().Foreground(s.th.Accent2).Render(fmt.Sprintf("#%d", num))
 			}
-			used := 4 + lipgloss.Width(suffix)
-			b.WriteString(marker + "  " + nameStyle.Render(truncate(name, w-used-1)) + suffix + "\n")
+			if _, ok := s.held[name]; ok {
+				suffix += " " + mutedStyle(s.th).Render("worktree")
+			}
+			nameW, keep := fitRow(w, 4, lipgloss.Width(name), lipgloss.Width(suffix))
+			if !keep {
+				suffix = ""
+			}
+			b.WriteString(marker + "  " + nameStyle.Render(truncate(name, nameW)) + suffix + "\n")
 		}
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, rule, b.String())
@@ -2698,6 +2787,8 @@ func (s stackModel) renderOutput(w int) string {
 	switch {
 	case s.phase == stackRunning:
 		status = lipgloss.NewStyle().Foreground(s.th.Focus).Render("running…")
+	case s.blocked != "":
+		status = lipgloss.NewStyle().Foreground(s.th.Warning).Render(s.blocked)
 	case s.runErr != nil && s.pending.Verb == "shipstack":
 		// A whole-stack ship that ends with an error is a controlled halt ("lands what
 		// it can, stops with a reason") — amber "stopped", not a red "failed", since

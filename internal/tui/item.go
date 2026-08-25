@@ -500,6 +500,9 @@ var clock = time.Now
 
 // truncate shortens s to max runes, adding an ellipsis when cut.
 func truncate(s string, max int) string {
+	if max <= 0 {
+		return "" // a pane too narrow for one rune must not panic on r[:max]
+	}
 	r := []rune(s)
 	if len(r) <= max {
 		return s
