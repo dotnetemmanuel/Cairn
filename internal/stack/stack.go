@@ -7,7 +7,9 @@ package stack
 import (
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Lineage is the git-town lineage recorded for a repo: the trunk branch plus
@@ -422,6 +424,25 @@ func gitOutput(dir string, args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// FirstCommitTime returns the commit time of the oldest commit on branch that is
+// not already on trunk — when the branch's own history began. Zero when the
+// branch has no commits of its own, or git cannot answer.
+func FirstCommitTime(dir, trunk, branch string) time.Time {
+	if trunk == "" || branch == "" {
+		return time.Time{}
+	}
+	out := gitOutput(dir, "log", "--format=%ct", trunk+".."+branch)
+	if out == "" {
+		return time.Time{}
+	}
+	lines := strings.Split(out, "\n")
+	secs, err := strconv.ParseInt(strings.TrimSpace(lines[len(lines)-1]), 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
 }
 
 // driftedFromParent reports whether branch has drifted off its recorded parent:
