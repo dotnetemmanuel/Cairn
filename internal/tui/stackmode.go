@@ -1714,15 +1714,33 @@ type stackDriftMsg struct {
 // fetchStackDrift checks whether any of the local stack's branches were landed or
 // closed on the remote (a teammate ship, a GitHub-UI merge) — one lookup per
 // branch. Best-effort: a failure leaves the drift map empty (no false warning).
-func fetchStackDrift(repo string, branches []string) tea.Cmd {
+func fetchStackDrift(repo, trunk string, branches []string) tea.Cmd {
 	return func() tea.Msg {
 		owner, name, ok := gh.SplitRepo(repo)
 		if !ok || len(branches) == 0 {
 			return stackDriftMsg{}
 		}
 		d, _ := gh.LandedPRsByBranch(owner, name, branches)
-		return stackDriftMsg{drift: d}
+		firstCommit := func(b string) time.Time { return stack.FirstCommitTime("", trunk, b) }
+		return stackDriftMsg{drift: dropReusedNames(d, firstCommit)}
 	}
+}
+
+// dropReusedNames removes landings that belong to an earlier branch of the same
+// name: a PR closed before the local branch's first commit cannot be its PR.
+// Without this, reusing a branch name after closing its PR locks stack mode
+// behind a reconcile the tree does not need. Anything it cannot date is kept, so
+// a real drift is never silently dropped.
+func dropReusedNames(drift map[string]gh.PRLanding, firstCommit func(branch string) time.Time) map[string]gh.PRLanding {
+	for b, l := range drift {
+		if l.ClosedAt.IsZero() {
+			continue
+		}
+		if first := firstCommit(b); !first.IsZero() && first.After(l.ClosedAt) {
+			delete(drift, b)
+		}
+	}
+	return drift
 }
 
 // trackedFeatureBranches lists every tracked, non-trunk branch in the local tree —
@@ -1751,7 +1769,17 @@ func (s stackModel) driftCmd() tea.Cmd {
 	if len(br) == 0 {
 		return nil
 	}
-	return fetchStackDrift(s.repo, br)
+	return fetchStackDrift(s.repo, s.trunkName(), br)
+}
+
+// trunkName is the trunk to measure branches against. The built tree is the
+// source of truth; s.trunk is only ever filled in for the no-git-town init
+// prompt, so it is empty on a repo that has a tree.
+func (s stackModel) trunkName() string {
+	if s.tree != nil && s.tree.Root != nil {
+		return s.tree.Root.Name
+	}
+	return s.trunk
 }
 
 // remoteDrift splits the CURRENT stack's branches whose PR has left the open

@@ -1017,6 +1017,9 @@ func PRMergeState(owner, repo string, number int) (PRMergeSnapshot, error) {
 type PRLanding struct {
 	Number int
 	Merged bool // true = merged (landed); false = closed without merging
+	// ClosedAt dates the landing, so a caller can tell a stale same-named PR from
+	// this branch: a PR closed before the branch's first commit is not its PR.
+	ClosedAt time.Time
 }
 
 // LandedPRsByBranch reports, for each head branch, whether its most recent PR has
@@ -1041,6 +1044,7 @@ func LandedPRsByBranch(owner, repo string, branches []string) (map[string]PRLand
 			Number   int        `json:"number"`
 			State    string     `json:"state"`
 			MergedAt *time.Time `json:"merged_at"`
+			ClosedAt *time.Time `json:"closed_at"`
 		}
 		// state=all, newest-updated first, one result: the branch's latest PR, so a
 		// reopened-then-merged history reads as merged (its current state).
@@ -1051,7 +1055,11 @@ func LandedPRsByBranch(owner, repo string, branches []string) (map[string]PRLand
 		if len(prs) == 0 || prs[0].State == "open" {
 			continue
 		}
-		out[b] = PRLanding{Number: prs[0].Number, Merged: prs[0].MergedAt != nil}
+		landed := PRLanding{Number: prs[0].Number, Merged: prs[0].MergedAt != nil}
+		if prs[0].ClosedAt != nil {
+			landed.ClosedAt = *prs[0].ClosedAt
+		}
+		out[b] = landed
 	}
 	return out, nil
 }
